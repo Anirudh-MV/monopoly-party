@@ -1,0 +1,153 @@
+/* ── Phone controller ── */
+:root {
+  --bg: #0b0e1a;
+  --panel: #131a2e;
+  --line: #26325a;
+  --ink: #d7e2ff;
+  --dim: #7c89b8;
+  --accent: #6c8cff;
+  --good: #34d399;
+  --bad: #f87171;
+  --money: #fbbf24;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+html { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  min-height: 100%;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+#app { max-width: 520px; margin: 0 auto; padding: 10px 12px 40px; }
+
+/* join + lobby */
+.join { min-height: 90vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; }
+.join h1 { font-size: 26px; text-align: center; }
+label { display: block; color: var(--dim); font-size: 13px; margin: 12px 0 4px; }
+input {
+  width: 100%; font: inherit; color: var(--ink);
+  background: #0e1526; border: 1px solid var(--line); border-radius: 12px;
+  padding: 14px; font-size: 18px;
+}
+#code { text-transform: uppercase; letter-spacing: 0.3em; text-align: center; font-weight: 800; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 16px;
+  margin: 10px 0;
+}
+.card.urgent { border-color: var(--bad); background: #25101a; }
+h1, h2, h3 { margin-bottom: 8px; }
+.good { color: var(--good); }
+.hint { color: var(--dim); font-size: 13px; line-height: 1.45; }
+.playerlist { list-style: none; font-size: 16px; display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
+.playerlist .dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; vertical-align: -1px; }
+.off { color: var(--bad); font-style: normal; font-size: 0.8em; }
+.crown { color: var(--money); }
+.crowned { color: #fff; font-weight: 700; }
+
+/* buttons — thumb-sized */
+button {
+  font: inherit; font-weight: 600; color: var(--ink); cursor: pointer;
+  background: #1d2747; border: 1px solid var(--line);
+  border-radius: 12px; padding: 12px 14px; min-height: 48px; font-size: 16px;
+}
+button:active { transform: scale(0.97); }
+button.big { width: 100%; font-size: 19px; padding: 16px; margin-top: 10px; border-radius: 14px; }
+button.wide { width: 100%; }
+button.primary { background: var(--accent); border-color: #8ba3ff; color: #0b0e1a; }
+button.good-btn, button.good { background: #123d2e; border-color: #1f7a56; color: #9ff0c8; }
+button.danger { background: #3b1620; border-color: #a13a4a; color: #ffb4b4; }
+button.tiny { min-height: 34px; font-size: 13px; padding: 6px 10px; border-radius: 9px; }
+button.disabled, button:disabled { opacity: 0.4; }
+.row { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.row > button, .row > input { flex: 1; min-width: 0; }
+.row > input { padding: 10px; font-size: 16px; }
+
+/* topbar */
+.topbar {
+  position: sticky; top: 0; z-index: 5;
+  display: flex; align-items: baseline; gap: 10px;
+  background: linear-gradient(180deg, var(--bg) 75%, transparent);
+  padding: 10px 0 8px;
+  border-bottom: 1px solid var(--line);
+}
+.topbar .me { font-weight: 800; font-size: 17px; }
+.topbar .money { font-size: 26px; font-weight: 800; color: var(--money); margin-left: auto; }
+.topbar .meta { color: var(--dim); font-size: 13px; }
+
+/* banners */
+.banner { margin: 10px 0 4px; padding: 12px 14px; border-radius: 12px; font-size: 16px; font-weight: 600; }
+.banner.good { background: #123024; color: #9ff0c8; border: 1px solid #1f7a56; }
+.banner.info { background: #14203c; border: 1px solid var(--line); }
+.banner.debt { background: #3b1620; color: #ffb4b4; border: 1px solid #a13a4a; font-size: 18px; }
+.banner.auction { background: #33270d; color: #ffe3a3; border: 1px solid #a17c1a; }
+.banner.card-chance { background: #2d1c0d; color: #ffc890; border: 1px solid #b45309; }
+.banner.card-chest { background: #0d2733; color: #90dcff; border: 1px solid #0e7490; }
+
+/* decision countdown — only visible in the final 30 seconds */
+.deadline {
+  margin: 10px 0 4px;
+  padding: 12px 14px; border-radius: 12px;
+  background: #3b1620; color: #ffb4b4; border: 1px solid #a13a4a;
+  font-size: 17px; font-weight: 700; text-align: center;
+}
+.deadline span { font-size: 22px; color: #fff; }
+.deadline.urgent { animation: flash 0.6s infinite; }
+@keyframes flash { 0%, 100% { background: #3b1620; } 50% { background: #6b1f2e; } }
+
+main { display: block; }
+
+/* properties */
+.prop {
+  display: flex; align-items: stretch; gap: 10px;
+  background: #10182e; border: 1px solid #1e2946; border-radius: 12px;
+  padding: 10px; margin: 8px 0;
+}
+.prop .strip { width: 8px; border-radius: 4px; flex: none; }
+.prop .strip.gray { background: #556; }
+.prop .pname { font-weight: 600; font-size: 15px; }
+.prop .row { margin-top: 6px; gap: 6px; }
+
+/* trades */
+.trades { margin-top: 18px; }
+.trades h3 { color: var(--dim); letter-spacing: 0.12em; font-size: 14px; }
+.trade .row { margin-bottom: 0; }
+.trade { margin: 8px 0; }
+
+/* chips (trade composer) */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.chip {
+  min-height: 36px; font-size: 13px; padding: 6px 10px; border-radius: 20px;
+  background: #0e1526; border: 2px solid var(--line); color: var(--ink);
+}
+.chip.sel { background: #2b3f7a; box-shadow: 0 0 0 2px rgba(108, 140, 255, 0.4); }
+
+/* modal sheet */
+.modal {
+  position: fixed; inset: 0; z-index: 20;
+  background: rgba(4, 6, 14, 0.75); backdrop-filter: blur(3px);
+  display: flex; align-items: flex-end; justify-content: center;
+}
+.sheet {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 20px 20px 0 0;
+  padding: 18px 16px calc(18px + env(safe-area-inset-bottom));
+  width: 100%; max-width: 520px;
+  max-height: 88vh; overflow-y: auto;
+}
+
+/* toast */
+.toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+  background: #3b1620; color: #ffd6d6; border: 1px solid #a13a4a;
+  padding: 12px 18px; border-radius: 12px; font-weight: 600;
+  z-index: 50; max-width: 90vw; text-align: center;
+  animation: rise 0.2s ease-out;
+}
+@keyframes rise { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }

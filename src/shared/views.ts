@@ -1,0 +1,42 @@
+import { allowedActions } from './rules.js'
+import type { GameState, HostView, PlayerView } from './types.js'
+
+// Monopoly is full-information, so the projection is mostly a trim:
+// the TV gets everything public; phones additionally get their own
+// allowed-actions list and the trade offers they're party to.
+
+export function hostView(s: GameState, code: string, hostId: string | null): HostView {
+  return {
+    code,
+    phase: s.phase,
+    started: s.phase !== 'LOBBY',
+    turn: s.turn,
+    currentPlayerId: s.currentPlayerId,
+    hostId,
+    players: s.players,
+    props: s.props,
+    dice: s.dice,
+    log: s.log.slice(-40),
+    auction: s.auction,
+    pendingCard: s.pendingCard,
+    pendingPurchase: s.pendingPurchase,
+    pendingTax: s.pendingTax,
+    debt: s.debt,
+    winner: s.winner,
+    trades: s.trades,
+    lastLanded: s.lastLanded,
+    deadline: s.deadline,
+    deadlineFor: s.deadlineFor,
+  }
+}
+
+export function playerView(s: GameState, code: string, pid: string, hostId: string | null): PlayerView {
+  const base = hostView(s, code, hostId)
+  return {
+    ...base,
+    you: pid,
+    allowed: allowedActions(s, pid),
+    trades: s.trades.filter((t) => t.from === pid || t.to === pid),
+    isHost: hostId === pid,
+  }
+}
