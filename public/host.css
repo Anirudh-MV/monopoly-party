@@ -21,7 +21,7 @@ body {
   font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
   overflow: hidden;
 }
-#app { height: 100vh; }
+#app { position: relative; z-index: 1; height: 100vh; }
 
 /* landing + lobby */
 .landing, .lobby {
@@ -154,7 +154,7 @@ button:hover { filter: brightness(1.15); }
 .overlay.ticker .t.bad { color: var(--bad); }
 .overlay.ticker .t.money { color: var(--money); }
 
-/* center overlay */
+/* center overlay inside the 2D grid board (used by the simulator page) */
 .center {
   grid-area: 2 / 2 / 11 / 11;
   display: flex; flex-direction: column;
@@ -163,13 +163,44 @@ button:hover { filter: brightness(1.15); }
   padding: 4%;
   background: radial-gradient(600px 400px at 50% 40%, #182242 0%, transparent 75%);
   pointer-events: none;
+  z-index: 3;
 }
 .center.gameover { background: radial-gradient(600px 400px at 50% 40%, #2a1f05 0%, transparent 90%); }
-.turn { font-size: 3vh; font-weight: 700; color: #fff; }
+.center .turn, .center3d .turn { font-size: 3vh; font-weight: 700; color: #fff; text-shadow: 0 2px 12px rgba(0, 0, 0, 0.8); }
 .center .sub { color: var(--dim); font-size: 1.8vh; }
+.center .banner { font-size: 2.4vh; font-weight: 700; padding: 1vh 2vw; border-radius: 12px; background: #1d2747; }
+.center .banner.debt { background: #3b1620; color: #ffb4b4; }
+.center .auction .a-title { font-size: 2.2vh; letter-spacing: 0.4em; color: var(--money); }
+.center .auction .a-prop { font-size: 4vh; font-weight: 800; color: #fff; }
+.center .auction .a-bid { font-size: 7vh; font-weight: 800; color: var(--money); text-shadow: 0 0 24px rgba(251, 191, 36, 0.6); }
+.center .auction .a-bidder { font-size: 2.2vh; }
+.center .auction .a-count { color: var(--dim); font-size: 1.8vh; }
+.center .winner { font-size: 12vh; }
+.center .winner .wname { font-size: 7vh; font-weight: 800; color: #fff; }
+.center .winner .wsub { color: var(--money); letter-spacing: 0.3em; font-size: 2.4vh; }
+
+/* center overlay for the 3D TV (the board itself is a WebGL canvas at z-0) */
+.center3d {
+  position: absolute; inset: 0; z-index: 4;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 1.2vh; text-align: center;
+  padding: 4%;
+  pointer-events: none;
+}
+.center3d.gameover { background: radial-gradient(600px 400px at 50% 40%, rgba(42, 31, 5, 0.85) 0%, transparent 90%); }
+.center3d .sub { color: var(--dim); font-size: 1.8vh; text-shadow: 0 2px 8px rgba(0, 0, 0, 0.8); }
 .dice span { font-size: 8vh; color: #fff; text-shadow: 0 0 26px var(--accent); margin: 0 6px; }
-.banner { font-size: 2.4vh; font-weight: 700; padding: 1vh 2vw; border-radius: 12px; background: #1d2747; }
-.banner.debt { background: #3b1620; color: #ffb4b4; }
+.center3d .banner { font-size: 2.4vh; font-weight: 700; padding: 1vh 2vw; border-radius: 12px; background: rgba(29, 39, 71, 0.92); }
+.center3d .banner.debt { background: #3b1620; color: #ffb4b4; }
+.center3d .auction .a-title { font-size: 2.2vh; letter-spacing: 0.4em; color: var(--money); text-shadow: 0 2px 8px rgba(0,0,0,0.8); }
+.center3d .auction .a-prop { font-size: 4vh; font-weight: 800; color: #fff; text-shadow: 0 2px 8px rgba(0,0,0,0.8); }
+.center3d .auction .a-bid { font-size: 7vh; font-weight: 800; color: var(--money); text-shadow: 0 0 24px rgba(251, 191, 36, 0.6); }
+.center3d .auction .a-bidder { font-size: 2.2vh; text-shadow: 0 2px 8px rgba(0,0,0,0.8); }
+.center3d .auction .a-count { color: var(--dim); font-size: 1.8vh; }
+.center3d .winner { font-size: 12vh; text-shadow: 0 4px 24px rgba(0,0,0,0.7); }
+.center3d .winner .wname { font-size: 7vh; font-weight: 800; color: #fff; }
+.center3d .winner .wsub { color: var(--money); letter-spacing: 0.3em; font-size: 2.4vh; }
 
 /* the landed-space spotlight */
 .landed {

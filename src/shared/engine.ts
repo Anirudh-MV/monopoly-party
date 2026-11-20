@@ -13,9 +13,9 @@ import {
   isStreet,
   nearestOf,
   groupIndices,
-} from '../shared/board.js'
-import { ALL_CARDS, CHANCE_JAIL_CARD_ID, CHEST_JAIL_CARD_ID, cardById } from '../shared/cards.js'
-import * as R from '../shared/rules.js'
+} from './board.js'
+import { ALL_CARDS, CHANCE_JAIL_CARD_ID, CHEST_JAIL_CARD_ID, cardById } from './cards.js'
+import * as R from './rules.js'
 import type {
   Action,
   Card,
@@ -25,7 +25,7 @@ import type {
   PlayerState,
   PropertyState,
   TradeSide,
-} from '../shared/types.js'
+} from './types.js'
 
 export type Result = { ok: true } | { ok: false; error: string }
 const OK: Result = { ok: true }

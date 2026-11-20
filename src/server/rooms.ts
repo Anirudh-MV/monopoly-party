@@ -8,7 +8,7 @@
 
 import { randomUUID } from 'node:crypto'
 import type { Server as IOServer, Socket } from 'socket.io'
-import { applyAction, createGame, type PlayerMeta } from './engine.js'
+import { applyAction, createGame, type PlayerMeta } from '../shared/engine.js'
 import { hostView, playerView } from '../shared/views.js'
 import { alivePlayers, netWorth } from '../shared/rules.js'
 import type { Action, GameState, LobbyInfo, LobbyPlayer } from '../shared/types.js'

@@ -18,6 +18,7 @@ const pub = path.resolve('public')
 app.use(express.static(pub))
 app.get('/', (_q, res) => res.sendFile(path.join(pub, 'host.html')))
 app.get('/join', (_q, res) => res.sendFile(path.join(pub, 'controller.html')))
+app.get('/simulate', (_q, res) => res.sendFile(path.join(pub, 'sim.html')))
 
 const http = createServer(app)
 const io = new Server(http)

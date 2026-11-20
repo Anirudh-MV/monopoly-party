@@ -4,7 +4,7 @@
 // plays rigged dice through the real reducer, and asserts exact outcomes.
 // Run: npm run scenarios
 
-import { applyAction, createGame, type PlayerMeta, type Result } from './engine.js'
+import { applyAction, createGame, type PlayerMeta, type Result } from '../shared/engine.js'
 import { allowedActions, rentFor } from '../shared/rules.js'
 import type { Action, GameState, PlayerState, PropertyState } from '../shared/types.js'
 

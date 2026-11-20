@@ -1,14 +1,15 @@
 // ── TV / host screen ──
-// The audience view: lobby with room code + QR, then the live board with
-// minimal overlays — turn queue top-left, activity ticker bottom, and a
-// center spotlight for whatever the active piece just landed on.
+// A WebGL board (board3d.ts) fills the screen; slim HTML overlays carry the
+// turn queue, activity ticker, and the center spotlight. The camera stays
+// zoomed on the active piece and tracks its hops; in the lobby it does a
+// slow cinematic orbit behind the QR card.
 // Read-only by design — the game's authoritative state lives on the server.
 
 import { io } from 'socket.io-client'
 import QRCode from 'qrcode'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
-import { netWorth } from '../../shared/rules.js'
 import type { HostView, LobbyInfo, PlayerState, Space } from '../../shared/types.js'
+import { Board3D } from './board3d.js'
 
 interface HostAck {
   ok: boolean
@@ -22,12 +23,12 @@ const DIE = ['⚀', '⚁', '⚂', '⚃', '⚄', '⚅']
 
 const socket = io()
 const $app = document.getElementById('app') as HTMLElement
+const board3d = new Board3D(document.body)
 
 let view: HostView | null = null
 let lobby: LobbyInfo | null = null
 let urls: string[] = []
-let cells: (HTMLElement | null)[] = []
-let boardBuilt = false
+let gameBuilt = false
 
 function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string)
@@ -51,7 +52,7 @@ socket.on('connect', () => {
 socket.on('lobby', (l: LobbyInfo) => {
   lobby = l
   view = null
-  boardBuilt = false
+  gameBuilt = false
   render()
 })
 
@@ -84,6 +85,7 @@ function render(): void {
     renderGame(view)
     return
   }
+  board3d.setIdle()
   if (lobby) {
     renderLobby(lobby)
     return
@@ -132,99 +134,27 @@ function renderLobby(l: LobbyInfo): void {
 
 // ── Game ──
 
-function gridPos(i: number): { r: number; c: number } {
-  if (i === 0) return { r: 11, c: 11 }
-  if (i < 10) return { r: 11, c: 11 - i }
-  if (i === 10) return { r: 11, c: 1 }
-  if (i < 20) return { r: 11 - (i - 10), c: 1 }
-  if (i === 20) return { r: 1, c: 1 }
-  if (i < 30) return { r: 1, c: 1 + (i - 20) }
-  if (i === 30) return { r: 1, c: 11 }
-  return { r: 1 + (i - 30), c: 11 }
-}
-
-function regionOf(i: number): string {
-  if (i <= 10) return 'bottom'
-  if (i <= 20) return 'left'
-  if (i <= 30) return 'top'
-  return 'right'
-}
-
-function cellHTML(i: number, sp: Space): string {
-  if (isStreet(sp)) {
-    return `<div class="bar" style="background:${GROUP_COLORS[sp.group]}"></div>
-      <div class="nm">${sp.name}</div><div class="pr">$${sp.price}</div>
-      <div class="marks"></div><div class="toks"></div>`
-  }
-  switch (sp.kind) {
-    case 'rail':
-      return `<div class="bar rail"></div><div class="nm">🚂 ${sp.name}</div><div class="pr">$${sp.price}</div><div class="marks"></div><div class="toks"></div>`
-    case 'utility':
-      return `<div class="bar util"></div><div class="nm">${sp.name.includes('Electric') ? '💡' : '🚰'} ${sp.name}</div><div class="pr">$${sp.price}</div><div class="marks"></div><div class="toks"></div>`
-    case 'go':
-      return `<div class="corner">GO<div class="sub">collect $200</div></div><div class="toks"></div>`
-    case 'jail':
-      return `<div class="corner">🚔<div class="sub">JAIL / visiting</div></div><div class="toks"></div>`
-    case 'parking':
-      return `<div class="corner">🅿<div class="sub">free parking</div></div><div class="toks"></div>`
-    case 'gotojail':
-      return `<div class="corner">👮<div class="sub">go to jail</div></div><div class="toks"></div>`
-    case 'chance':
-      return `<div class="nm">❓ Chance</div><div class="marks"></div><div class="toks"></div>`
-    case 'chest':
-      return `<div class="nm">🎁 Community Chest</div><div class="marks"></div><div class="toks"></div>`
-    case 'tax':
-      return `<div class="nm">${sp.name}</div><div class="pr">${sp.percent ? 'flat or 10%' : `$${sp.flat}`}</div><div class="marks"></div><div class="toks"></div>`
-    default:
-      return ''
-  }
-}
-
-function buildBoard(): void {
-  $app.innerHTML = `
-    <div class="game">
-      <div class="boardwrap">
-        <div class="board" id="board"></div>
-      </div>
-      <div class="overlay queue" id="queue"></div>
-      <div class="overlay ticker" id="ticker"></div>
-    </div>`
-  const board = document.getElementById('board') as HTMLElement
-  cells = []
-  for (let i = 0; i < BOARD.length; i++) {
-    const sp = BOARD[i]
-    const cell = document.createElement('div')
-    const g = gridPos(i)
-    cell.className = `cell r-${regionOf(i)} k-${sp.kind}`
-    cell.style.gridArea = `${g.r} / ${g.c}`
-    cell.innerHTML = cellHTML(i, sp)
-    board.appendChild(cell)
-    cells[i] = cell
-  }
-  const center = document.createElement('div')
-  center.className = 'center'
-  center.id = 'center'
-  board.appendChild(center)
-}
-
-function renderGame(v: HostView): void {
-  if (!boardBuilt) {
-    buildBoard()
-    boardBuilt = true
-  }
-  updateCells(v)
-  updateQueue(v)
-  updateTicker(v)
-  updateCenter(v)
-}
-
-// Turn order starting with the current player: whoever ends their turn
-// slides to the bottom of this list.
 function turnQueue(v: HostView): PlayerState[] {
   const alive = v.players.filter((p) => !p.bankrupt)
   const idx = alive.findIndex((p) => p.id === v.currentPlayerId)
   if (idx < 0) return alive
   return [...alive.slice(idx), ...alive.slice(0, idx)]
+}
+
+function renderGame(v: HostView): void {
+  if (!gameBuilt) {
+    $app.innerHTML = `
+      <div class="game">
+        <div class="overlay queue" id="queue"></div>
+        <div class="overlay ticker" id="ticker"></div>
+        <div class="center3d" id="center"></div>
+      </div>`
+    gameBuilt = true
+  }
+  board3d.sync(v)
+  updateQueue(v)
+  updateTicker(v)
+  updateCenter(v)
 }
 
 function updateQueue(v: HostView): void {
@@ -261,41 +191,6 @@ function updateTicker(v: HostView): void {
   if (!el) return
   const last = v.log[v.log.length - 1]
   el.innerHTML = last ? `<span class="t ${last.kind}">${esc(last.text)}</span>` : ''
-}
-
-function updateCells(v: HostView): void {
-  const decisionSpace = v.pendingPurchase ?? v.auction?.space ?? null
-  const landedSpace =
-    v.lastLanded && v.lastLanded.playerId === v.currentPlayerId ? v.lastLanded.space : null
-  for (let i = 0; i < BOARD.length; i++) {
-    const cell = cells[i]
-    if (!cell) continue
-    const st = v.props[i]
-    if (st) {
-      const owner = st.owner ? v.players.find((p) => p.id === st.owner) : null
-      cell.classList.toggle('owned', !!owner)
-      cell.style.setProperty('--own', owner?.color ?? 'transparent')
-      const marks = cell.querySelector('.marks')
-      if (marks) {
-        marks.innerHTML =
-          (st.houses > 0
-            ? st.houses === 5
-              ? '<span class="hotel">🏨</span>'
-              : `<span class="hs">${'🏠'.repeat(st.houses)}</span>`
-            : '') + (st.mortgaged ? '<span class="mtg">💤</span>' : '')
-      }
-    }
-    const here = v.players.filter((p) => p.pos === i && !p.bankrupt)
-    const toks = cell.querySelector('.toks')
-    if (toks) {
-      toks.innerHTML = here
-        .map((p) => `<span class="tk${p.id === v.currentPlayerId ? ' cur' : ''}" style="--c:${p.color}">${p.token}</span>`)
-        .join('')
-    }
-    cell.classList.toggle('active', v.currentPlayerId != null && here.some((p) => p.id === v.currentPlayerId))
-    cell.classList.toggle('decision', i === decisionSpace)
-    cell.classList.toggle('landed', i === landedSpace)
-  }
 }
 
 function stripColor(sp: Space): string {
@@ -402,3 +297,5 @@ function updateCenter(v: HostView): void {
     ${dice}
     ${captions.map((c) => `<div class="sub">${c}</div>`).join('')}`
 }
+
+render()

@@ -13,6 +13,7 @@ const common = {
 const entries = [
   { entryPoints: ['src/client/host/main.ts'], outfile: 'public/host.js' },
   { entryPoints: ['src/client/controller/main.ts'], outfile: 'public/controller.js' },
+  { entryPoints: ['src/client/sim/main.ts'], outfile: 'public/sim.js' },
 ]
 
 const watch = process.argv.includes('--watch')
