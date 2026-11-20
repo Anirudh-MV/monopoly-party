@@ -24,11 +24,14 @@ npm run dev
 ```
 
 1. Open **`http://localhost:3000`** on the TV/laptop → **Create a game**.
-   You'll get a room code + QR code.
+   You'll get a room code + QR code — with a live 3D board spinning behind it.
 2. On each phone, scan the QR (or open the **LAN URL** shown on screen) →
    enter the room code + your name.
-3. When everyone's in, hit **Start the game** on the TV.
-4. Play. Roll, buy, trade, build, bankrupt your friends.
+3. The **first player to join is the party host** 👑 (the TV can also start
+   things). The host can hand duties to anyone; if the host leaves or drops,
+   the crown slides down the queue automatically.
+4. Play. Roll, buy, bid, trade, build, bankrupt your friends — the camera
+   stays zoomed on the active piece and rides along with every hop.
 
 > **Windows firewall note:** the first time the server listens, Windows may pop a
 > "Allow Node.js on private networks?" prompt — that's normal for LAN play, and it's
@@ -38,12 +41,17 @@ npm run dev
 > **Phones can't connect?** They must be on the **same Wi-Fi** as the host machine,
 > and the host must use its LAN URL (printed at startup), not `localhost`.
 
+> **Bots instead of humans?** Open **`http://localhost:3000/simulate`** — 2–8 bots
+> play the real engine in your browser at 10ms–5000ms per decision, with
+> pause/resume and every setting in one menu.
+
 ## Scripts
 
 | Command | What it does |
 |---|---|
 | `npm run dev` | Dev mode: server with hot-reload + client rebuilds |
-| `npm run simulate` | Headless fuzz-test: plays random games against the rules engine (see below) |
+| `npm run simulate` | CLI fuzz-test: random bot games against the rules engine |
+| `npm run scenarios` | 28 deterministic rule scenarios (182 checks) |
 | `npm run smoke` | End-to-end test: boots the server, plays a real game over sockets, reconnects a phone + the TV |
 | `npm run build` | Production build (server → `dist/`, clients → `public/*.js`) |
 | `npm start` | Run the production build (`PORT` env to override, default 3000) |
@@ -69,17 +77,32 @@ npm run dev
 ### Reconnects are a feature, not an afterthought
 
 Phones lock, screens sleep, Wi-Fi blips. Each phone stores a rejoin token in
-`localStorage`; on reconnect it re-attaches to its seat with wallet, deeds, and
-jail cards intact. The TV has the same treatment via a host token. A phone that
-drops mid-auction is **auto-passed** so the table never stalls.
+`localStorage` and re-attaches automatically on **every** socket reconnect —
+seat, wallet, deeds, and jail cards intact. The TV has the same treatment via
+a host token. A phone that drops mid-auction is **auto-passed** so the table
+never stalls.
 
-### The engine is fuzz-tested
+### Decision clocks
 
-`npm run simulate` runs weighted-random bots through the reducer and asserts:
-no exceptions, no deadlocks (every state always has at least one legal action),
-no negative/NaN money, and every game terminates. It has already caught and fixed
-real bugs: float rounding on mortgage interest, an auction that could wedge when
-the last active player bid, and queued debts surviving a bankruptcy.
+Every decision point (roll, buy/auction, tax choice, end turn, debt) gets a
+**300-second** server-authoritative deadline. Phones show the countdown only
+in the **final 30 seconds** — and when it expires, the server plays a sensible
+default (auto-roll, send to auction, end turn, pay or bankrupt) so a stalled
+phone can never stall the party.
+
+### The engine is fuzz- and scenario-tested
+
+- `npm run simulate` — weighted-random bots play full games; asserts no
+  exceptions, no deadlocks, no negative money, guaranteed termination.
+- `npm run scenarios` — 28 deterministic situations (182 checks): GO payouts,
+  rent tables, jail in every exit, chained card draws, even-building rules,
+  exact mortgage math, multi-debt queues, both bankruptcy flavors, auction
+  regressions, trade validation, tamper-proof action gating.
+- `npm run smoke` — the full stack over real sockets, including reconnects.
+
+Together they've caught and fixed real bugs: float drift on mortgage buyback,
+a wedged auction when the last active player bid, queued debts surviving a
+bankruptcy, and a client-side first-paint blank screen.
 
 ## Rules implemented (official, no house rules)
 
