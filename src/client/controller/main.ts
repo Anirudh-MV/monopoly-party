@@ -432,6 +432,43 @@ function showPropInfo(space: number): void {
   document.body.appendChild(overlay)
 }
 
+// ── the attention ding ──
+// A soft chime whenever the game starts waiting on THIS phone: your turn,
+// a purchase decision, your bid, the wheel, a debt, a trade offer — any
+// time your action set appears or changes. Pure WebAudio, no assets.
+let audioCtx: AudioContext | null = null
+let prevAllowedKey = ''
+let dingArmed = false
+
+function ding(): void {
+  try {
+    audioCtx ??= new AudioContext()
+    if (audioCtx.state === 'suspended') void audioCtx.resume()
+    const t = audioCtx.currentTime
+    const o = audioCtx.createOscillator()
+    const g = audioCtx.createGain()
+    o.type = 'sine'
+    o.frequency.setValueAtTime(880, t)
+    o.frequency.exponentialRampToValueAtTime(1318, t + 0.09)
+    g.gain.setValueAtTime(0.0001, t)
+    g.gain.exponentialRampToValueAtTime(0.22, t + 0.02)
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.55)
+    o.connect(g)
+    g.connect(audioCtx.destination)
+    o.start(t)
+    o.stop(t + 0.6)
+  } catch {
+    /* no audio available — the visual cues carry it */
+  }
+}
+
+function maybeDing(v: PlayerView): void {
+  const key = (v.allowed || []).join(',')
+  if (dingArmed && key.length > 0 && key !== prevAllowedKey) ding()
+  prevAllowedKey = key
+  dingArmed = true
+}
+
 // ── the GO salary moment ──
 // Crossing GO credits instantly server-side; the phone still makes a moment
 // of it — a Collect $200 prompt stands between the roll and the end-turn
@@ -529,6 +566,7 @@ socket.on('view', (v: PlayerView) => {
   render()
   maybeShowRoll(v)
   maybeShowGoPrompt(v)
+  maybeDing(v)
   firstViewSeen = true
   // a roaming board stays live with the game
   phoneBoard?.sync(v)

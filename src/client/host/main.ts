@@ -11,6 +11,7 @@ import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
 import { rentFor, rentPreview } from '../../shared/rules.js'
 import type { HostView, LobbyInfo, PlayerState, Space } from '../../shared/types.js'
 import { Board3D } from './board3d.js'
+import { announce, bruh, heeHee, setVoiceEnabled, unlockAudio, voiceEnabled } from './voice.js'
 
 interface HostAck {
   ok: boolean
@@ -36,6 +37,9 @@ document.documentElement.dataset.theme = theme
 const board3d = new Board3D(document.body)
 board3d.setTheme(theme)
 
+// first tap anywhere unlocks the TV's voice (browser autoplay policy)
+window.addEventListener('pointerdown', unlockAudio, { capture: true })
+
 // persistent theme toggle, outside #app so re-renders never destroy it
 const themeBtn = document.createElement('button')
 themeBtn.className = 'themetoggle'
@@ -46,6 +50,18 @@ themeBtn.addEventListener('click', () => {
   themeBtn.textContent = theme === 'light' ? 'Dark' : 'Light'
 })
 document.body.appendChild(themeBtn)
+
+// the announcer toggle — speech narration + the card sounds
+const voiceBtn = document.createElement('button')
+voiceBtn.className = 'themetoggle voicetoggle'
+voiceBtn.style.position = 'fixed'
+voiceBtn.style.top = '4.5vh'
+voiceBtn.textContent = voiceEnabled() ? '🔊' : '🔇'
+voiceBtn.addEventListener('click', () => {
+  setVoiceEnabled(!voiceEnabled())
+  voiceBtn.textContent = voiceEnabled() ? '🔊' : '🔇'
+})
+document.body.appendChild(voiceBtn)
 
 // god console toggle — the operator's emergency exit for mid-game trouble
 const godBtn = document.createElement('button')
@@ -212,7 +228,64 @@ socket.on('view', (v: HostView) => {
   view = v
   lobby = null
   render()
+  announceView(v)
 })
+
+// ── the announcer ──
+// Diffs consecutive views and narrates the moments: rolls, purchases,
+// rent owed, auctions, arrests, the winner — plus the two card sounds.
+let annPrev: HostView | null = null
+let annArmed = false
+
+function announceView(v: HostView): void {
+  const prev = annPrev
+  annPrev = v
+  if (!annArmed) {
+    annArmed = true
+    return // first sight (connect/reconnect): never replay old events
+  }
+  if (!prev) return
+  const nameOf = (id: string | null | undefined): string => v.players.find((p) => p.id === id)?.name ?? 'someone'
+
+  // a fresh roll: "Maya rolled a 9"
+  if (v.dice && `${v.turn}:${v.dice.join()}` !== `${prev.turn}:${(prev.dice ?? []).join()}`) {
+    announce(`${nameOf(v.currentPlayerId)} rolled a ${v.dice[0] + v.dice[1]}`)
+  }
+
+  // card landings: the party sounds
+  if (v.pendingCardDraw && !prev.pendingCardDraw) {
+    if (v.pendingCardDraw.deck === 'chance') heeHee()
+    else bruh()
+  }
+
+  // purchase: the pending offer cleared and the buyer owns the space now
+  if (prev.pendingPurchase != null && v.pendingPurchase == null) {
+    const st = v.props[prev.pendingPurchase]
+    if (st && st.owner && st.owner === prev.currentPlayerId) {
+      announce(`${nameOf(st.owner)} bought ${BOARD[prev.pendingPurchase].name}`)
+    }
+  }
+
+  // a new auction
+  if (v.auction && !prev.auction) {
+    announce(`${BOARD[v.auction.space].name} goes to auction`)
+  }
+
+  // an announced arrest
+  if (v.pendingJail && !prev.pendingJail) {
+    announce(`${nameOf(v.pendingJail.player)} is under arrest`)
+  }
+
+  // rent owed by hand: "Ben owes Maya 24 dollars rent"
+  if (v.debt && v.debt.memo?.startsWith('Rent: ') && (!prev.debt || prev.debt.debtor !== v.debt.debtor)) {
+    announce(`${nameOf(v.debt.debtor)} owes ${v.debt.creditor ? nameOf(v.debt.creditor) : 'the bank'} $${v.debt.amount} rent`)
+  }
+
+  // game over
+  if (v.phase === 'GAME_OVER' && v.winner && prev.phase !== 'GAME_OVER') {
+    announce(`${nameOf(v.winner)} wins the game!`)
+  }
+}
 
 $app.addEventListener('click', (ev) => {
   const el = (ev.target as HTMLElement).closest('[data-act]') as HTMLElement | null
