@@ -209,6 +209,111 @@ function showActionConfirm(title: string, body: string, confirmLabel: string, on
   document.body.appendChild(overlay)
 }
 
+// ── the dice roll moment ──
+// Every phone at the table plays the roll together, in sync with the TV's
+// suspense beat: the dice tumble for the TV's 1150ms hold, settle on the
+// real values, and only then does the landing underneath get revealed.
+let lastRollKey = ''
+let firstRollSeen = false
+
+function maybeShowRoll(v: PlayerView): void {
+  if (!v.dice) return
+  const key = `${v.turn}:${v.currentPlayerId}:${v.dice.join()}`
+  if (key === lastRollKey) return
+  lastRollKey = key
+  if (!firstRollSeen) {
+    firstRollSeen = true
+    return // reconnect mid-turn: don't replay a roll that already happened
+  }
+  showRollOverlay(v)
+}
+
+function pipsFor(n: number): string {
+  const pos: Record<number, string[]> = {
+    1: ['50,50'],
+    2: ['28,28', '72,72'],
+    3: ['28,28', '50,50', '72,72'],
+    4: ['28,28', '72,28', '28,72', '72,72'],
+    5: ['28,28', '72,28', '50,50', '28,72', '72,72'],
+    6: ['28,28', '72,28', '28,50', '72,50', '28,72', '72,72'],
+  }
+  return (pos[n] ?? pos[1]!).map((c) => {
+    const [x, y] = c.split(',')
+    return `<span class="pip" style="left:${x}%;top:${y}%"></span>`
+  }).join('')
+}
+
+function showRollOverlay(v: PlayerView): void {
+  const roller = v.players.find((p) => p.id === v.currentPlayerId)
+  const mine = v.currentPlayerId === v.you
+  const d1 = v.dice?.[0] ?? 1
+  const d2 = v.dice?.[1] ?? 1
+  const overlay = document.createElement('div')
+  overlay.className = 'roll-overlay'
+  overlay.innerHTML = `
+    <div class="roll-box">
+      <div class="roll-who">${mine ? 'You roll!' : `${roller?.token ?? ''} ${esc(roller?.name ?? 'Someone')} rolls`}</div>
+      <div class="dice-row">
+        <div class="die tumbling"></div>
+        <div class="die tumbling"></div>
+      </div>
+      <div class="roll-total"></div>
+    </div>`
+  document.body.appendChild(overlay)
+  const [dieA, dieB] = [...overlay.querySelectorAll('.die')] as HTMLElement[]
+  const total = overlay.querySelector('.roll-total') as HTMLElement
+
+  // tumbling faces, swapping fast — the anticipation phase
+  const tumbler = setInterval(() => {
+    dieA.innerHTML = pipsFor(1 + Math.floor(Math.random() * 6))
+    dieB.innerHTML = pipsFor(1 + Math.floor(Math.random() * 6))
+  }, 90)
+
+  // the TV's dice hold is 1150ms; settle when it does
+  setTimeout(() => {
+    clearInterval(tumbler)
+    dieA.innerHTML = pipsFor(d1)
+    dieB.innerHTML = pipsFor(d2)
+    dieA.classList.remove('tumbling')
+    dieB.classList.remove('tumbling')
+    dieA.classList.add('settled')
+    dieB.classList.add('settled')
+    total.textContent = `${d1} + ${d2} = ${d1 + d2}${d1 === d2 ? ' — DOUBLES!' : ''}`
+  }, 1150)
+  // the piece on the TV has (mostly) arrived by now — show the landing
+  setTimeout(() => overlay.remove(), 2600)
+}
+
+// ── wallet pulse ──
+// Every cash change counts to the new balance with a floating delta chip —
+// money visibly moves instead of silently renumbering.
+let lastCash: number | null = null
+let moneyRaf = 0
+
+function animateMoney(from: number, to: number): void {
+  cancelAnimationFrame(moneyRaf)
+  const t0 = performance.now()
+  const dur = 700
+  const step = (t: number): void => {
+    const chip = document.getElementById('moneyChip')
+    if (!chip) return // re-rendered away; the fresh paint already shows `to`
+    const k = Math.min(1, (t - t0) / dur)
+    const eased = 1 - Math.pow(1 - k, 3)
+    chip.firstChild!.textContent = `$${Math.round(from + (to - from) * eased)}`
+    if (k < 1) moneyRaf = requestAnimationFrame(step)
+  }
+  moneyRaf = requestAnimationFrame(step)
+
+  const chip = document.getElementById('moneyChip')
+  if (chip) {
+    const float = document.createElement('span')
+    float.className = `money-float ${to >= from ? 'plus' : 'minus'}`
+    float.textContent = `${to >= from ? '+' : '−'}$${Math.abs(to - from)}`
+    chip.appendChild(float)
+    setTimeout(() => float.remove(), 1500)
+  }
+}
+
 // ── the GO salary moment ──
 // Crossing GO credits instantly server-side; the phone still makes a moment
 // of it — a Collect $200 prompt stands between the roll and the end-turn
@@ -290,6 +395,7 @@ socket.on('view', (v: PlayerView) => {
   lastCardSeq = v.cardDrawSeq
 
   render()
+  maybeShowRoll(v)
   maybeShowGoPrompt(v)
   firstViewSeen = true
 })
@@ -555,6 +661,10 @@ function renderGame(v: PlayerView): void {
   const acts = new Set(v.allowed)
   const worth = netWorth(v, I.id)
 
+  // wallet pulse bookkeeping: the previous balance animates to this one
+  const prevCash = lastCash
+  lastCash = I.cash
+
   let banner = ''
   let body = ''
 
@@ -745,7 +855,7 @@ function renderGame(v: PlayerView): void {
   $app.innerHTML = `
     <header class="topbar" style="--c:${I.color}">
       <span class="me">${I.token} ${esc(I.name)}</span>
-      <span class="money">$${I.cash}</span>
+      <span class="money" id="moneyChip">$${I.cash}</span>
       <span class="meta">worth $${worth}${I.jailCards > 0 ? ` · jail card ×${I.jailCards}` : ''}${I.jail ? ' · in jail' : ''}</span>
       <button class="themebtn" data-act="theme">${theme === 'light' ? 'Dark' : 'Light'}</button>
       <button class="themebtn exitbtn" data-act="leave">Exit</button>
@@ -756,6 +866,9 @@ function renderGame(v: PlayerView): void {
     ${deadlineChip}
     <main>${body}</main>
     ${composer && composer.open ? renderComposer(v) : ''}`
+
+  // the wallet counts to its new balance, with a floating delta
+  if (prevCash != null && prevCash !== I.cash) animateMoney(prevCash, I.cash)
 }
 
 function sideSummary(side: TradeSide): string {
