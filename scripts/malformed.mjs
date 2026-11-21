@@ -259,13 +259,18 @@ try {
   await sleep(300)
   assert(alive(), 'server alive after room:create sent with a payload in the ack slot')
 
-  // …and twice in a row, plus a create storm on one connection
-  for (let i = 0; i < 5; i++) {
+  // …and a create storm on one connection: five rooms per socket is the cap
+  // (two were already minted above), everything past it is refused.
+  for (let i = 0; i < 3; i++) {
     const res = await emitAck(tv, 'room:create')
     assert(res.ok && /^[A-Z]{4}$/.test(res.code || ''), `room:create #${i + 2} on the same connection ok (${res.code})`)
     assert(alive(), 'server alive')
   }
-  // one connection, one room: the latest create won; older rooms detached
+  for (let i = 0; i < 2; i++) {
+    const res = await emitAck(tv, 'room:create')
+    assert(!res.ok, `room:create refused past the per-socket cap (#${i + 5})`)
+    assert(alive(), 'server alive after the refusal')
+  }
   assert(alive(), 'server alive after the create storm')
 
   // ── prototype pollution attempt through a snapshot import ──

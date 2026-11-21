@@ -12,7 +12,7 @@ import { createServer, type IncomingHttpHeaders } from 'node:http'
 import { networkInterfaces } from 'node:os'
 import path from 'node:path'
 import { Server } from 'socket.io'
-import { attach } from './rooms.js'
+import { attach, flushSnapshots } from './rooms.js'
 
 const PORT = Number(process.env.PORT ?? 3000)
 
@@ -178,6 +178,14 @@ function joinUrls(): string[] {
 }
 
 attach(io, () => joinUrls(), path.resolve(process.env.SNAP_DIR ?? 'snapshots'))
+
+// A restart must not lose acknowledged moves: snapshot writes are batched
+// over ~250ms, so flush whatever is pending before the process goes down.
+for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(sig, () => {
+    void flushSnapshots().finally(() => process.exit(0))
+  })
+}
 
 http.listen(PORT, '0.0.0.0', () => {
   console.log('')

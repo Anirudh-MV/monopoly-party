@@ -107,6 +107,16 @@ function playerRoom(code: string, playerId: string): string {
   return `p:${code}:${playerId}`
 }
 
+// True if this socket is the player's CURRENT connection for its seat. A
+// stale socket (phone already rejoined elsewhere; socket.io notices the old
+// one ~45s later) must never act, leave, or hand over duties for a seat
+// it no longer holds.
+function isCurrentConnection(room: Room, data: SocketData, socketId: string): boolean {
+  if (data.role !== 'player' || !data.playerId) return false
+  const e = room.players.find((x) => x.meta.id === data.playerId)
+  return e != null && e.socketId === socketId
+}
+
 function lobbyInfo(room: Room): LobbyInfo {
   const players: LobbyPlayer[] = room.players.map((e) => ({
     id: e.meta.id,
@@ -867,7 +877,31 @@ function restoreRoomFromSnapshot(room: Room, snap: RoomSnapshot): boolean {
   }))
   for (const e of room.players) playerTokens.set(e.token, { code: room.code, playerId: e.meta.id })
   room.state = snap.state
+  // The imported state's deadline timer is stale by definition: drop it so
+  // the next broadcast re-arms the real decision with a fresh clock.
+  if (room.timer) clearTimeout(room.timer)
+  room.timer = null
+  room.timerKey = null
   return true
+}
+
+// Flush pending snapshot writes right now — called on SIGTERM/SIGINT so a
+// systemd restart can never lose a move that was already acknowledged.
+export async function flushSnapshots(): Promise<void> {
+  try {
+    await flushChain.catch(() => {})
+    const batch = [...dirtyRooms]
+    dirtyRooms.clear()
+    for (const r of batch) {
+      try {
+        await flushSnapshot(r)
+      } catch (e) {
+        console.error(`[snapshots] failed to save ${r.code}:`, e)
+      }
+    }
+  } catch {
+    /* nothing more we can do at shutdown */
+  }
 }
 
 export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 'snapshots'): void {
@@ -1025,6 +1059,20 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       const entry = room?.players.find((e) => e.meta.id === t.playerId)
       if (!room || !entry) return ack?.({ ok: false, error: 'Session expired — rejoin with the room code' })
 
+      // The OLD connection loses its player identity the moment the seat
+      // moves — a stale socket must not be able to act for this seat later.
+      if (entry.socketId != null && entry.socketId !== socket.id) {
+        const stale = io.sockets.sockets.get(entry.socketId)
+        if (stale) {
+          const sd = stale.data as SocketData
+          if (sd.code === room.code && sd.playerId === entry.meta.id) {
+            sd.code = undefined
+            sd.role = undefined
+            sd.playerId = undefined
+          }
+        }
+      }
+
       leaveCurrentRoom(io, socket, data)
       socket.join(playerRoom(room.code, entry.meta.id))
       entry.socketId = socket.id
@@ -1041,12 +1089,14 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       if (!room || data.role !== 'player' || !data.playerId) return ack?.({ ok: false })
       const idx = room.players.findIndex((e) => e.meta.id === data.playerId)
       if (idx < 0) return ack?.({ ok: false })
-
+      // Only the seat's live connection can give it up — a stale socket
+      // must not be able to destroy the seat's rejoin token.
+      if (!isCurrentConnection(room, data, socket.id)) return ack?.({ ok: false })
+      const entry = room.players[idx]
       if (room.state) {
         // Mid-game exit: the seat stays at the table — the game plays on and
         // the decision clock covers their turns — but this phone is out for
         // good: its rejoin token is destroyed, so it can never wander back.
-        const entry = room.players[idx]
         if (entry) {
           playerTokens.delete(entry.token)
           entry.socketId = null
@@ -1073,7 +1123,7 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
     on('game:handOver', (raw: unknown, ack?: (res: unknown) => void) => {
       const room = data.code ? rooms.get(data.code) : undefined
       if (!room || room.state) return ack?.({ ok: false, error: 'Only in the lobby' })
-      if (data.role !== 'player' || !data.playerId || data.playerId !== room.hostPlayerId) {
+      if (!isCurrentConnection(room, data, socket.id) || data.playerId !== room.hostPlayerId) {
         return ack?.({ ok: false, error: 'Only the host can do that' })
       }
       const to = typeof (raw as { to?: unknown })?.to === 'string' ? (raw as { to?: string }).to : ''
@@ -1089,7 +1139,7 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       const room = data.code ? rooms.get(data.code) : undefined
       if (!room) return ack?.({ ok: false, error: 'Room not found' })
       const isTvHost = room.hostSockets.has(socket.id)
-      const isPartyHost = data.role === 'player' && data.playerId === room.hostPlayerId
+      const isPartyHost = isCurrentConnection(room, data, socket.id) && data.playerId === room.hostPlayerId
       if (!isTvHost && !isPartyHost) return ack?.({ ok: false, error: 'Hosts only' })
       if (room.state) return ack?.({ ok: false, error: 'Already started' })
       if (room.players.length < MIN_PLAYERS) return ack?.({ ok: false, error: 'Need at least 2 players' })
@@ -1105,7 +1155,9 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       if (!action) return ack?.({ ok: false, error: 'Malformed action' })
       const room = data.code ? rooms.get(data.code) : undefined
       if (!room?.state) return ack?.({ ok: false, error: 'No game running' })
-      if (data.role !== 'player' || !data.playerId) return ack?.({ ok: false, error: 'Players only' })
+      if (!isCurrentConnection(room, data, socket.id) || !data.playerId) {
+        return ack?.({ ok: false, error: 'Players only' })
+      }
 
       // Clone, apply, and only commit on success — a failed action never
       // leaves half-applied state behind.
@@ -1126,7 +1178,7 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
         const room = data.code ? rooms.get(data.code) : undefined
         if (!room) return ack?.({ ok: false, error: 'Room not found' })
         const isTvHost = room.hostSockets.has(socket.id)
-        const isPartyHost = data.role === 'player' && data.playerId === room.hostPlayerId
+        const isPartyHost = isCurrentConnection(room, data, socket.id) && data.playerId === room.hostPlayerId
         if (!isTvHost && !isPartyHost) return ack?.({ ok: false, error: 'Hosts only' })
         const rawMs = (raw as { turnTimeoutMs?: unknown } | null | undefined)?.turnTimeoutMs
         // Whole minutes-of-seconds only: no NaN, no strings, no floats.
@@ -1136,6 +1188,8 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
             : null
         if (ms === null) return ack?.({ ok: false, error: 'Bad timer value' })
         room.turnTimeoutMs = ms
+        // The in-progress decision re-arms with the new duration.
+        room.timerKey = null
         if (room.state) {
           godMutate(io, room, `decision timer ${ms === 0 ? 'disabled' : `set to ${Math.round(ms / 1000)}s`}`, () => {})
         } else {
@@ -1319,6 +1373,8 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
           const raw = Math.floor(Number(payload.ms))
           const ms = Number.isFinite(raw) ? Math.max(0, Math.min(3_600_000, raw)) : room.turnTimeoutMs
           room.turnTimeoutMs = ms
+          // The in-progress decision re-arms with the new duration.
+          room.timerKey = null
           if (s) {
             godMutate(io, room, `decision timer ${ms === 0 ? 'disabled' : `set to ${Math.round(ms / 1000)}s`}`, () => {})
           } else {

@@ -186,6 +186,34 @@ try {
     assert(lastHostView.hostId === phones[0].id, 'stale socket could not steal the crown')
   }
 
+  // ── a stale socket cannot act for a seat that has moved ──
+  // The current player reconnects on a new socket; the OLD socket (still
+  // open) tries to act for the seat first — and must be refused.
+  {
+    const cur = phones.find((p) => p.id === lastHostView.currentPlayerId)
+    const old = cur.sock
+    const fresh = connect()
+    fresh.on('view', (v) => {
+      cur.view = v
+    })
+    const rres = await emitAck(fresh, 'room:rejoin', { token: cur.token })
+    assert(rres.ok, 'current player reconnected on a second socket')
+    cur.sock = fresh
+    await sleep(150)
+    const acts = (cur.view && cur.view.allowed) || []
+    const pick = ['roll', 'drawCard', 'buy', 'declineBuy', 'passBid', 'payTax', 'endTurn']
+    const kind = pick.find((a) => acts.includes(a))
+    const probe = kind === 'payTax' ? { type: 'payTax', choice: 'flat' } : kind ? { type: kind } : null
+    assert(probe != null, 'current player has a probe action for the stale-socket test')
+    if (probe) {
+      const staleRes = await emitAck(old, 'game:action', probe)
+      assert(staleRes && !staleRes.ok, `stale socket cannot act for the seat (${staleRes && staleRes.error})`)
+      const liveRes = await emitAck(fresh, 'game:action', probe)
+      assert(liveRes.ok, 'the live connection still can')
+    }
+    old.disconnect()
+  }
+
   // ── god console ──
   // phones are never allowed in
   const gbad = await emitAck(phones[0].sock, 'god:command', { cmd: 'skipTurn' })
