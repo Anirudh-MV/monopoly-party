@@ -534,10 +534,15 @@ export class Board3D {
       this.posGoal.set(0, 34, 26)
     } else {
       const player = v.players[focusIdx]
-      const mesh = this.tokens[focusIdx]
-      if (player && mesh) {
-        this.focusGoal.copy(mesh.position)
-        this.posGoal.copy(mesh.position).add(cameraOffset(player.pos))
+      // Focus the tile the player is ON, never the mesh: on the landing
+      // view the mesh still sits at the pre-hop tile while the hop plays
+      // out, so a mesh-based focus left the camera easing back to the OLD
+      // position once the stroll ended. The hop chase still tracks the
+      // live token; this is the resting goal it eases back to.
+      if (player) {
+        const t = tileCenter(player.pos)
+        this.focusGoal.set(t.x, 0, t.z)
+        this.posGoal.set(t.x, 0, t.z).add(cameraOffset(player.pos))
       }
     }
 

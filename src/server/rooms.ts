@@ -51,7 +51,7 @@ interface Room {
 
 interface SocketData {
   code?: string
-  role?: 'host' | 'player'
+  role?: 'host' | 'player' | 'watcher'
   playerId?: string
 }
 
@@ -491,6 +491,20 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       room.hostSockets.add(socket.id)
       data.code = room.code
       data.role = 'host'
+      if (room.state) socket.emit('view', hostView(room.state, room.code, room.hostPlayerId, room.turnTimeoutMs))
+      else socket.emit('lobby', lobbyInfo(room))
+      ack?.({ ok: true, code: room.code, urls: getJoinUrls() })
+    })
+
+    // Extra TVs: mirror the room on any other screen. The watcher joins the
+    // host broadcast room but NEVER hostSockets — god, start and settings
+    // check that set, so mirrored screens are view-only by construction.
+    socket.on('room:watch', (payload: { code?: string }, ack?: (res: unknown) => void) => {
+      const room = rooms.get(String(payload?.code ?? '').toUpperCase())
+      if (!room) return ack?.({ ok: false, error: 'Room not found' })
+      socket.join(hostRoom(room.code))
+      data.code = room.code
+      data.role = 'watcher'
       if (room.state) socket.emit('view', hostView(room.state, room.code, room.hostPlayerId, room.turnTimeoutMs))
       else socket.emit('lobby', lobbyInfo(room))
       ack?.({ ok: true, code: room.code, urls: getJoinUrls() })

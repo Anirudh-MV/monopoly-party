@@ -75,6 +75,17 @@ let lobby: LobbyInfo | null = null
 let urls: string[] = []
 let gameBuilt = false
 
+// mirrored-screen mode: this TV shows a room created on another screen
+let isWatcher = false
+let watcherCode: string | null = localStorage.getItem('mp-watch')
+
+function setWatcher(on: boolean): void {
+  isWatcher = on
+  // the god console belongs to the primary screen only
+  godBtn.style.display = on ? 'none' : ''
+  render()
+}
+
 // animation bookkeeping
 let lastDiceKey = ''
 let lastCardSeq = 0
@@ -92,14 +103,38 @@ function esc(s: string): string {
 // Reconnect the TV whenever the socket (re)connects — survives refreshes,
 // laptop sleeps, and Wi-Fi blips without losing the room.
 socket.on('connect', () => {
+  let hosted = false
   for (const k of Object.keys(localStorage)) {
     if (!k.startsWith('mp-host-')) continue
+    hosted = true
     const code = k.slice('mp-host-'.length)
     const hostToken = localStorage.getItem(k) ?? ''
     socket.emit('room:hostJoin', { code, hostToken }, (res: HostAck) => {
       if (!res.ok) localStorage.removeItem(k)
-      else urls = res.urls ?? urls
+      else {
+        urls = res.urls ?? urls
+        // this screen is the primary TV — mirror mode is over
+        if (isWatcher) {
+          watcherCode = null
+          localStorage.removeItem('mp-watch')
+          setWatcher(false)
+        }
+      }
       render()
+    })
+  }
+  // this screen is a mirror, not the primary TV — reattach as a watcher
+  // (host attach wins if this screen ever created/reconnected to a room)
+  if (!hosted && watcherCode) {
+    socket.emit('room:watch', { code: watcherCode }, (res: HostAck) => {
+      if (!res.ok) {
+        watcherCode = null
+        localStorage.removeItem('mp-watch')
+        render()
+      } else {
+        urls = res.urls ?? urls
+        setWatcher(true)
+      }
     })
   }
 })
@@ -127,7 +162,29 @@ $app.addEventListener('click', (ev) => {
       urls = res.urls ?? []
       // The 'lobby' event arrived before this ack with urls still empty —
       // repaint so the QR and join URL show the real address.
+      if (isWatcher) {
+        watcherCode = null
+        localStorage.removeItem('mp-watch')
+        setWatcher(false)
+      }
       render()
+    })
+  } else if (el.dataset.act === 'watch') {
+    const input = document.getElementById('watchcode') as HTMLInputElement | null
+    const code = (input?.value ?? '').trim().toUpperCase()
+    if (!code || !/^[A-Z]{4}$/.test(code)) return
+    socket.emit('room:watch', { code }, (res: HostAck) => {
+      if (!res.ok) {
+        if (input) {
+          input.value = ''
+          input.style.outline = '2px solid #d64545'
+        }
+        return
+      }
+      watcherCode = res.code ?? code
+      localStorage.setItem('mp-watch', watcherCode)
+      // 'lobby'/'view' arrived before this ack — repaint in mirror mode
+      setWatcher(true)
     })
   } else if (el.dataset.act === 'start') {
     socket.emit('game:start', {}, (res: { ok: boolean; error?: string }) => {
@@ -160,6 +217,13 @@ function render(): void {
       <p class="tag">The couch co-op edition — your phone is your wallet.</p>
       <button class="big" data-act="create">Create a game</button>
       <p class="hint">Open this screen on the TV. Keep it running — it's the shared board.</p>
+      <div class="mirrorbox">
+        <p class="hint">The game is already running on another screen? Mirror it here:</p>
+        <div class="mirrorform">
+          <input id="watchcode" maxlength="4" placeholder="ROOM CODE" autocomplete="off" spellcheck="false" />
+          <button class="chip" data-act="watch">Mirror</button>
+        </div>
+      </div>
     </div>`
 }
 
@@ -185,12 +249,16 @@ function renderLobby(l: LobbyInfo): void {
       <div class="joined">
         <h2>PLAYERS · ${l.players.length}</h2>
         <ul class="playerlist">${players}</ul>
-        <button class="big ${l.canStart ? '' : 'disabled'}" data-act="start">Start the game</button>
+        ${
+          isWatcher
+            ? '<p class="hint">Mirroring — start, settings and God live on the primary screen</p>'
+            : `<button class="big ${l.canStart ? '' : 'disabled'}" data-act="start">Start the game</button>
         ${l.canStart ? '' : '<p class="hint">Best with 3+ players — waiting…</p>'}
         <label style="margin-top:2vh">Decision timer</label>
         <div class="chips">${TIMERS.map(
           ([label, ms]) => `<button class="chip ${l.turnTimeoutMs === ms ? 'sel' : ''}" data-act="setTimer" data-args='{"ms":${ms}}'>${label}</button>`,
-        ).join('')}</div>
+        ).join('')}</div>`
+        }
       </div>
     </div>`
   const canvas = document.getElementById('qr') as HTMLCanvasElement | null
