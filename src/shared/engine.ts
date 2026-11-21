@@ -543,6 +543,9 @@ function declareBankruptcy(s: GameState, p: PlayerState): Result {
       }
     } else {
       st.owner = null
+      // The bank repossesses clean: the property goes under the hammer
+      // unmortgaged, so the next buyer pays full price for a live deed.
+      st.mortgaged = false
       s.auctionQueue.push(i) // bank-bankruptcy: properties go under the hammer
     }
   }
@@ -561,6 +564,18 @@ function declareBankruptcy(s: GameState, p: PlayerState): Result {
   // estate already went to the triggering creditor.
   s.debtQueue = s.debtQueue.filter((d2) => d2.debtor !== p.id)
   s.trades = s.trades.filter((t) => t.from !== p.id && t.to !== p.id)
+
+  // …and so does the rest of their interrupted turn. Without this, a
+  // bankruptcy on the 3rd failed jail roll left `pendingMove` behind: the
+  // next debt resolution finished the DEAD player's stroll — possibly
+  // collecting GO — and landed them on an offer nobody could act on,
+  // freezing the game.
+  s.pendingMove = null
+  s.pendingPurchase = null
+  s.pendingTax = null
+  s.pendingCardDraw = null
+  s.pendingCard = null
+  s.pendingJail = null
 
   const alive = R.alivePlayers(s)
   if (alive.length <= 1) {

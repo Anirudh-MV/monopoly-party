@@ -615,6 +615,38 @@ scenario('allowed actions gate everything (tamper-proof reducer)', 4, (h) => {
   h.eq(allowedActions(h.s, 'ghost').length, 0, 'unknown player')
 })
 
+scenario('bankruptcy on the third failed jail roll ends the turn cleanly', 4, (h) => {
+  h.now(0)
+  h.p(0).jail = true
+  h.p(0).jailRolls = 2
+  h.cash(0, 30) // can't cover the $50 fine
+  const posBefore = h.p(0).pos
+  h.ok(h.roll(0, [[2, 3]]), 'third failed jail roll')
+  h.eq(h.s.phase, 'DEBT', 'owe the fine')
+  h.eq(h.s.pendingMove, 5, 'move parked until the fine is settled')
+  h.ok(h.act(0, { type: 'bankrupt' }), 'declare bankruptcy')
+  h.eq(h.p(0).bankrupt, true, 'out of the game')
+  h.eq(h.p(0).pos, posBefore, 'the dead piece never finished its stroll')
+  h.eq(h.p(0).cash, 0, 'estate wiped — no GO salary on the way out')
+  h.eq(h.s.pendingMove, null, 'no parked move left behind')
+  h.eq(h.s.pendingPurchase, null, 'no landing offer left behind')
+  h.eq(h.s.phase, 'ROLL', 'the turn passed on')
+  h.eq(h.s.currentPlayerId, 'p1', 'next player is up')
+  h.eq(allowedActions(h.s, 'p1').includes('roll'), true, 'the game is still live')
+})
+
+scenario('the bank repossesses bankrupt properties unmortgaged', 4, (h) => {
+  h.give(0, [1])
+  h.prop(1, { mortgaged: true })
+  h.now(0)
+  h.cash(0, 0)
+  h.s.debt = { debtor: 'p0', amount: 500, creditor: null }
+  h.s.phase = 'DEBT'
+  h.ok(h.act(0, { type: 'bankrupt' }), 'bankrupt to the bank')
+  h.eq(h.s.props[1].owner, null, 'property back with the bank')
+  h.eq(h.s.props[1].mortgaged, false, 'repossessed clean — the auction sells a live deed')
+})
+
 // ── summary ──
 if (failures.length > 0) {
   console.log(`\n✗ ${failures.length} failure(s) of ${totalChecks + failures.length} checks:`)
