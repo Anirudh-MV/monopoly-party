@@ -99,6 +99,44 @@ try {
     extra.disconnect()
   }
 
+  // ── piece change + host kick (lobby only) ──
+  {
+    let l = null
+    host.on('lobby', (x) => {
+      l = x
+    })
+    // the host swaps pieces; the lobby (and the avatar) follow
+    const sres = await emitAck(phones[0].sock, 'room:setPiece', { piece: '🚢' })
+    assert(sres.ok, 'lobby piece change accepted')
+    await sleep(150)
+    assert(l && l.players.find((p) => p.id === phones[0].id)?.token === '🚢', 'the lobby shows the new piece')
+    // nobody else can take it
+    const dres = await emitAck(phones[1].sock, 'room:setPiece', { piece: '🚢' })
+    assert(dres && !dres.ok, 'a taken piece stays taken')
+
+    // the host kicks a fourth joiner; only the host can kick
+    const extra = connect()
+    let kicked = false
+    extra.on('kicked', () => {
+      kicked = true
+    })
+    const eres = await emitAck(extra, 'room:join', { code, name: 'Ravi' })
+    assert(eres.ok, 'fourth phone joined for the kick test')
+    await sleep(120)
+    const bad = await emitAck(phones[1].sock, 'room:kick', { playerId: eres.playerId })
+    assert(bad && !bad.ok, 'only the party host can kick')
+    const kres = await emitAck(phones[0].sock, 'room:kick', { playerId: eres.playerId })
+    assert(kres.ok, 'host kicked the fourth phone')
+    await sleep(200)
+    assert(kicked, 'the kicked phone was told')
+    assert(l && l.players.length === 3 && !l.players.some((p) => p.name === 'Ravi'), 'lobby back to 3 after the kick')
+    const back = connect()
+    const bres = await emitAck(back, 'room:rejoin', { token: eres.token })
+    assert(bres && !bres.ok, 'the kicked token is dead')
+    back.disconnect()
+    extra.disconnect()
+  }
+
   // ── start ──
   let lastHostView = null
   host.on('view', (v) => {

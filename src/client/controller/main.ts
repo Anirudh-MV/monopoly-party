@@ -80,6 +80,8 @@ let joinName = ''
 const joinTaken = new Set<string>() // pieces the server refused as taken
 let avatarPreview: AvatarPreview | null = null
 const PREVIEW_COLOR = '#f59e0b'
+// optimistic piece selection in the lobby (cleared once the broadcast lands)
+let lobbySel: string | null = null
 
 function disposeAvatarPreview(): void {
   avatarPreview?.dispose()
@@ -451,6 +453,20 @@ socket.on('lobby', (l: LobbyInfo) => {
   render()
 })
 
+// The party host removed this seat — back to the join screen, politely.
+socket.on('kicked', () => {
+  localStorage.removeItem('mp-token')
+  localStorage.removeItem('mp-playerid')
+  myToken = null
+  myPlayerId = null
+  lobby = null
+  view = null
+  composer = null
+  lobbySel = null
+  render()
+  toast('The host removed you from the room')
+})
+
 socket.on('view', (v: PlayerView) => {
   view = v
   lobby = null
@@ -536,6 +552,44 @@ $app.addEventListener('click', (ev) => {
         b.classList.toggle('sel', (b as HTMLElement).dataset.piece === joinPiece)
       })
       avatarPreview?.show(TOKENS.indexOf(joinPiece), PREVIEW_COLOR)
+      break
+    }
+    case 'lobbyPiece': {
+      // change your piece in the lobby — optimistic selection, server
+      // confirms with a lobby broadcast (or rejects a taken piece)
+      const piece = el.dataset.piece ?? ''
+      const wearing = lobby?.players.find((p) => p.id === myPlayerId)?.token
+      if (!piece || piece === wearing) return
+      lobbySel = piece
+      document.querySelectorAll('.tok').forEach((b) => {
+        b.classList.toggle('sel', (b as HTMLElement).dataset.piece === piece)
+      })
+      avatarPreview?.show(TOKENS.indexOf(piece), PREVIEW_COLOR)
+      socket.emit('room:setPiece', { piece }, (res: { ok: boolean; error?: string }) => {
+        if (!res.ok) {
+          toast(res.error ?? 'Could not change piece')
+          lobbySel = null
+          render() // back to what you're actually wearing
+        } else {
+          joinPiece = piece
+          lobbySel = null
+        }
+      })
+      break
+    }
+    case 'kickPlayer': {
+      const target = lobby?.players.find((p) => p.id === String(args.id))
+      if (!lobby || !target) return
+      showActionConfirm(
+        'Kick this player?',
+        `Remove <b>${target.token} ${esc(target.name)}</b> from the room — they can rejoin with the room code until the game starts.`,
+        'Kick',
+        () => {
+          socket.emit('room:kick', { playerId: target.id }, (res: { ok: boolean; error?: string }) => {
+            if (!res.ok) toast(res.error ?? 'Could not kick')
+          })
+        },
+      )
       break
     }
     case 'startGame': {
@@ -684,7 +738,7 @@ function partnerPlayer(v: PlayerView | null, pid: string) {
 // ── Render ──
 
 function render(): void {
-  if (view || lobby || rejoinPending) disposeAvatarPreview()
+  if (view || rejoinPending) disposeAvatarPreview()
   if (view) {
     renderGame(view)
     return
@@ -749,20 +803,34 @@ function renderJoin(): void {
 }
 
 function renderLobby(l: LobbyInfo): void {
+  disposeAvatarPreview()
   const isHost = myPlayerId != null && myPlayerId === l.hostId
+  const me = l.players.find((p) => p.id === myPlayerId)
   const players = l.players
-    .map(
-      (p) =>
-        `<li${p.id === l.hostId ? ' class="crowned"' : ''}><span class="dot" style="background:${p.color}"></span>${p.token} ${esc(p.name)}${p.id === l.hostId ? ' <span class="crown">Host</span>' : ''}${p.connected ? '' : '<em class="off"> (offline)</em>'}</li>`,
-    )
+    .map((p) => {
+      const kick = isHost && p.id !== myPlayerId ? `<button class="tiny kickbtn" data-act="kickPlayer" data-args='{"id":"${p.id}"}' title="Kick from the room">✕</button>` : ''
+      return `<li${p.id === l.hostId ? ' class="crowned"' : ''}><span class="dot" style="background:${p.color}"></span>${p.token} ${esc(p.name)}${p.id === l.hostId ? ' <span class="crown">Host</span>' : ''}${p.connected ? '' : '<em class="off"> (offline)</em>'}${kick}</li>`
+    })
     .join('')
   const others = l.players.filter((p) => p.id !== myPlayerId)
+  const myPiece = lobbySel ?? me?.token ?? TOKENS[0]
+  // your piece is yours to change until the game starts
+  const pieceEditor = me ? `
+      <label>Your piece — tap to change</label>
+      <div class="tokgrid">
+        ${TOKENS.map(
+          (t) =>
+            `<button type="button" class="tok${t === myPiece ? ' sel' : ''}${l.players.some((p) => p.id !== myPlayerId && p.token === t) ? ' taken' : ''}" data-piece="${t}" data-act="lobbyPiece"${t === myPiece || l.players.some((p) => p.id !== myPlayerId && p.token === t) ? ' disabled' : ''}>${t}</button>`,
+        ).join('')}
+      </div>
+      <div id="avatarStage"></div>` : ''
   $app.innerHTML = `
     <div class="card">
       <h2>Room ${esc(l.code)}</h2>
       <p class="good">You're in${isHost ? ' — and you\u2019re the party host' : ''}.</p>
       <h3>Players (${l.players.length})</h3>
       <ul class="playerlist">${players}</ul>
+      ${pieceEditor}
       ${isHost ? `
         <button class="big primary" data-act="startGame" ${l.canStart ? '' : 'disabled'}>Start the game</button>
         ${!l.canStart ? '<p class="hint">Best with 3+ players — waiting…</p>' : ''}
@@ -772,6 +840,12 @@ function renderLobby(l: LobbyInfo): void {
       ` : '<p class="hint">Waiting for the host to start the game…<br/>Keep this tab open.</p>'}
       <div class="row"><button class="tiny" data-act="leave">Leave room</button></div>
     </div>`
+  // live 3D preview of the piece you're wearing (or about to take)
+  const stage = document.getElementById('avatarStage')
+  if (stage && me) {
+    avatarPreview = new AvatarPreview(stage)
+    avatarPreview.show(TOKENS.indexOf(myPiece), PREVIEW_COLOR)
+  }
 }
 
 function renderGame(v: PlayerView): void {

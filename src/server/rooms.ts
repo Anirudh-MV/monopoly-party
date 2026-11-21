@@ -1119,6 +1119,59 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       ack?.({ ok: true })
     })
 
+    // Swap your piece while still in the lobby — identities lock once the
+    // game starts (each piece is a distinct 3D avatar; mid-game swaps would
+    // confuse the table).
+    on('room:setPiece', (raw: unknown, ack?: (res: unknown) => void) => {
+      const room = data.code ? rooms.get(data.code) : undefined
+      if (!room || !isCurrentConnection(room, data, socket.id)) return ack?.({ ok: false, error: 'Not your seat' })
+      if (room.state) return ack?.({ ok: false, error: 'The game already started' })
+      const piece = (raw as { piece?: unknown } | null | undefined)?.piece
+      if (typeof piece !== 'string' || !TOKENS.includes(piece)) return ack?.({ ok: false, error: 'Not a valid piece' })
+      const idx = room.players.findIndex((e) => e.meta.id === data.playerId)
+      const entry = idx >= 0 ? room.players[idx] : undefined
+      if (!entry) return ack?.({ ok: false, error: 'Not your seat' })
+      if (entry.meta.token === piece) return ack?.({ ok: true }) // already wearing it
+      if (room.players.some((e, i) => i !== idx && e.meta.token === piece)) {
+        return ack?.({ ok: false, error: `${piece} is already taken — pick another piece` })
+      }
+      entry.meta.token = piece
+      broadcastLobby(io, room)
+      ack?.({ ok: true })
+    })
+
+    // The party host can remove someone from the LOBBY (locked once the
+    // game starts — a mid-game kick would strand a live seat). The kicked
+    // phone loses its seat identity and is told politely.
+    on('room:kick', (raw: unknown, ack?: (res: unknown) => void) => {
+      const room = data.code ? rooms.get(data.code) : undefined
+      if (!room || !isCurrentConnection(room, data, socket.id)) return ack?.({ ok: false, error: 'Not your seat' })
+      if (room.state) return ack?.({ ok: false, error: 'The game already started' })
+      if (room.hostPlayerId !== data.playerId) return ack?.({ ok: false, error: 'Only the party host can kick' })
+      const targetId = (raw as { playerId?: unknown } | null | undefined)?.playerId
+      if (typeof targetId !== 'string' || targetId.length > 64 || targetId === data.playerId) {
+        return ack?.({ ok: false, error: 'Pick another player' })
+      }
+      const idx = room.players.findIndex((e) => e.meta.id === targetId)
+      if (idx < 0) return ack?.({ ok: false, error: 'Not in this room' })
+      const [gone] = room.players.splice(idx, 1)
+      playerTokens.delete(gone.token)
+      // the kicked phone's identity dies with the seat
+      const kicked = gone.socketId != null ? io.sockets.sockets.get(gone.socketId) : undefined
+      if (kicked) {
+        const td = kicked.data as SocketData
+        if (td.code === room.code && td.playerId === targetId) {
+          td.code = undefined
+          td.role = undefined
+          td.playerId = undefined
+        }
+        kicked.leave(playerRoom(room.code, targetId))
+        kicked.emit('kicked')
+      }
+      broadcastLobby(io, room)
+      ack?.({ ok: true })
+    })
+
     // ── Party host powers (migratable player role) ──
     on('game:handOver', (raw: unknown, ack?: (res: unknown) => void) => {
       const room = data.code ? rooms.get(data.code) : undefined
