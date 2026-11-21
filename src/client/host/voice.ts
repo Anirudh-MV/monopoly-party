@@ -77,3 +77,10 @@ export function heeHee(): void {
 export function bruh(): void {
   playEffect('sounds/bruh.mp3')
 }
+
+// Doubles streaks escalate: one double, two in a row, three in a row
+// (which is also the last sound before the handcuffs).
+export function doublesStreak(streak: number): void {
+  const clip = streak >= 3 ? 'sounds/doubles3.mp3' : streak === 2 ? 'sounds/doubles2.mp3' : 'sounds/doubles1.mp3'
+  playEffect(clip)
+}

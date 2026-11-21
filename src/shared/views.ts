@@ -16,6 +16,7 @@ export function hostView(s: GameState, code: string, hostId: string | null, turn
     players: s.players,
     props: s.props,
     dice: s.dice,
+    doubles: s.doubles,
     log: s.log.slice(-40),
     ledger: s.ledger.slice(-150),
     auction: s.auction,

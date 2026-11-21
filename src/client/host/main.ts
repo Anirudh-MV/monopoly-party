@@ -11,7 +11,7 @@ import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
 import { rentFor, rentPreview } from '../../shared/rules.js'
 import type { HostView, LobbyInfo, PlayerState, Space } from '../../shared/types.js'
 import { Board3D } from './board3d.js'
-import { announce, bruh, heeHee, setVoiceEnabled, unlockAudio, voiceEnabled } from './voice.js'
+import { announce, bruh, doublesStreak, heeHee, setVoiceEnabled, unlockAudio, voiceEnabled } from './voice.js'
 
 interface HostAck {
   ok: boolean
@@ -247,9 +247,11 @@ function announceView(v: HostView): void {
   if (!prev) return
   const nameOf = (id: string | null | undefined): string => v.players.find((p) => p.id === id)?.name ?? 'someone'
 
-  // a fresh roll: "Maya rolled a 9"
+  // a fresh roll: "Maya rolled a 9" — and doubles escalate, one clip per
+  // streak length (three in a row is also the road to jail)
   if (v.dice && `${v.turn}:${v.dice.join()}` !== `${prev.turn}:${(prev.dice ?? []).join()}`) {
     announce(`${nameOf(v.currentPlayerId)} rolled a ${v.dice[0] + v.dice[1]}`)
+    if (v.dice[0] === v.dice[1]) doublesStreak(Math.max(1, v.doubles))
   }
 
   // card landings: the party sounds

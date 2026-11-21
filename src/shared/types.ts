@@ -205,6 +205,8 @@ export interface HostView {
   players: PlayerState[]
   props: Record<number, PropertyState>
   dice: [number, number] | null
+  /** Consecutive doubles this turn — the doubles-streak sounds follow it. */
+  doubles: number
   log: LogEntry[]
   ledger: MoneyEvent[]
   auction: AuctionState | null
