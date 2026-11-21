@@ -120,15 +120,61 @@ try {
   assert(curPhone.view.allowed.includes('roll'), "current player's phone offers ROLL")
 
   // ── drive the game via allowed actions ──
+  // Interactive rent (and auctions) pause the table on a pending decision;
+  // settleTable closes those so the script always drives from a live phase.
+  async function settleDebt() {
+    for (const p of phones) {
+      const acts = (p.view && p.view.allowed) || []
+      if (acts.includes('payDebt')) {
+        await emitAck(p.sock, 'game:action', { type: 'payDebt' })
+        await sleep(120)
+        return
+      }
+    }
+  }
+  async function settleAuction() {
+    for (const p of phones) {
+      const acts = (p.view && p.view.allowed) || []
+      if (acts.includes('passBid')) {
+        await emitAck(p.sock, 'game:action', { type: 'passBid' })
+        await sleep(80)
+      }
+    }
+  }
+  async function settleTable() {
+    for (let k = 0; k < 8; k++) {
+      if (lastHostView.debt) {
+        await settleDebt()
+        await sleep(120)
+        continue
+      }
+      if (lastHostView.auction) {
+        await settleAuction()
+        await sleep(120)
+        continue
+      }
+      if (lastHostView.pendingJail) {
+        // the announced arrest executes from the arrested player's phone
+        const arrested = phones.find((p) => p.id === lastHostView.pendingJail?.player)
+        if (arrested) await emitAck(arrested.sock, 'game:action', { type: 'goToJail' })
+        await sleep(120)
+        continue
+      }
+      return
+    }
+  }
+
   async function playRounds(n, label, minOk) {
     let okCount = 0
     for (let i = 0; i < n; i++) {
+      await settleTable()
       const me = phones.find((p) => p.id === lastHostView.currentPlayerId)
       if (!me || !me.view) break
       const acts = me.view.allowed || []
       const action =
         acts.includes('roll') ? { type: 'roll' }
         : acts.includes('drawCard') ? { type: 'drawCard' }
+        : acts.includes('goToJail') ? { type: 'goToJail' } // an announced arrest executes from the phone
         : acts.includes('payDebt') ? { type: 'payDebt' } // rent is paid by hand now
         : acts.includes('buy') ? { type: 'buy' }
         : acts.includes('declineBuy') ? { type: 'declineBuy' }
@@ -191,6 +237,7 @@ try {
   // The current player reconnects on a new socket; the OLD socket (still
   // open) tries to act for the seat first — and must be refused.
   {
+    await settleTable()
     const cur = phones.find((p) => p.id === lastHostView.currentPlayerId)
     const old = cur.sock
     const fresh = connect()
@@ -202,7 +249,7 @@ try {
     cur.sock = fresh
     await sleep(150)
     const acts = (cur.view && cur.view.allowed) || []
-    const pick = ['roll', 'drawCard', 'buy', 'declineBuy', 'passBid', 'payTax', 'endTurn']
+    const pick = ['payDebt', 'roll', 'drawCard', 'goToJail', 'buy', 'declineBuy', 'passBid', 'payTax', 'endTurn']
     const kind = pick.find((a) => acts.includes(a))
     const probe = kind === 'payTax' ? { type: 'payTax', choice: 'flat' } : kind ? { type: kind } : null
     assert(probe != null, 'current player has a probe action for the stale-socket test')
@@ -219,6 +266,11 @@ try {
   // phones are never allowed in
   const gbad = await emitAck(phones[0].sock, 'god:command', { cmd: 'skipTurn' })
   assert(gbad && !gbad.ok, 'phones cannot use the god console')
+
+  // interactive rent (or a leftover auction) can leave the table paused on
+  // a pending decision — settle it so the god flow runs from a clean phase
+  await settleTable()
+  assert(!lastHostView.debt && !lastHostView.auction, 'the table reached a clean phase for the god flow')
 
   // force a reveal and drive the drawer's phone through it
   {
@@ -268,8 +320,13 @@ try {
   // seat keeps rotating into the turn order, and its phone no longer
   // receives views.
   {
-    // never the current player, so the game keeps moving right after
-    const gone = phones.find((p) => p.id !== lastHostView.currentPlayerId)
+    // never the current player, and never the debtor (their pending Pay
+    // owns the table) — chosen from a settled state so the game keeps
+    // moving right after
+    await settleTable()
+    const gone = phones.find(
+      (p) => p.id !== lastHostView.currentPlayerId && p.id !== lastHostView.debt?.debtor,
+    )
     const goneToken = gone.token
     const before = lastHostView.players.length
 
@@ -289,9 +346,32 @@ try {
     assert(bres && !bres.ok, 'the destroyed token cannot rejoin')
     back.disconnect()
 
-    // everyone else keeps playing (turns that land on the empty seat are
-    // covered by the decision clock, so only the live turns count here)
-    await playRounds(6, 'post-exit gameplay', 2)
+    // everyone else keeps playing until the rotation reaches the empty seat
+    // (from there the decision clock owns it)
+    let okCount = 0
+    for (let i = 0; i < 8; i++) {
+      await settleTable()
+      if (lastHostView.currentPlayerId === gone.id) break
+      const me = phones.find((p) => p.id === lastHostView.currentPlayerId)
+      if (!me || !me.view) break
+      const acts = me.view.allowed || []
+      const action =
+        acts.includes('roll') ? { type: 'roll' }
+        : acts.includes('drawCard') ? { type: 'drawCard' }
+        : acts.includes('goToJail') ? { type: 'goToJail' }
+        : acts.includes('payDebt') ? { type: 'payDebt' }
+        : acts.includes('buy') ? { type: 'buy' }
+        : acts.includes('declineBuy') ? { type: 'declineBuy' }
+        : acts.includes('payTax') ? { type: 'payTax', choice: 'flat' }
+        : acts.includes('passBid') ? { type: 'passBid' }
+        : acts.includes('endTurn') ? { type: 'endTurn' }
+        : null
+      if (!action) break
+      const res = await emitAck(me.sock, 'game:action', action)
+      if (res.ok) okCount++
+      await sleep(60)
+    }
+    assert(okCount >= 1, `post-exit gameplay: ${okCount} actions accepted`)
 
     // and the exited phone can start over in a different room
     const tv2 = connect()

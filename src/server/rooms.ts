@@ -1356,6 +1356,11 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
 
         case 'forceDraw': {
           if (!s) return ack?.({ ok: false, error: 'No game running' })
+          // A pending debt or arrest owns the table until it settles —
+          // forcing a draw on top of either would leave a reveal nobody is
+          // allowed to open.
+          if (s.debt) return ack?.({ ok: false, error: 'A debt is pending — it must settle first' })
+          if (s.pendingJail) return ack?.({ ok: false, error: 'An arrest is pending — it must resolve first' })
           const name = s.players.find((p) => p.id === s.currentPlayerId)?.name ?? '?'
           godMutate(io, room, `forced a ${payload.deck === 'chest' ? 'Community Chest' : 'Chance'} draw for ${name}`, (n) => {
             n.pendingPurchase = null
