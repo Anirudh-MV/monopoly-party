@@ -33,7 +33,7 @@ function lanJoinUrls(): string[] {
   return urls
 }
 
-attach(io, () => lanJoinUrls())
+attach(io, () => lanJoinUrls(), path.resolve(process.env.SNAP_DIR ?? 'snapshots'))
 
 http.listen(PORT, '0.0.0.0', () => {
   console.log('')

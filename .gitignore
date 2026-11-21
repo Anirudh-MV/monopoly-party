@@ -1,5 +1,7 @@
 node_modules/
 dist/
+snapshots/
+snapshots-test/
 public/host.js
 public/host.js.map
 public/controller.js

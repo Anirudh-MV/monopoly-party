@@ -200,6 +200,7 @@ export interface HostView {
   lastLanded: { playerId: string; space: number } | null
   deadline: number | null
   deadlineFor: string | null
+  turnTimeoutMs: number
 }
 
 export interface PlayerView extends HostView {
@@ -223,4 +224,27 @@ export interface LobbyInfo {
   players: LobbyPlayer[]
   canStart: boolean
   hostId: string | null
+  /** Decision deadline in ms; 0 = off. Set by the host in the lobby. */
+  turnTimeoutMs: number
 }
+
+// ── God commands (TV host console only) ──
+// Emergency operator controls: if the game hits a bug mid-party, the host
+// can rescue the state instead of starting over. Every command is logged
+// into the game log so the table sees what was done.
+
+export type GodCommand =
+  | { cmd: 'skipTurn' }
+  | { cmd: 'replayTurn'; playerId?: string }
+  | { cmd: 'setCash'; playerId: string; amount: number }
+  | { cmd: 'setPos'; playerId: string; pos: number; jail?: boolean }
+  | { cmd: 'setJail'; playerId: string; jail: boolean }
+  | { cmd: 'setJailCards'; playerId: string; count: number }
+  | { cmd: 'setProperty'; space: number; owner: string | null }
+  | { cmd: 'setHouses'; space: number; count: number }
+  | { cmd: 'setMortgaged'; space: number; mortgaged: boolean }
+  | { cmd: 'forceDraw'; deck: 'chance' | 'chest' }
+  | { cmd: 'setTimer'; ms: number }
+  | { cmd: 'endGame'; winner?: string | null }
+  | { cmd: 'export' }
+  | { cmd: 'import'; json: unknown }

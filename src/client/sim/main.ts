@@ -7,6 +7,7 @@
 import { applyAction, createGame, type PlayerMeta } from '../../shared/engine.js'
 import { botAction, botActor } from '../../shared/bot.js'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
+import { gridPos, regionOf, cellHTML } from '../../shared/board-grid.js'
 import type { GameState, Space } from '../../shared/types.js'
 
 const NAMES = ['Asha', 'Ben', 'Cho', 'Dara', 'Eli', 'Faye', 'Gus', 'Hana']
@@ -75,54 +76,6 @@ function tick(): void {
 }
 
 // ── rendering ──
-
-function gridPos(i: number): { r: number; c: number } {
-  if (i === 0) return { r: 11, c: 11 }
-  if (i < 10) return { r: 11, c: 11 - i }
-  if (i === 10) return { r: 11, c: 1 }
-  if (i < 20) return { r: 11 - (i - 10), c: 1 }
-  if (i === 20) return { r: 1, c: 1 }
-  if (i < 30) return { r: 1, c: 1 + (i - 20) }
-  if (i === 30) return { r: 1, c: 11 }
-  return { r: 1 + (i - 30), c: 11 }
-}
-
-function regionOf(i: number): string {
-  if (i <= 10) return 'bottom'
-  if (i <= 20) return 'left'
-  if (i <= 30) return 'top'
-  return 'right'
-}
-
-function cellHTML(i: number, sp: Space): string {
-  if (isStreet(sp)) {
-    return `<div class="bar" style="background:${GROUP_COLORS[sp.group]}"></div>
-      <div class="nm">${sp.name}</div><div class="pr">$${sp.price}</div>
-      <div class="marks"></div><div class="toks"></div>`
-  }
-  switch (sp.kind) {
-    case 'rail':
-      return `<div class="bar rail"></div><div class="nm">🚂 ${sp.name}</div><div class="pr">$${sp.price}</div><div class="marks"></div><div class="toks"></div>`
-    case 'utility':
-      return `<div class="bar util"></div><div class="nm">${sp.name.includes('Electric') ? '💡' : '🚰'} ${sp.name}</div><div class="pr">$${sp.price}</div><div class="marks"></div><div class="toks"></div>`
-    case 'go':
-      return `<div class="corner">GO<div class="sub">collect $200</div></div><div class="toks"></div>`
-    case 'jail':
-      return `<div class="corner">🚔<div class="sub">JAIL / visiting</div></div><div class="toks"></div>`
-    case 'parking':
-      return `<div class="corner">🅿<div class="sub">free parking</div></div><div class="toks"></div>`
-    case 'gotojail':
-      return `<div class="corner">👮<div class="sub">go to jail</div></div><div class="toks"></div>`
-    case 'chance':
-      return `<div class="nm">❓ Chance</div><div class="marks"></div><div class="toks"></div>`
-    case 'chest':
-      return `<div class="nm">🎁 Community Chest</div><div class="marks"></div><div class="toks"></div>`
-    case 'tax':
-      return `<div class="nm">${sp.name}</div><div class="pr">${sp.percent ? 'flat or 10%' : `$${sp.flat}`}</div><div class="marks"></div><div class="toks"></div>`
-    default:
-      return ''
-  }
-}
 
 function buildBoard(): void {
   const board = document.createElement('div')

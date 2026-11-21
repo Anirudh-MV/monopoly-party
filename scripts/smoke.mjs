@@ -35,7 +35,7 @@ function emitAck(sock, event, ...args) {
 
 console.log('booting server …')
 const server = spawn(process.execPath, ['dist/server/index.js'], {
-  env: { ...process.env, PORT: String(PORT) },
+  env: { ...process.env, PORT: String(PORT), SNAP_DIR: 'snapshots-test' },
   stdio: ['ignore', 'pipe', 'pipe'],
 })
 server.stdout.on('data', (d) => process.stdout.write(d))
@@ -148,6 +148,54 @@ try {
   assert(phones[1].view != null && phones[1].view.you === phones[1].id, 'reconnected phone got its seat back')
 
   await playRounds(8, 'post-reconnect gameplay')
+
+  // ── god console ──
+  // phones are never allowed in
+  const gbad = await emitAck(phones[0].sock, 'god:command', { cmd: 'skipTurn' })
+  assert(gbad && !gbad.ok, 'phones cannot use the god console')
+
+  // force a reveal and drive the drawer's phone through it
+  {
+    const curPhone = phones.find((p) => p.id === lastHostView.currentPlayerId)
+    const seqBefore = curPhone.view.cardDrawSeq
+    const fres = await emitAck(host, 'god:command', { cmd: 'forceDraw', deck: 'chest' })
+    assert(fres.ok, 'god forced a Community Chest draw')
+    await sleep(150)
+    assert(
+      curPhone.view.pendingCardDraw && curPhone.view.pendingCardDraw.deck === 'chest',
+      "drawer's phone shows the Open prompt",
+    )
+    const dres = await emitAck(curPhone.sock, 'game:action', { type: 'drawCard' })
+    assert(dres.ok, 'drawer opens the chest from their phone')
+    await sleep(150)
+    assert(curPhone.view.pendingCard != null, 'the drawn card is in the view')
+    assert(curPhone.view.cardDrawSeq > seqBefore, 'reveal counted for animations')
+  }
+
+  // skip a turn
+  {
+    const before = lastHostView.currentPlayerId
+    const turnBefore = lastHostView.turn
+    const sres = await emitAck(host, 'god:command', { cmd: 'skipTurn' })
+    assert(sres.ok, 'god skipped the turn')
+    await sleep(150)
+    assert(
+      lastHostView.turn > turnBefore || lastHostView.currentPlayerId !== before,
+      'the game advanced after the skip',
+    )
+  }
+
+  // snapshot export → import round trip, then keep playing
+  {
+    const eres = await emitAck(host, 'god:command', { cmd: 'export' })
+    assert(eres.ok && eres.snapshot && eres.snapshot.state, 'export returned a snapshot with game state')
+    const turnBefore = lastHostView.turn
+    const ires = await emitAck(host, 'god:command', { cmd: 'import', json: eres.snapshot })
+    assert(ires.ok, 'import accepted the snapshot')
+    await sleep(150)
+    assert(lastHostView.turn === turnBefore, 'game resumed at the same turn after import')
+    await playRounds(6, 'post-import gameplay')
+  }
 
   // ── TV reconnect ──
   host.disconnect()

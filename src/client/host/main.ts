@@ -47,6 +47,28 @@ themeBtn.addEventListener('click', () => {
 })
 document.body.appendChild(themeBtn)
 
+// god console toggle — the operator's emergency exit for mid-game trouble
+const godBtn = document.createElement('button')
+godBtn.className = 'themetoggle godtoggle'
+godBtn.style.position = 'fixed'
+godBtn.style.top = '68px'
+godBtn.textContent = 'God'
+godBtn.addEventListener('click', () => {
+  godOpen = !godOpen
+  render()
+})
+document.body.appendChild(godBtn)
+
+function sendGod(payload: Record<string, unknown>, onResult?: (res: Record<string, unknown>) => void): void {
+  socket.emit('god:command', payload, (res: { ok: boolean; error?: string; snapshot?: unknown }) => {
+    if (!res.ok) {
+      godStatus = res.error ?? 'Command failed'
+      render()
+    }
+    onResult?.(res as Record<string, unknown>)
+  })
+}
+
 const socket = io()
 let view: HostView | null = null
 let lobby: LobbyInfo | null = null
@@ -54,9 +76,14 @@ let urls: string[] = []
 let gameBuilt = false
 
 // animation bookkeeping
-let lastRollKey = ''
+let lastDiceKey = ''
 let lastCardSeq = 0
 let revealUntil = 0
+
+// god console
+let godOpen = false
+let godPropSpace: number | null = null
+let godStatus = ''
 
 function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string)
@@ -102,6 +129,11 @@ $app.addEventListener('click', (ev) => {
   } else if (el.dataset.act === 'start') {
     socket.emit('game:start', {}, (res: { ok: boolean; error?: string }) => {
       if (!res.ok) console.warn('start failed:', res.error)
+    })
+  } else if (el.dataset.act === 'setTimer') {
+    const ms = Number(JSON.parse(el.dataset.args ?? '{}').ms ?? 300000)
+    socket.emit('room:settings', { turnTimeoutMs: ms }, (res: { ok: boolean; error?: string }) => {
+      if (!res.ok) console.warn('timer change failed:', res.error)
     })
   }
 })
@@ -152,6 +184,10 @@ function renderLobby(l: LobbyInfo): void {
         <ul class="playerlist">${players}</ul>
         <button class="big ${l.canStart ? '' : 'disabled'}" data-act="start">Start the game</button>
         ${l.canStart ? '' : '<p class="hint">Best with 3+ players — waiting…</p>'}
+        <label style="margin-top:2vh">Decision timer</label>
+        <div class="chips">${TIMERS.map(
+          ([label, ms]) => `<button class="chip ${l.turnTimeoutMs === ms ? 'sel' : ''}" data-act="setTimer" data-args='{"ms":${ms}}'>${label}</button>`,
+        ).join('')}</div>
       </div>
     </div>`
   const canvas = document.getElementById('qr') as HTMLCanvasElement | null
@@ -175,24 +211,55 @@ function renderGame(v: HostView): void {
       <div class="game">
         <div class="overlay queue" id="queue"></div>
         <div class="overlay ticker" id="ticker"></div>
+        <div class="dicebox" id="dicebox"></div>
         <div class="center3d" id="center"></div>
+        ${godOpen ? '<div class="godpanel" id="godpanel"></div>' : ''}
       </div>`
     gameBuilt = true
+  } else {
+    const panel = document.getElementById('godpanel')
+    if (godOpen && !panel) {
+      $app.querySelector('.game')?.insertAdjacentHTML('beforeend', '<div class="godpanel" id="godpanel"></div>')
+    } else if (!godOpen && panel) {
+      panel.remove()
+    }
   }
 
   // fresh card draw? play the reveal for the next few seconds
   if (v.cardDrawSeq > lastCardSeq && v.pendingCard) revealUntil = Date.now() + 3200
   lastCardSeq = v.cardDrawSeq
 
-  // fresh roll? tumbling dice first, THEN the piece starts hopping
-  const rollKey = `${v.turn}:${v.dice ? v.dice.join() : ''}`
-  if (v.dice && rollKey !== lastRollKey) board3d.delayHops(1150)
-  lastRollKey = rollKey
+  // fresh roll? hold the piece's hops until the tumbling dice settle —
+  // the delay must be armed BEFORE sync enqueues the hops.
+  if (v.dice && `${v.turn}:${v.dice.join()}` !== lastDiceKey) board3d.delayHops(1150)
 
   board3d.sync(v)
+  updateDice(v)
   updateQueue(v)
   updateTicker(v)
   updateCenter(v)
+  if (godOpen) updateGodPanel(v)
+}
+
+// The dice live in their OWN container, untouched by the center overlay's
+// frequent innerHTML rebuilds — so the tumble never restarts mid-animation.
+function updateDice(v: HostView): void {
+  const el = document.getElementById('dicebox')
+  if (!el) return
+  if (!v.dice) {
+    if (el.innerHTML !== '') {
+      el.innerHTML = ''
+      lastDiceKey = ''
+    }
+    return
+  }
+  const key = `${v.turn}:${v.dice.join()}`
+  if (key === lastDiceKey) return // never touch mid-animation
+  lastDiceKey = key
+  // hold the piece's hops until the tumbling dice settle
+  board3d.delayHops(1150)
+  el.innerHTML = `<div class="diceroll" aria-hidden="true">${dieHTML(v.dice[0], 0)}${dieHTML(v.dice[1], 0)}</div>`
+  kickDiceAnimation()
 }
 
 function updateQueue(v: HostView): void {
@@ -409,17 +476,179 @@ function updateCenter(v: HostView): void {
   if (v.trades.length > 0) captions.push(`${v.trades.length} trade offer${v.trades.length > 1 ? 's' : ''} on the table`)
   if (v.phase === 'ROLL') captions.push('Roll the dice!')
 
-  const dice = v.dice
-    ? `<div class="diceroll" aria-hidden="true">${dieHTML(v.dice[0], 0)}${dieHTML(v.dice[1], 0)}</div>`
-    : ''
-
   el.innerHTML = `
     ${cur ? `<div class="turn">${cur.token} <b>${esc(cur.name)}</b>'s turn</div>` : ''}
     ${landedCard(v)}
-    ${dice}
     ${captions.map((c) => `<div class="sub">${c}</div>`).join('')}`
-
-  if (v.dice) kickDiceAnimation()
 }
+
+// ── god console ──
+
+const TIMERS: Array<[string, number]> = [
+  ['Off', 0],
+  ['1 min', 60_000],
+  ['2 min', 120_000],
+  ['5 min', 300_000],
+  ['10 min', 600_000],
+]
+
+function updateGodPanel(v: HostView): void {
+  const el = document.getElementById('godpanel')
+  if (!el) return
+  const cur = v.players.find((p) => p.id === v.currentPlayerId)
+  const timerChips = TIMERS.map(
+    ([label, ms]) => `<button class="chip ${v.turnTimeoutMs === ms ? 'sel' : ''}" data-god='{"cmd":"setTimer","ms":${ms}}'>${label}</button>`,
+  ).join('')
+  const playerRows = v.players
+    .map(
+      (p) => `
+    <div class="gp-player" style="--c:${p.color}">
+      <div class="gp-pname">${p.token} ${esc(p.name)} — $${p.cash}${p.bankrupt ? ' (bankrupt)' : ''}${p.jail ? ' · in jail' : ''}</div>
+      <div class="gp-chips">
+        <button class="tiny" data-god='{"cmd":"setCash","playerId":"${p.id}","amount":${Math.max(0, p.cash - 100)}}'>-$100</button>
+        <button class="tiny" data-god='{"cmd":"setCash","playerId":"${p.id}","amount":${p.cash + 100}}'>+$100</button>
+        <button class="tiny" data-god='{"cmd":"setCash","playerId":"${p.id}","amount":${p.cash + 500}}'>+$500</button>
+        <button class="tiny" data-god='{"cmd":"promptCash","playerId":"${p.id}"}'>Set...</button>
+      </div>
+      <div class="gp-chips">
+        <button class="tiny" data-god='{"cmd":"setPos","playerId":"${p.id}","pos":${(p.pos + 39) % 40}}'>&#9664;</button>
+        <span class="gp-pos">space ${p.pos}</span>
+        <button class="tiny" data-god='{"cmd":"setPos","playerId":"${p.id}","pos":${(p.pos + 1) % 40}}'>&#9654;</button>
+        <button class="tiny" data-god='{"cmd":"setPos","playerId":"${p.id}","pos":${p.pos},"jail":${!p.jail}}'>${p.jail ? 'Release' : 'Jail'}</button>
+        <button class="tiny" data-god='{"cmd":"promptPos","playerId":"${p.id}"}'>Move...</button>
+      </div>
+    </div>`,
+    )
+    .join('')
+
+  const propRows = Object.entries(v.props)
+    .map(([iStr, st]) => ({ i: Number(iStr), st }))
+    .sort((a, b) => a.i - b.i)
+    .map(({ i, st }) => {
+      const sp = BOARD[i]
+      const owner = st.owner ? v.players.find((p) => p.id === st.owner) : null
+      const open = godPropSpace === i
+      const isStreetSpace = 'price' in sp && sp.kind === 'street'
+      return `<div class="gp-prop">
+      <button class="gp-propname" data-god='{"cmd":"propToggle","space":${i}}'>${esc(sp.name)} <span style="color:${owner?.color ?? 'var(--dim)'}">· ${owner ? esc(owner.name) : 'Bank'}</span>${st.houses > 0 ? ` · ${st.houses === 5 ? 'hotel' : `${st.houses}h`}` : ''}${st.mortgaged ? ' · mtg' : ''}</button>
+      ${open ? `
+        <div class="gp-chips">
+          <button class="tiny" data-god='{"cmd":"setProperty","space":${i},"owner":null}'>Bank</button>
+          ${v.players.map((p) => `<button class="tiny" data-god='{"cmd":"setProperty","space":${i},"owner":"${p.id}"}'>${p.token} ${esc(p.name)}</button>`).join('')}
+        </div>
+        ${isStreetSpace ? `
+        <div class="gp-chips">
+          <button class="tiny" data-god='{"cmd":"setHouses","space":${i},"count":${Math.max(0, st.houses - 1)}}'>-house</button>
+          <span class="gp-pos">${st.houses === 5 ? 'hotel' : `${st.houses} house(s)`}</span>
+          <button class="tiny" data-god='{"cmd":"setHouses","space":${i},"count":${Math.min(5, st.houses + 1)}}'>+house</button>
+        </div>` : ''}
+        <div class="gp-chips">
+          <button class="tiny" data-god='{"cmd":"setMortgaged","space":${i},"mortgaged":${!st.mortgaged}}'>${st.mortgaged ? 'Lift mortgage' : 'Mortgage'}</button>
+        </div>` : ''}
+    </div>`
+    })
+    .join('')
+
+  el.innerHTML = `
+    <div class="gp-head">GOD CONSOLE <span class="gp-status">${esc(godStatus)}</span></div>
+    ${v.phase !== 'GAME_OVER' ? `
+    <div class="gp-sec">TURN — ${cur ? esc(cur.name) : '—'}</div>
+    <div class="gp-chips">
+      <button data-god='{"cmd":"skipTurn"}'>Skip turn</button>
+      <button data-god='{"cmd":"replayTurn"}'>Replay current</button>
+    </div>
+    <div class="gp-chips">${v.players
+      .filter((p) => !p.bankrupt)
+      .map((p) => `<button class="chip" data-god='{"cmd":"replayTurn","playerId":"${p.id}"}'>Turn &#8594; ${p.token} ${esc(p.name)}</button>`)
+      .join('')}</div>
+    <div class="gp-sec">FORCE REVEAL</div>
+    <div class="gp-chips">
+      <button data-god='{"cmd":"forceDraw","deck":"chest"}'>Community Chest</button>
+      <button data-god='{"cmd":"forceDraw","deck":"chance"}'>Chance</button>
+    </div>` : ''}
+    <div class="gp-sec">DECISION TIMER</div>
+    <div class="gp-chips">${timerChips}</div>
+    <div class="gp-sec">PLAYERS</div>
+    ${playerRows}
+    <div class="gp-sec">PROPERTIES</div>
+    <div class="gp-proplist">${propRows}</div>
+    <div class="gp-sec">SNAPSHOT</div>
+    <div class="gp-chips">
+      <button data-god='{"cmd":"export"}'>Export JSON</button>
+      <button id="godImportBtn">Import JSON</button>
+      <button data-god='{"cmd":"endGame"}'>End game</button>
+    </div>`
+}
+
+function downloadSnapshot(snap: unknown): void {
+  const blob = new Blob([JSON.stringify(snap, null, 2)], { type: 'application/json' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = `monopoly-${view?.code ?? 'room'}-turn${view?.turn ?? 0}.json`
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
+function doImport(): void {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = '.json,application/json'
+  input.onchange = () => {
+    const file = input.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      try {
+        const json: unknown = JSON.parse(String(reader.result))
+        sendGod({ cmd: 'import', json })
+      } catch {
+        godStatus = 'That file is not valid JSON'
+        render()
+      }
+    }
+    reader.readAsText(file)
+  }
+  input.click()
+}
+
+$app.addEventListener('click', (ev) => {
+  const el = (ev.target as HTMLElement).closest('[data-god], #godImportBtn') as HTMLElement | null
+  if (!el) return
+  if (el.id === 'godImportBtn') {
+    doImport()
+    return
+  }
+  const args = JSON.parse(el.dataset.god ?? '{}') as Record<string, unknown>
+  if (args.cmd === 'promptCash') {
+    const n = Number(window.prompt('Set cash to...', '0') ?? Number.NaN)
+    if (Number.isFinite(n)) {
+      sendGod({ cmd: 'setCash', playerId: args.playerId, amount: Math.max(0, Math.floor(n)) })
+    }
+    return
+  }
+  if (args.cmd === 'promptPos') {
+    const n = Number(window.prompt('Move to space (0-39)...', '0') ?? Number.NaN)
+    if (Number.isFinite(n)) {
+      sendGod({ cmd: 'setPos', playerId: args.playerId, pos: Math.max(0, Math.min(39, Math.floor(n))) })
+    }
+    return
+  }
+  if (args.cmd === 'export') {
+    sendGod({ cmd: 'export' }, (res) => {
+      if (res.ok && res.snapshot) downloadSnapshot(res.snapshot)
+      else {
+        godStatus = String(res.error ?? 'Export failed')
+        render()
+      }
+    })
+    return
+  }
+  if (args.cmd === 'propToggle') {
+    godPropSpace = godPropSpace === Number(args.space) ? null : Number(args.space)
+    render()
+    return
+  }
+  sendGod(args)
+})
 
 render()

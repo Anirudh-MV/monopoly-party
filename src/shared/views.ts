@@ -5,7 +5,7 @@ import type { GameState, HostView, PlayerView } from './types.js'
 // the TV gets everything public; phones additionally get their own
 // allowed-actions list and the trade offers they're party to.
 
-export function hostView(s: GameState, code: string, hostId: string | null): HostView {
+export function hostView(s: GameState, code: string, hostId: string | null, turnTimeoutMs: number): HostView {
   return {
     code,
     phase: s.phase,
@@ -30,11 +30,12 @@ export function hostView(s: GameState, code: string, hostId: string | null): Hos
     lastLanded: s.lastLanded,
     deadline: s.deadline,
     deadlineFor: s.deadlineFor,
+    turnTimeoutMs,
   }
 }
 
-export function playerView(s: GameState, code: string, pid: string, hostId: string | null): PlayerView {
-  const base = hostView(s, code, hostId)
+export function playerView(s: GameState, code: string, pid: string, hostId: string | null, turnTimeoutMs: number): PlayerView {
+  const base = hostView(s, code, hostId, turnTimeoutMs)
   return {
     ...base,
     you: pid,

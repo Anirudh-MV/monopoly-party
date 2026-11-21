@@ -14,6 +14,7 @@
     "start": "node dist/server/index.js",
     "simulate": "tsx src/server/sim.ts",
     "scenarios": "tsx src/server/scenarios.ts",
+    "remedy": "tsx src/server/remedy-check.ts",
     "smoke": "npm run build && node scripts/smoke.mjs",
     "typecheck": "tsc --noEmit"
   },

@@ -7,20 +7,24 @@
 // Every applied action triggers a full view push (state is tiny — party scale).
 
 import { randomUUID } from 'node:crypto'
+import { mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
+import * as fsp from 'node:fs/promises'
+import path from 'node:path'
 import type { Server as IOServer, Socket } from 'socket.io'
 import { applyAction, createGame, type PlayerMeta } from '../shared/engine.js'
 import { hostView, playerView } from '../shared/views.js'
 import { allowedActions, alivePlayers, netWorth } from '../shared/rules.js'
-import type { Action, GameState, LobbyInfo, LobbyPlayer } from '../shared/types.js'
+import type { Action, GameState, GodCommand, LobbyInfo, LobbyPlayer } from '../shared/types.js'
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ' // no I/O — they confuse party guests
 const MAX_PLAYERS = 8
 const MIN_PLAYERS = 2
 const ROOM_TTL_MS = 3 * 60 * 60 * 1000
-// Every decision point gets 5 minutes. Phones only show the countdown in
-// the final 30 seconds; when it expires the server plays a sensible default
-// so a stalled phone can never stall the table.
-const TURN_TIMEOUT_MS = 300_000
+// Every decision point gets 5 minutes by default (host-configurable in the
+// lobby, or live from the god console). Phones only show the countdown in
+// the final 30 seconds; on expiry the server plays a sensible default so a
+// stalled phone can never stall the table.
+const DEFAULT_TURN_TIMEOUT_MS = 300_000
 
 const PLAYER_COLORS = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316', '#06b6d4', '#ec4899']
 const PLAYER_TOKENS = ['🎩', '🚗', '🐕', '🚢', '👞', '🐈', '🛴', '🍀']
@@ -35,6 +39,7 @@ interface Room {
   code: string
   hostToken: string // TV rejoin secret
   hostPlayerId: string | null // the player who is "party host" (crown)
+  turnTimeoutMs: number // decision deadline; 0 = off
   state: GameState | null
   hostSockets: Set<string>
   players: PlayerEntry[]
@@ -82,6 +87,7 @@ function lobbyInfo(room: Room): LobbyInfo {
     players,
     canStart: room.players.length >= MIN_PLAYERS,
     hostId: room.hostPlayerId,
+    turnTimeoutMs: room.turnTimeoutMs,
   }
 }
 
@@ -117,6 +123,7 @@ function broadcastLobby(io: IOServer, room: Room): void {
   const info = lobbyInfo(room)
   io.to(hostRoom(room.code)).emit('lobby', info)
   for (const e of room.players) io.to(playerRoom(room.code, e.meta.id)).emit('lobby', info)
+  void saveRoom(room)
 }
 
 function broadcastGame(io: IOServer, room: Room): void {
@@ -146,31 +153,57 @@ function broadcastGame(io: IOServer, room: Room): void {
   }
 
   // Stall watchdog: if a live game reaches a state where NOBODY can act
-  // (a rules-combination bug), auto-remedy instead of hanging the party,
-  // and log the state loudly so the bug can be fixed.
+  // (a rules-combination bug), attempt a targeted rescue instead of hanging
+  // the party — and fall through to normal emission either way, so a failed
+  // remedy never leaves clients on a stale view.
   if (s.phase !== 'GAME_OVER' && !room.watchdogBusy && alivePlayers(s).length > 1) {
     const stuck = alivePlayers(s).every((q) => allowedActions(s, q.id).length === 0)
     if (stuck) {
-      console.error(`[watchdog] room ${room.code}: stuck at phase ${s.phase}, turn ${s.turn} — auto-remedying`)
+      console.error(`[watchdog] room ${room.code}: stuck at phase ${s.phase}, turn ${s.turn} — attempting remedy`)
+      const remedy = remedyActionsFor(s)
+      let committed = false
       room.watchdogBusy = true
       try {
-        if (s.phase === 'ACTION') applyServerAction(room, [[s.currentPlayerId, { type: 'endTurn' }]])
-        else if (s.phase === 'ROLL') applyServerAction(room, [[s.currentPlayerId, { type: 'roll' }]])
-        else if (s.phase === 'DEBT' && s.debt) applyServerAction(room, [[s.debt.debtor, { type: 'bankrupt' }]])
+        if (remedy.length > 0) committed = applyServerAction(room, remedy)
       } finally {
         room.watchdogBusy = false
       }
-      return // the nested broadcastGame (if any) has already shipped views
+      if (committed) return // the nested broadcastGame shipped views + snapshot
+      console.error(
+        `[watchdog] room ${room.code}: remedy ${remedy.length > 0 ? 'rejected' : 'unavailable'} — shipping state as-is for diagnosis`,
+      )
+      // fall through: emit whatever we have
     }
   }
 
   // The deadline lives on the state so every view carries it.
   scheduleDeadline(room)
 
-  io.to(hostRoom(room.code)).emit('view', hostView(s, room.code, room.hostPlayerId))
+  io.to(hostRoom(room.code)).emit('view', hostView(s, room.code, room.hostPlayerId, room.turnTimeoutMs))
   for (const e of room.players) {
-    io.to(playerRoom(room.code, e.meta.id)).emit('view', playerView(s, room.code, e.meta.id, room.hostPlayerId))
+    io.to(playerRoom(room.code, e.meta.id)).emit('view', playerView(s, room.code, e.meta.id, room.hostPlayerId, room.turnTimeoutMs))
   }
+  void saveRoom(room)
+}
+
+// The rescue the watchdog plays for a stuck state, by phase and pendings:
+// reveal any pending card, resolve any pending purchase/tax, then fall back
+// to advancing the turn. Pure — exported for the remedy checks.
+export function remedyActionsFor(s: GameState): Array<[string, Action]> {
+  const cur = s.currentPlayerId
+  if (s.phase === 'DEBT' && s.debt) {
+    const p = s.players.find((q) => q.id === s.debt?.debtor)
+    const amount = s.debt.amount
+    return [[s.debt.debtor, p && p.cash >= amount ? { type: 'payDebt' } : { type: 'bankrupt' }]]
+  }
+  if (s.phase === 'ACTION') {
+    if (s.pendingCardDraw) return [[cur, { type: 'drawCard' }]]
+    if (s.pendingPurchase != null) return [[cur, { type: 'declineBuy' }]]
+    if (s.pendingTax) return [[cur, { type: 'payTax', choice: 'flat' }]]
+    return [[cur, { type: 'endTurn' }]]
+  }
+  if (s.phase === 'ROLL') return [[cur, { type: 'roll' }]]
+  return []
 }
 
 function broadcast(room: Room, io: IOServer): void {
@@ -229,6 +262,15 @@ function autoActionsFor(room: Room, d: Decision): Array<[string, Action]> {
 function scheduleDeadline(room: Room): void {
   const s = room.state
   if (!s) return
+  if (room.turnTimeoutMs <= 0) {
+    // Host disabled the decision clock entirely.
+    if (room.timer) clearTimeout(room.timer)
+    room.timer = null
+    room.timerKey = null
+    s.deadline = null
+    s.deadlineFor = null
+    return
+  }
   const decision = currentDecision(s)
   if (!decision) {
     if (room.timer) clearTimeout(room.timer)
@@ -241,7 +283,7 @@ function scheduleDeadline(room: Room): void {
   if (room.timerKey === decision.key) return // already ticking for this decision
   if (room.timer) clearTimeout(room.timer)
   room.timerKey = decision.key
-  s.deadline = Date.now() + TURN_TIMEOUT_MS
+  s.deadline = Date.now() + room.turnTimeoutMs
   s.deadlineFor = decision.playerId
   room.timer = setTimeout(() => {
     room.timer = null
@@ -262,7 +304,7 @@ function scheduleDeadline(room: Room): void {
         }
       }
     }
-  }, TURN_TIMEOUT_MS)
+  }, room.turnTimeoutMs)
 }
 
 // Timer-side commit path: same clone-apply-commit rules as player actions,
@@ -286,8 +328,123 @@ function applyServerAction(room: Room, autos: Array<[string, Action]>): boolean 
   return committed
 }
 
-export function attach(io: IOServer, getJoinUrls: () => string[]): void {
+// ── Room snapshots ──
+// Every state change is persisted to disk, so a dev restart never ends the
+// party: on boot the rooms come back and phones rejoin via their tokens.
+// The same serialization powers the god console's export/import.
+
+interface RoomSnapshot {
+  v: number
+  code: string
+  hostToken: string
+  hostPlayerId: string | null
+  turnTimeoutMs: number
+  players: Array<{ meta: PlayerMeta; token: string }>
+  state: GameState | null
+}
+
+function serializeRoom(room: Room): RoomSnapshot {
+  return {
+    v: 1,
+    code: room.code,
+    hostToken: room.hostToken,
+    hostPlayerId: room.hostPlayerId,
+    turnTimeoutMs: room.turnTimeoutMs,
+    players: room.players.map((e) => ({ meta: e.meta, token: e.token })),
+    state: room.state,
+  }
+}
+
+let SNAP_DIR = 'snapshots'
+
+async function saveRoom(room: Room): Promise<void> {
+  try {
+    await fsp.mkdir(SNAP_DIR, { recursive: true })
+    await fsp.writeFile(path.join(SNAP_DIR, `${room.code}.json`), JSON.stringify(serializeRoom(room)))
+  } catch (e) {
+    console.error(`[snapshots] failed to save ${room.code}:`, e)
+  }
+}
+
+function loadSnapshots(): void {
+  try {
+    mkdirSync(SNAP_DIR, { recursive: true })
+    for (const f of readdirSync(SNAP_DIR).filter((x) => x.endsWith('.json'))) {
+      try {
+        const raw = JSON.parse(readFileSync(path.join(SNAP_DIR, f), 'utf8')) as RoomSnapshot
+        if (typeof raw.code !== 'string' || !Array.isArray(raw.players)) continue
+        const room: Room = {
+          code: raw.code,
+          hostToken: String(raw.hostToken ?? ''),
+          hostPlayerId: raw.hostPlayerId ?? null,
+          turnTimeoutMs: Number(raw.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS),
+          state: raw.state ?? null,
+          hostSockets: new Set(),
+          players: raw.players.map((e) => ({ meta: e.meta, token: e.token, socketId: null })),
+          lastActive: Date.now(),
+          timer: null,
+          timerKey: null,
+          watchdogBusy: false,
+        }
+        rooms.set(room.code, room)
+        for (const e of room.players) playerTokens.set(e.token, { code: room.code, playerId: e.meta.id })
+        console.log(
+          `[snapshots] restored room ${room.code} (${room.players.length} players, ${room.state ? `turn ${room.state.turn}` : 'lobby'})`,
+        )
+      } catch (e) {
+        console.error(`[snapshots] failed to restore ${f}:`, e)
+      }
+    }
+  } catch {
+    /* no snapshot dir yet — fine */
+  }
+}
+
+// ── God console ──
+// Emergency operator controls for the TV host: rescue turns, edit wallets,
+// reassign properties, force reveals, export/import the whole game.
+
+function godLog(next: GameState, note: string): void {
+  next.log.push({ text: `GOD: ${note}`, kind: 'info' })
+}
+
+function godMutate(io: IOServer, room: Room, note: string, fn: (s: GameState) => void): boolean {
+  const s = room.state
+  if (!s) return false
+  const next = structuredClone(s)
+  fn(next)
+  godLog(next, note)
+  room.state = next
+  broadcastGame(io, room)
+  return true
+}
+
+function restoreRoomFromSnapshot(room: Room, data: unknown): boolean {
+  if (!data || typeof data !== 'object') return false
+  const d = data as Record<string, unknown>
+  const st = (d.state ?? null) as GameState | null
+  if (st && (!Array.isArray(st.players) || typeof st.phase !== 'string')) return false
+  if (!Array.isArray(d.players)) return false
+  const prevConnected = new Map(room.players.map((e) => [e.meta.id, e.socketId]))
+  // re-key rejoin tokens to the incoming seats
+  for (const [tok, ref] of playerTokens) if (ref.code === room.code) playerTokens.delete(tok)
+  room.hostPlayerId = (d.hostPlayerId as string | null) ?? null
+  room.turnTimeoutMs = Number(d.turnTimeoutMs ?? room.turnTimeoutMs)
+  room.players = (d.players as Array<{ meta: PlayerMeta; token: string }>).map((e) => ({
+    meta: e.meta,
+    token: e.token,
+    // same-room imports keep live sockets attached to their seats
+    socketId: prevConnected.get(e.meta.id) ?? null,
+  }))
+  for (const e of room.players) playerTokens.set(e.token, { code: room.code, playerId: e.meta.id })
+  room.state = st
+  return true
+}
+
+export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 'snapshots'): void {
   ioRef = io
+  SNAP_DIR = snapshotDir
+  loadSnapshots()
   io.on('connection', (socket: Socket) => {
     const data = socket.data as SocketData
     socket.onAny(() => {
@@ -301,6 +458,7 @@ export function attach(io: IOServer, getJoinUrls: () => string[]): void {
         code: newCode(),
         hostToken: randomUUID(),
         hostPlayerId: null,
+        turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS,
         state: null,
         hostSockets: new Set(),
         players: [],
@@ -328,7 +486,7 @@ export function attach(io: IOServer, getJoinUrls: () => string[]): void {
       room.hostSockets.add(socket.id)
       data.code = room.code
       data.role = 'host'
-      if (room.state) socket.emit('view', hostView(room.state, room.code, room.hostPlayerId))
+      if (room.state) socket.emit('view', hostView(room.state, room.code, room.hostPlayerId, room.turnTimeoutMs))
       else socket.emit('lobby', lobbyInfo(room))
       ack?.({ ok: true, code: room.code, urls: getJoinUrls() })
     })
@@ -448,6 +606,248 @@ export function attach(io: IOServer, getJoinUrls: () => string[]): void {
       ack?.({ ok: true })
     })
 
+    // ── Host lobby settings ──
+    socket.on(
+      'room:settings',
+      (payload: { turnTimeoutMs?: number }, ack?: (res: unknown) => void) => {
+        const room = data.code ? rooms.get(data.code) : undefined
+        if (!room) return ack?.({ ok: false, error: 'Room not found' })
+        const isTvHost = room.hostSockets.has(socket.id)
+        const isPartyHost = data.role === 'player' && data.playerId === room.hostPlayerId
+        if (!isTvHost && !isPartyHost) return ack?.({ ok: false, error: 'Hosts only' })
+        const raw = Number(payload?.turnTimeoutMs)
+        const ms = Number.isFinite(raw) ? Math.max(0, Math.min(3_600_000, Math.floor(raw))) : room.turnTimeoutMs
+        room.turnTimeoutMs = ms
+        if (room.state) {
+          godMutate(io, room, `decision timer ${ms === 0 ? 'disabled' : `set to ${Math.round(ms / 1000)}s`}`, () => {})
+        } else {
+          broadcastLobby(io, room)
+          void saveRoom(room)
+        }
+        ack?.({ ok: true })
+      },
+    )
+
+    // ── God console (TV hosts only) ──
+    socket.on('god:command', (payload: GodCommand, ack?: (res: unknown) => void) => {
+      const room = data.code ? rooms.get(data.code) : undefined
+      if (!room || !room.hostSockets.has(socket.id)) {
+        return ack?.({ ok: false, error: 'The god console is only available on the TV screen' })
+      }
+      const s = room.state
+
+      switch (payload.cmd) {
+        case 'skipTurn': {
+          if (!s) return ack?.({ ok: false, error: 'No game running' })
+          const skipped = s.players.find((p) => p.id === s.currentPlayerId)?.name ?? 'the current player'
+          godMutate(io, room, `skipped ${skipped}'s turn`, (n) => {
+            n.pendingPurchase = null
+            n.pendingTax = null
+            n.pendingCardDraw = null
+            n.pendingCard = null
+            n.pendingMove = null
+            n.debt = null
+            n.debtQueue = []
+            n.auction = null
+            n.auctionQueue = []
+            n.dice = null
+            n.doubles = 0
+            // advance the turn pointer manually (nextPlayer lives in the engine)
+            const k = n.players.findIndex((q) => q.id === n.currentPlayerId)
+            for (let step = 1; step <= n.players.length; step++) {
+              const cand = n.players[(k + step) % n.players.length]
+              if (cand && !cand.bankrupt) {
+                n.currentPlayerId = cand.id
+                break
+              }
+            }
+            n.turn++
+            n.phase = 'ROLL'
+          })
+          return ack?.({ ok: true })
+        }
+
+        case 'replayTurn': {
+          if (!s) return ack?.({ ok: false, error: 'No game running' })
+          const target = payload.playerId ?? s.currentPlayerId
+          const name = s.players.find((p) => p.id === target)?.name ?? '?'
+          godMutate(io, room, `handed the turn back to ${name}`, (n) => {
+            n.currentPlayerId = target
+            n.phase = 'ROLL'
+            n.dice = null
+            n.doubles = 0
+            n.pendingPurchase = null
+            n.pendingTax = null
+            n.pendingCardDraw = null
+            n.pendingMove = null
+            n.debt = null
+            n.debtQueue = []
+            n.auction = null
+            n.auctionQueue = []
+          })
+          return ack?.({ ok: true })
+        }
+
+        case 'setCash': {
+          if (!s) return ack?.({ ok: false, error: 'No game running' })
+          const amount = Math.max(0, Math.floor(Number(payload.amount)))
+          const name = s.players.find((p) => p.id === payload.playerId)?.name ?? '?'
+          godMutate(io, room, `set ${name}'s cash to $${amount}`, (n) => {
+            const p = n.players.find((q) => q.id === payload.playerId)
+            if (p) p.cash = amount
+          })
+          return ack?.({ ok: true })
+        }
+
+        case 'setPos': {
+          if (!s) return ack?.({ ok: false, error: 'No game running' })
+          const pos = Math.max(0, Math.min(39, Math.floor(Number(payload.pos))))
+          const name = s.players.find((p) => p.id === payload.playerId)?.name ?? '?'
+          godMutate(io, room, `moved ${name} to ${pos === 10 && payload.jail ? 'jail' : `space ${pos}`}`, (n) => {
+            const p = n.players.find((q) => q.id === payload.playerId)
+            if (p) {
+              p.pos = pos
+              if (payload.jail !== undefined) {
+                p.jail = payload.jail
+                if (payload.jail) p.jailRolls = 0
+              }
+            }
+          })
+          return ack?.({ ok: true })
+        }
+
+        case 'setJail': {
+          if (!s) return ack?.({ ok: false, error: 'No game running' })
+          const name = s.players.find((p) => p.id === payload.playerId)?.name ?? '?'
+          godMutate(io, room, `${payload.jail ? 'jailed' : 'released'} ${name}`, (n) => {
+            const p = n.players.find((q) => q.id === payload.playerId)
+            if (p) {
+              p.jail = payload.jail
+              if (payload.jail) {
+                p.pos = 10
+                p.jailRolls = 0
+              }
+            }
+          })
+          return ack?.({ ok: true })
+        }
+
+        case 'setJailCards': {
+          if (!s) return ack?.({ ok: false, error: 'No game running' })
+          const count = Math.max(0, Math.min(5, Math.floor(Number(payload.count))))
+          const name = s.players.find((p) => p.id === payload.playerId)?.name ?? '?'
+          godMutate(io, room, `set ${name}'s jail cards to ${count}`, (n) => {
+            const p = n.players.find((q) => q.id === payload.playerId)
+            if (p) p.jailCards = count
+          })
+          return ack?.({ ok: true })
+        }
+
+        case 'setProperty': {
+          if (!s) return ack?.({ ok: false, error: 'No game running' })
+          const st = s.props[payload.space]
+          if (!st) return ack?.({ ok: false, error: 'Not a purchasable space' })
+          const ownerName = payload.owner ? (s.players.find((p) => p.id === payload.owner)?.name ?? 'a player') : 'the bank'
+          godMutate(io, room, `gave space ${payload.space} to ${ownerName}`, (n) => {
+            const t = n.props[payload.space]
+            if (t) t.owner = payload.owner
+          })
+          return ack?.({ ok: true })
+        }
+
+        case 'setHouses': {
+          if (!s) return ack?.({ ok: false, error: 'No game running' })
+          const st = s.props[payload.space]
+          if (!st) return ack?.({ ok: false, error: 'Not a street' })
+          const count = Math.max(0, Math.min(5, Math.floor(Number(payload.count))))
+          godMutate(io, room, `set space ${payload.space} to ${count === 5 ? 'hotel' : `${count} house(s)`}`, (n) => {
+            const t = n.props[payload.space]
+            if (t) t.houses = count
+          })
+          return ack?.({ ok: true })
+        }
+
+        case 'setMortgaged': {
+          if (!s) return ack?.({ ok: false, error: 'No game running' })
+          const st = s.props[payload.space]
+          if (!st) return ack?.({ ok: false, error: 'Not a purchasable space' })
+          godMutate(io, room, `${payload.mortgaged ? 'mortgaged' : 'lifted the mortgage on'} space ${payload.space}`, (n) => {
+            const t = n.props[payload.space]
+            if (t) t.mortgaged = payload.mortgaged
+          })
+          return ack?.({ ok: true })
+        }
+
+        case 'forceDraw': {
+          if (!s) return ack?.({ ok: false, error: 'No game running' })
+          const name = s.players.find((p) => p.id === s.currentPlayerId)?.name ?? '?'
+          godMutate(io, room, `forced a ${payload.deck === 'chest' ? 'Community Chest' : 'Chance'} draw for ${name}`, (n) => {
+            n.pendingPurchase = null
+            n.pendingTax = null
+            const cur = n.players.find((q) => q.id === n.currentPlayerId)
+            n.pendingCardDraw = cur
+              ? { player: cur.id, deck: payload.deck, space: cur.pos }
+              : null
+            n.phase = 'ACTION'
+          })
+          return ack?.({ ok: true })
+        }
+
+        case 'setTimer': {
+          const raw = Math.floor(Number(payload.ms))
+          const ms = Number.isFinite(raw) ? Math.max(0, Math.min(3_600_000, raw)) : room.turnTimeoutMs
+          room.turnTimeoutMs = ms
+          if (s) {
+            godMutate(io, room, `decision timer ${ms === 0 ? 'disabled' : `set to ${Math.round(ms / 1000)}s`}`, () => {})
+          } else {
+            broadcastLobby(io, room)
+            void saveRoom(room)
+          }
+          return ack?.({ ok: true })
+        }
+
+        case 'endGame': {
+          if (!s) return ack?.({ ok: false, error: 'No game running' })
+          const winner = payload.winner
+            ? (s.players.find((p) => p.id === payload.winner)?.name ?? 'nobody')
+            : (s.players.find((p) => p.id === s.winner)?.name ?? 'nobody')
+          godMutate(io, room, `ended the game — ${winner} wins`, (n) => {
+            n.phase = 'GAME_OVER'
+            n.winner = payload.winner ?? n.winner
+            n.pendingPurchase = null
+            n.pendingTax = null
+            n.pendingCardDraw = null
+            n.debt = null
+            n.debtQueue = []
+            n.auction = null
+            n.auctionQueue = []
+          })
+          return ack?.({ ok: true })
+        }
+
+        case 'export': {
+          return ack?.({ ok: true, snapshot: serializeRoom(room) })
+        }
+
+        case 'import': {
+          if (!restoreRoomFromSnapshot(room, payload.json)) {
+            return ack?.({ ok: false, error: 'That file is not a valid game snapshot' })
+          }
+          if (room.state) {
+            godLog(room.state, 'imported a game snapshot')
+            broadcastGame(io, room)
+          } else {
+            broadcastLobby(io, room)
+            void saveRoom(room)
+          }
+          return ack?.({ ok: true })
+        }
+
+        default:
+          return ack?.({ ok: false, error: 'Unknown god command' })
+      }
+    })
+
     socket.on('disconnect', () => {
       const room = data.code ? rooms.get(data.code) : undefined
       if (!room) return
@@ -469,6 +869,11 @@ export function attach(io: IOServer, getJoinUrls: () => string[]): void {
       if (now - room.lastActive > ROOM_TTL_MS && room.hostSockets.size === 0) {
         rooms.delete(code)
         for (const [tok, ref] of playerTokens) if (ref.code === code) playerTokens.delete(tok)
+        try {
+          unlinkSync(path.join(SNAP_DIR, `${code}.json`))
+        } catch {
+          /* already gone */
+        }
       }
     }
   }, 15 * 60 * 1000).unref?.()

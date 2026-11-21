@@ -59,7 +59,6 @@ let composer: Composer | null = null
 
 // animation bookkeeping
 let lastCardSeq = -1
-let seenFirstView = false
 
 // ledger tab (defaults to "me")
 let ledgerTab: string | null = null
@@ -151,7 +150,6 @@ socket.on('view', (v: PlayerView) => {
   rejoinPending = false
 
   // fresh card draw? play the reveal once (never replay stale ones)
-  if (lastCardSeq < 0) seenFirstView = true
   if (v.cardDrawSeq > lastCardSeq && lastCardSeq >= 0 && v.pendingCard) {
     showReveal(v.pendingCard)
   }
