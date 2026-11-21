@@ -28,6 +28,7 @@ export function hostView(s: GameState, code: string, hostId: string | null, turn
     winner: s.winner,
     trades: s.trades,
     lastLanded: s.lastLanded,
+    lastMove: s.lastMove,
     deadline: s.deadline,
     deadlineFor: s.deadlineFor,
     turnTimeoutMs,

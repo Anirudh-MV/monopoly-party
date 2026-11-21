@@ -86,7 +86,8 @@ function scenario(name: string, playerCount: number, fn: (h: Helpers) => void): 
     },
     eq: (a, b, msg) => {
       checks++
-      if (a !== b) failures.push(`${name}: ${msg} — got ${JSON.stringify(a)}, want ${JSON.stringify(b)}`)
+      const same = a === b || JSON.stringify(a) === JSON.stringify(b)
+      if (!same) failures.push(`${name}: ${msg} — got ${JSON.stringify(a)}, want ${JSON.stringify(b)}`)
     },
   }
   try {
@@ -320,6 +321,7 @@ scenario('chance: nearest utility charges 10× a fresh roll', 4, (h) => {
   h.roll(0, [[1, 1]]) // → 22 Chance, then fresh utility roll 5+2
   h.ok(h.act(0, { type: 'drawCard' }, [[5, 2]]), 'spin') // the rigged pair feeds the fresh roll
   h.eq(h.p(0).pos, 28, 'advanced to Water Works')
+  h.eq(h.s.lastMove != null && h.s.lastMove.path, [23, 24, 25, 26, 27, 28], 'the stroll to the utility is recorded tile-by-tile for the TV')
   h.eq(h.p(0).cash, 1430, 'paid 10 × 7 = $70')
 })
 
@@ -330,6 +332,8 @@ scenario('chance: advance to Illinois crosses GO and pays $200', 4, (h) => {
   h.roll(0, [[1, 1]]) // → 36 Chance → Illinois (24)
   h.ok(h.act(0, { type: 'drawCard' }), 'spin')
   h.eq(h.p(0).pos, 24, 'advanced to Illinois Ave')
+  h.eq(h.s.lastMove != null && h.s.lastMove.path.length, 28, 'a 28-tile wrap stroll around the board')
+  h.eq(h.s.lastMove != null && h.s.lastMove.path[27], 24, 'ending on Illinois')
   h.eq(h.p(0).cash, 1700, 'collected GO money on the wrap')
 })
 
@@ -341,6 +345,7 @@ scenario('chance: go back 3 spaces chains into Community Chest', 4, (h) => {
   h.roll(0, [[1, 1]]) // → 36 Chance
   h.ok(h.act(0, { type: 'drawCard' }), 'spin the wheel')
   h.eq(h.p(0).pos, 33, 'back 3 onto Community Chest')
+  h.eq(h.s.lastMove != null && h.s.lastMove.path, [35, 34, 33], 'backward moves record their path in walk order')
   h.eq(h.s.pendingCardDraw != null && h.s.pendingCardDraw.deck, 'chest', 'the chained chest also prompts')
   h.ok(h.act(0, { type: 'drawCard' }), 'open the chained chest')
   h.eq(h.p(0).cash, 1400, 'drew and paid the chest card')

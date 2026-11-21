@@ -103,6 +103,7 @@ export function createGame(players: PlayerMeta[], rng: () => number = Math.rando
     debtQueue: [],
     trades: [],
     lastLanded: null,
+    lastMove: null,
     ledger: [],
     deadline: null,
     deadlineFor: null,
@@ -219,6 +220,9 @@ function advance(s: GameState, steps: number, rng: () => number): void {
     logMoney(s, p.id, GO_REWARD, 'Passed GO')
     log(s, `${p.name} passed GO and collected $${GO_REWARD}`, 'money')
   }
+  const path: number[] = []
+  for (let k = 1; k <= steps; k++) path.push((p.pos + k) % BOARD.length)
+  s.lastMove = { playerId: p.id, path }
   p.pos = np
   land(s, p, {}, rng)
   advancePhase(s)
@@ -228,7 +232,8 @@ function sendToJail(s: GameState, p: PlayerState): void {
   p.pos = JAIL_POS
   p.jail = true
   p.jailRolls = 0
-  log(s, `${p.name} was thrown in jail! 🚔`, 'bad')
+  s.lastMove = null // a jail ride is a snap, not a stroll
+  log(s, `${p.name} was thrown in jail!`, 'bad')
 }
 
 function land(s: GameState, p: PlayerState, opts: { railMult?: number; utilMult?: number }, rng: () => number): void {
@@ -337,11 +342,20 @@ function applyCard(s: GameState, p: PlayerState, card: Card, rng: () => number):
         logMoney(s, p.id, GO_REWARD, 'Passed GO')
         log(s, `${p.name} passed GO (+$${GO_REWARD})`, 'money')
       }
+      const steps = (e.target - p.pos + BOARD.length) % BOARD.length
+      const path: number[] = []
+      for (let k = 1; k <= steps; k++) path.push((p.pos + k) % BOARD.length)
+      s.lastMove = { playerId: p.id, path }
       p.pos = e.target
       land(s, p, {}, rng)
       break
     }
     case 'move': {
+      const path: number[] = []
+      for (let k = 1; k <= Math.abs(e.steps); k++) {
+        path.push((p.pos + (e.steps > 0 ? k : -k) + BOARD.length) % BOARD.length)
+      }
+      s.lastMove = { playerId: p.id, path }
       p.pos = (p.pos + e.steps + BOARD.length) % BOARD.length
       land(s, p, {}, rng)
       break
@@ -353,6 +367,10 @@ function applyCard(s: GameState, p: PlayerState, card: Card, rng: () => number):
         logMoney(s, p.id, GO_REWARD, 'Passed GO')
         log(s, `${p.name} passed GO (+$${GO_REWARD})`, 'money')
       }
+      const steps = (t - p.pos + BOARD.length) % BOARD.length
+      const path: number[] = []
+      for (let k = 1; k <= steps; k++) path.push((p.pos + k) % BOARD.length)
+      s.lastMove = { playerId: p.id, path }
       p.pos = t
       if (e.target === 'rail') {
         land(s, p, { railMult: 2 }, rng)

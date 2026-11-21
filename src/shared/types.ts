@@ -119,6 +119,10 @@ export interface GameState {
   trades: TradeOffer[]
   // The space the current player most recently landed on — the TV spotlights it.
   lastLanded: { playerId: string; space: number } | null
+  // How the active piece last moved — the exact tile-by-tile path, so the TV
+  // animates card advances ("nearest utility", "advance to GO") as a real
+  // stroll instead of a teleport. null = snap (jail, god edits).
+  lastMove: { playerId: string; path: number[] } | null
   // Full-information money ledger: every cash movement, visible to everyone.
   ledger: MoneyEvent[]
   // Wall-clock deadline (epoch ms) for the active decision, maintained by the
@@ -198,6 +202,7 @@ export interface HostView {
   winner: string | null
   trades: TradeOffer[]
   lastLanded: { playerId: string; space: number } | null
+  lastMove: { playerId: string; path: number[] } | null
   deadline: number | null
   deadlineFor: string | null
   turnTimeoutMs: number

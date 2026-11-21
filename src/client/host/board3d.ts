@@ -104,6 +104,7 @@ interface Hop {
   path: number[] // tile indices in order
   start: number // performance.now()
   perTile: number // ms per tile
+  from: number // the tile the stroll starts from
 }
 
 export class Board3D {
@@ -401,15 +402,15 @@ export class Board3D {
       this.prevPos[idx] = p.pos // always track — the ?? fallback above must
       // only apply on the very first sight of a token, never on later syncs
       if (p.pos !== prev) {
-        const steps = (p.pos - prev + 40) % 40
-        if (steps > 0 && steps <= 12) {
-          // hop tile-by-tile so the camera can ride along
-          const path: number[] = []
-          for (let k = 1; k <= steps; k++) path.push((prev + k) % 40)
+        const mv = v.lastMove
+        if (mv && mv.playerId === p.id && mv.path.length > 0 && mv.path[mv.path.length - 1] === p.pos) {
+          // a real stroll — dice moves AND card advances ("nearest utility",
+          // "advance to GO") walk tile-by-tile; long strolls roll quicker
+          const perTile = mv.path.length > 8 ? 110 : 170
           this.hops = this.hops.filter((h) => h.playerIdx !== idx)
-          this.hops.push({ playerIdx: idx, path, start: performance.now() + this.hopDelayMs, perTile: 170 })
+          this.hops.push({ playerIdx: idx, path: mv.path, start: performance.now() + this.hopDelayMs, perTile, from: prev })
         } else {
-          // sent to jail (or a big jump): teleport
+          // jail sends, god teleports, imports: snap to the destination
           const t = tileCenter(p.pos)
           const seat = SEAT_OFFSETS[idx % SEAT_OFFSETS.length]
           mesh.position.set(t.x + seat[0], 0.42, t.z + seat[1])
@@ -491,7 +492,7 @@ export class Board3D {
         this.hops = this.hops.filter((h) => h !== hop)
         continue
       }
-      const from = tileCenter(done === 0 ? (hop.path[0] - 1 + 40) % 40 : hop.path[done - 1])
+      const from = tileCenter(done === 0 ? hop.from : hop.path[done - 1])
       const to = tileCenter(hop.path[done])
       const frac = (elapsed % hop.perTile) / hop.perTile
       const seat = SEAT_OFFSETS[hop.playerIdx % SEAT_OFFSETS.length]

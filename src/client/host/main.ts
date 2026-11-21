@@ -226,12 +226,14 @@ function renderGame(v: HostView): void {
   }
 
   // fresh card draw? play the reveal for the next few seconds
-  if (v.cardDrawSeq > lastCardSeq && v.pendingCard) revealUntil = Date.now() + 3200
+  const freshReveal = v.cardDrawSeq > lastCardSeq && !!v.pendingCard
+  if (freshReveal) revealUntil = Date.now() + 3200
   lastCardSeq = v.cardDrawSeq
 
-  // fresh roll? hold the piece's hops until the tumbling dice settle —
-  // the delay must be armed BEFORE sync enqueues the hops.
-  if (v.dice && `${v.turn}:${v.dice.join()}` !== lastDiceKey) board3d.delayHops(1150)
+  // hold the piece's hops until the dice settle — or until a card reveal
+  // finishes playing (wheel ~2.1s) before card-advance strolls begin
+  if (freshReveal) board3d.delayHops(2600)
+  else if (v.dice && `${v.turn}:${v.dice.join()}` !== lastDiceKey) board3d.delayHops(1150)
 
   board3d.sync(v)
   updateDice(v)
@@ -452,22 +454,25 @@ function updateCenter(v: HostView): void {
   }
 
   if (v.pendingCard) {
-    const fresh = Date.now() < revealUntil
-    const isChest = v.pendingCard.deck === 'chest'
-    const anim = fresh ? (isChest ? 'revealcard' : 'wheelcard') : ''
-    el.innerHTML = `
-      <div class="cardbox3d">
-        ${fresh
-          ? isChest
+    // The reveal (chest opening / wheel spinning) owns the center only for
+    // its animation window — then the live turn display takes over so the
+    // stroll to the destination and the landed spotlight are visible.
+    if (Date.now() < revealUntil) {
+      const isChest = v.pendingCard.deck === 'chest'
+      const anim = isChest ? 'revealcard' : 'wheelcard'
+      el.innerHTML = `
+        <div class="cardbox3d">
+          ${isChest
             ? '<div class="chestwrap"><div class="chestlid"></div><div class="chestlock"></div><div class="chestbase"></div></div>'
-            : '<div class="wheelwrap"><div class="wheeldisc"></div><div class="wheelhub"></div><div class="wheelpointer"></div></div>'
-          : ''}
-        <div class="cardface ${v.pendingCard.deck} ${anim}">
-          <div class="c-deck">${isChest ? 'COMMUNITY CHEST' : 'CHANCE'}</div>
-          <div class="c-text">${esc(v.pendingCard.text)}</div>
-        </div>
-      </div>`
-    return
+            : '<div class="wheelwrap"><div class="wheeldisc"></div><div class="wheelhub"></div><div class="wheelpointer"></div></div>'}
+          <div class="cardface ${v.pendingCard.deck} ${anim}">
+            <div class="c-deck">${isChest ? 'COMMUNITY CHEST' : 'CHANCE'}</div>
+            <div class="c-text">${esc(v.pendingCard.text)}</div>
+          </div>
+        </div>`
+      return
+    }
+    // reveal finished: fall through to the turn display below
   }
 
   const captions: string[] = []
