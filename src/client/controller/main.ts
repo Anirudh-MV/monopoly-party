@@ -182,6 +182,64 @@ function performExit(): void {
   })
 }
 
+// ── one-step action confirmation ──
+// Money moves players regret get exactly one chance to back out.
+function showActionConfirm(title: string, body: string, confirmLabel: string, onConfirm: () => void): void {
+  document.querySelector('.confirm-overlay')?.remove()
+  const overlay = document.createElement('div')
+  overlay.className = 'confirm-overlay'
+  overlay.innerHTML = `
+    <div class="confirm-box">
+      <div class="confirm-title">${title}</div>
+      <p class="confirm-body">${body}</p>
+      <div class="row">
+        <button data-act="aCancel">Not now</button>
+        <button class="danger" data-act="aConfirm">${confirmLabel}</button>
+      </div>
+    </div>`
+  overlay.addEventListener('click', (ev) => {
+    const btn = (ev.target as HTMLElement).closest('[data-act]') as HTMLElement | null
+    if (!btn) {
+      if (ev.target === overlay) overlay.remove()
+      return
+    }
+    overlay.remove()
+    if (btn.dataset.act === 'aConfirm') onConfirm()
+  })
+  document.body.appendChild(overlay)
+}
+
+// ── the GO salary moment ──
+// Crossing GO credits instantly server-side; the phone still makes a moment
+// of it — a Collect $200 prompt stands between the roll and the end-turn
+// button, so the salary feels earned instead of silently appearing.
+let goPromptTurn = -1
+let firstViewSeen = false
+
+function maybeShowGoPrompt(v: PlayerView): void {
+  const crossed = v.you === v.currentPlayerId &&
+    v.ledger.some((e) => e.playerId === v.you && e.turn === v.turn && e.delta > 0 && e.memo === 'Passed GO')
+  if (crossed && goPromptTurn !== v.turn) {
+    goPromptTurn = v.turn
+    if (firstViewSeen) showGoPrompt()
+  }
+}
+
+function showGoPrompt(): void {
+  const overlay = document.createElement('div')
+  overlay.className = 'confirm-overlay'
+  overlay.innerHTML = `
+    <div class="confirm-box">
+      <div class="confirm-title">🟩 You passed GO!</div>
+      <p class="confirm-body">Collect your <b>$200</b> salary.</p>
+      <div class="row"><button class="good" data-act="collectGo">Collect $200</button></div>
+    </div>`
+  overlay.addEventListener('click', (ev) => {
+    if ((ev.target as HTMLElement).closest('[data-act="collectGo"]')) overlay.remove()
+  })
+  document.body.appendChild(overlay)
+}
+
 // ── Connection lifecycle ──
 
 const preCode = (new URLSearchParams(location.search).get('code') ?? '').toUpperCase()
@@ -224,7 +282,7 @@ socket.on('view', (v: PlayerView) => {
   lobby = null
   rejoinPending = false
 
-  // fresh card draw? the chest-opening / wheel-spin animation plays ONLY on
+  // fresh card draw? the chest-opening / wheel-spinning animation plays ONLY on
   // the drawer's phone; everyone else reads the info strip instead
   if (v.cardDrawSeq > lastCardSeq && lastCardSeq >= 0 && v.pendingCard && v.currentPlayerId === v.you) {
     showReveal(v.pendingCard)
@@ -232,6 +290,8 @@ socket.on('view', (v: PlayerView) => {
   lastCardSeq = v.cardDrawSeq
 
   render()
+  maybeShowGoPrompt(v)
+  firstViewSeen = true
 })
 
 // ── Actions ──
@@ -317,8 +377,31 @@ $app.addEventListener('click', (ev) => {
     case 'bankrupt': send({ type: 'bankrupt' }); break
     case 'buyHouse': send({ type: 'buyHouse', space: Number(args.space) }); break
     case 'sellHouse': send({ type: 'sellHouse', space: Number(args.space) }); break
-    case 'mortgage': send({ type: 'mortgage', space: Number(args.space) }); break
-    case 'unmortgage': send({ type: 'unmortgage', space: Number(args.space) }); break
+    case 'mortgage': {
+      // Mortgage: money now, income never — one chance to back out.
+      const space = Number(args.space)
+      const sp = view ? BOARD[space] : null
+      const price = sp && 'price' in sp ? sp.price : 0
+      showActionConfirm(
+        'Mortgage this property?',
+        `Take <b>$${price / 2}</b> from the bank for <b>${sp ? esc(sp.name) : 'this deed'}</b> — it earns nothing until you lift the mortgage.`,
+        'Mortgage it',
+        () => send({ type: 'mortgage', space }),
+      )
+      break
+    }
+    case 'unmortgage': {
+      const space = Number(args.space)
+      const sp = view ? BOARD[space] : null
+      const cost = sp && 'price' in sp ? unmortgageCost(sp.price) : 0
+      showActionConfirm(
+        'Lift the mortgage?',
+        `Pay <b>$${cost}</b> (price + 10%) to wake <b>${sp ? esc(sp.name) : 'this deed'}</b> back up.`,
+        'Lift mortgage',
+        () => send({ type: 'unmortgage', space }),
+      )
+      break
+    }
     case 'acceptTrade': send({ type: 'respondTrade', tradeId: String(args.id), accept: true }); break
     case 'declineTrade': send({ type: 'respondTrade', tradeId: String(args.id), accept: false }); break
     case 'cancelTrade': send({ type: 'cancelTrade', tradeId: String(args.id) }); break
@@ -497,11 +580,17 @@ function renderGame(v: PlayerView): void {
     if ('price' in sp) {
       const rp = rentPreview(v, i)
       const owner = v.props[i].owner ? v.players.find((p) => p.id === v.props[i].owner) : null
-      if (owner && owner.id !== v.currentPlayerId) {
+      if (owner && owner.id === v.currentPlayerId) {
+        // the mover landed on their own property — only THEIR phone says
+        // "Yours"; everyone else sees who's earning.
+        rentLine = owner.id === I.id
+          ? `<span class="ls-rent">Yours — earns <b>$${rp.current}</b>${sp.kind === 'utility' ? ` (${rp.note})` : ''}</span>`
+          : `<span class="ls-rent">${owner.token} ${esc(owner.name)} — earns <b>$${rp.current}</b>${sp.kind === 'utility' ? ` (${rp.note})` : ''}</span>`
+      } else if (owner) {
+        // someone else's property — if it's MINE, the rent is mine to collect
+        const who = owner.id === I.id ? '<b>yours to collect</b>' : `${owner.token} ${esc(owner.name)}`
         const diceSum = v.dice ? v.dice[0] + v.dice[1] : 7
-        rentLine = `<span class="ls-rent">Rent due: <b>$${rentFor(v, i, diceSum)}</b>${owner.token} ${esc(owner.name)}</span>`
-      } else if (owner && owner.id === v.currentPlayerId) {
-        rentLine = `<span class="ls-rent">Yours — earns <b>$${rp.current}</b>${sp.kind === 'utility' ? ` (${rp.note})` : ''}</span>`
+        rentLine = `<span class="ls-rent">Rent due: <b>$${rentFor(v, i, diceSum)}</b> — ${who}</span>`
       } else {
         rentLine = `<span class="ls-rent">Rent: <b>$${rp.current}</b> when owned${sp.kind === 'utility' ? ` (${rp.note})` : ''}</span>`
       }
