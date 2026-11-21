@@ -22,6 +22,7 @@ import type {
   CardEffect,
   GameState,
   LogEntry,
+  MoneyEvent,
   PlayerState,
   PropertyState,
   TradeSide,
@@ -55,6 +56,16 @@ function roll1(rng: () => number): number {
 
 function log(s: GameState, text: string, kind: LogEntry['kind'] = 'info'): void {
   s.log.push({ text, kind })
+}
+
+// ── Money ledger ──
+// Every cash movement in the game flows through here, so any player can
+// open the books and see exactly where everyone's money went.
+function logMoney(s: GameState, pid: string, delta: number, memo: string): void {
+  if (delta === 0) return
+  const e: MoneyEvent = { seq: s.ledger.length, turn: s.turn, playerId: pid, delta, memo }
+  s.ledger.push(e)
+  if (s.ledger.length > 600) s.ledger.splice(0, s.ledger.length - 600)
 }
 
 export function createGame(players: PlayerMeta[], rng: () => number = Math.random): GameState {
@@ -92,8 +103,11 @@ export function createGame(players: PlayerMeta[], rng: () => number = Math.rando
     debtQueue: [],
     trades: [],
     lastLanded: null,
+    ledger: [],
     deadline: null,
     deadlineFor: null,
+    pendingCardDraw: null,
+    cardDrawSeq: 0,
     log: [],
     turn: 1,
     winner: null,
@@ -107,13 +121,17 @@ export function createGame(players: PlayerMeta[], rng: () => number = Math.rando
 
 // ── Money flow ──
 
-function charge(s: GameState, payer: PlayerState, amount: number, creditor: string | null): void {
+function charge(s: GameState, payer: PlayerState, amount: number, creditor: string | null, memo: string): void {
   if (amount <= 0) return
   if (payer.cash >= amount) {
     payer.cash -= amount
+    logMoney(s, payer.id, -amount, memo)
     if (creditor) {
       const c = R.byId(s, creditor)
-      if (c) c.cash += amount
+      if (c) {
+        c.cash += amount
+        logMoney(s, c.id, amount, `Received from ${payer.name}: ${memo}`)
+      }
     }
     return
   }
@@ -135,7 +153,7 @@ function advancePhase(s: GameState): void {
     s.phase = 'DEBT'
     return
   }
-  if (s.pendingPurchase != null || s.pendingTax != null) {
+  if (s.pendingPurchase != null || s.pendingTax != null || s.pendingCardDraw != null) {
     s.phase = 'ACTION'
     return
   }
@@ -153,6 +171,7 @@ function nextPlayer(s: GameState): void {
   s.dice = null
   s.doubles = 0
   s.pendingCard = null
+  s.pendingCardDraw = null
   s.pendingMove = null
   const order = s.players
   const k = order.findIndex((q) => q.id === s.currentPlayerId)
@@ -197,6 +216,7 @@ function advance(s: GameState, steps: number, rng: () => number): void {
   const np = (p.pos + steps + BOARD.length) % BOARD.length
   if (np < p.pos) {
     p.cash += GO_REWARD
+    logMoney(s, p.id, GO_REWARD, 'Passed GO')
     log(s, `${p.name} passed GO and collected $${GO_REWARD}`, 'money')
   }
   p.pos = np
@@ -225,10 +245,12 @@ function land(s: GameState, p: PlayerState, opts: { railMult?: number; utilMult?
       sendToJail(s, p)
       break
     case 'chance':
-      drawCard(s, 'chance', p, rng)
+      s.pendingCardDraw = { player: p.id, deck: 'chance', space: i }
+      log(s, `${p.name} landed on Chance — spin the wheel!`)
       break
     case 'chest':
-      drawCard(s, 'chest', p, rng)
+      s.pendingCardDraw = { player: p.id, deck: 'chest', space: i }
+      log(s, `${p.name} landed on Community Chest — open it!`)
       break
     case 'tax':
       if (sp.percent) {
@@ -236,7 +258,7 @@ function land(s: GameState, p: PlayerState, opts: { railMult?: number; utilMult?
         log(s, `${p.name} landed on Income Tax — flat $${sp.flat} or 10% of worth?`)
       } else {
         log(s, `${p.name} pays $${sp.flat} Luxury Tax`, 'money')
-        charge(s, p, sp.flat, null)
+        charge(s, p, sp.flat, null, 'Luxury tax')
       }
       break
     default:
@@ -264,7 +286,7 @@ function handleProperty(s: GameState, p: PlayerState, i: number, opts: { railMul
   if (rent <= 0) return
   const owner = R.byId(s, st.owner)
   log(s, `${p.name} pays $${rent} rent to ${owner?.name ?? 'the owner'}`, 'money')
-  charge(s, p, rent, st.owner)
+  charge(s, p, rent, st.owner, `Rent: ${sp.name}`)
 }
 
 // ── Cards ──
@@ -289,6 +311,7 @@ function drawCard(s: GameState, deck: 'chance' | 'chest', p: PlayerState, rng: (
   if (!id) return
   const card = cardById(id)
   s.pendingCard = card
+  s.cardDrawSeq++
   log(s, `${p.name} draws: “${card.text}”`)
   applyCard(s, p, card, rng)
 }
@@ -311,6 +334,7 @@ function applyCard(s: GameState, p: PlayerState, card: Card, rng: () => number):
     case 'goto': {
       if (e.target < p.pos) {
         p.cash += GO_REWARD
+        logMoney(s, p.id, GO_REWARD, 'Passed GO')
         log(s, `${p.name} passed GO (+$${GO_REWARD})`, 'money')
       }
       p.pos = e.target
@@ -326,6 +350,7 @@ function applyCard(s: GameState, p: PlayerState, card: Card, rng: () => number):
       const t = nearestOf(e.target, p.pos)
       if (t < p.pos) {
         p.cash += GO_REWARD
+        logMoney(s, p.id, GO_REWARD, 'Passed GO')
         log(s, `${p.name} passed GO (+$${GO_REWARD})`, 'money')
       }
       p.pos = t
@@ -342,29 +367,30 @@ function applyCard(s: GameState, p: PlayerState, card: Card, rng: () => number):
     }
     case 'money': {
       p.cash += e.amount
+      logMoney(s, p.id, e.amount, `Card: ${card.text}`)
       log(s, `${p.name} collects $${e.amount}`, 'money')
       break
     }
     case 'pay': {
       log(s, `${p.name} pays $${e.amount}`, 'money')
-      charge(s, p, e.amount, null)
+      charge(s, p, e.amount, null, `Card: ${card.text}`)
       break
     }
     case 'collectEach': {
       for (const q of R.alivePlayers(s)) {
-        if (q.id !== p.id) charge(s, q, e.amount, p.id)
+        if (q.id !== p.id) charge(s, q, e.amount, p.id, `Card: ${card.text}`)
       }
       break
     }
     case 'payEach': {
       for (const q of R.alivePlayers(s)) {
-        if (q.id !== p.id) charge(s, p, e.amount, q.id)
+        if (q.id !== p.id) charge(s, p, e.amount, q.id, `Card: ${card.text}`)
       }
       break
     }
     case 'jailcard': {
       p.jailCards++
-      log(s, `${p.name} keeps a Get Out of Jail Free card 🎟`, 'good')
+      log(s, `${p.name} keeps a Get Out of Jail Free card`, 'good')
       break
     }
     case 'gotojail': {
@@ -380,7 +406,7 @@ function applyCard(s: GameState, p: PlayerState, card: Card, rng: () => number):
         total += h === 5 ? e.perHotel : h * e.perHouse
       }
       log(s, `${p.name} pays $${total} for repairs`, 'money')
-      charge(s, p, total, null)
+      charge(s, p, total, null, `Card: ${card.text}`)
       break
     }
   }
@@ -401,6 +427,7 @@ function closeAuction(s: GameState): void {
     const w = R.byId(s, au.bidder)
     if (w) {
       w.cash -= au.bid
+      logMoney(s, w.id, -au.bid, `Won ${BOARD[au.space].name} at auction`)
       s.props[au.space].owner = w.id
       log(s, `🔨 ${w.name} wins ${BOARD[au.space].name} for $${au.bid}`, 'good')
     }
@@ -442,12 +469,20 @@ function declareBankruptcy(s: GameState, p: PlayerState): Result {
     if (isStreet(sp)) {
       const st = s.props[i]
       if (st.houses > 0) {
-        p.cash += (st.houses * sp.houseCost) / 2
+        const half = (st.houses * sp.houseCost) / 2
+        p.cash += half
+        logMoney(s, p.id, half, `Liquidated buildings on ${sp.name}`)
         st.houses = 0
       }
     }
   }
-  if (cred) cred.cash += p.cash
+  if (cred) {
+    cred.cash += p.cash
+    if (p.cash > 0) {
+      logMoney(s, cred.id, p.cash, `Estate from ${p.name} (bankruptcy)`)
+      logMoney(s, p.id, -p.cash, `Bankruptcy: estate to ${cred.name}`)
+    }
+  }
   p.cash = 0
 
   for (const i of R.ownedSpaces(s, p.id)) {
@@ -460,6 +495,7 @@ function declareBankruptcy(s: GameState, p: PlayerState): Result {
         const interest = Math.ceil(sp.price / 10)
         if (cred.cash >= interest) {
           cred.cash -= interest
+          logMoney(s, cred.id, -interest, `Interest on ${sp.name} (bankruptcy transfer)`)
           log(s, `${cred.name} pays $${interest} interest on ${sp.name}`)
         }
       }
@@ -551,7 +587,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
             p.jail = false
             p.jailRolls = 0
             log(s, `${p.name} failed 3 times — must pay the $${JAIL_FINE} fine`, 'bad')
-            charge(s, p, JAIL_FINE, null)
+            charge(s, p, JAIL_FINE, null, 'Jail release fine')
             if (s.debt) {
               s.pendingMove = d1 + d2 // finish the move after the debt is settled
               s.phase = 'DEBT'
@@ -586,6 +622,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       if (!('price' in sp)) return fail('Not for sale')
       if (p.cash < sp.price) return fail('Not enough cash')
       p.cash -= sp.price
+      logMoney(s, by, -sp.price, `Bought ${sp.name}`)
       s.props[i].owner = by
       s.pendingPurchase = null
       log(s, `${p.name} buys ${sp.name} for $${sp.price} 🎉`, 'good')
@@ -626,8 +663,19 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
 
     case 'endTurn': {
       if (s.phase !== 'ACTION' || s.currentPlayerId !== by) return fail('You can only end your own turn')
-      if (s.pendingPurchase != null || s.pendingTax != null || s.debt) return fail('Resolve the pending action first')
+      if (s.pendingPurchase != null || s.pendingTax != null || s.pendingCardDraw != null || s.debt) {
+        return fail('Resolve the pending action first')
+      }
       nextPlayer(s)
+      return OK
+    }
+
+    case 'drawCard': {
+      const d = s.pendingCardDraw
+      if (!d || d.player !== by) return fail('No card waiting for you')
+      s.pendingCardDraw = null
+      drawCard(s, d.deck, p, rng)
+      advancePhase(s) // a debt from the card freezes play; otherwise back on rails
       return OK
     }
 
@@ -635,6 +683,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       const sp = BOARD[a.space]
       if (!sp || !isStreet(sp) || !R.canBuildOn(s, by, a.space)) return fail('Cannot build there')
       p.cash -= sp.houseCost
+      logMoney(s, by, -sp.houseCost, `Built a house on ${sp.name}`)
       s.props[a.space].houses++
       log(s, `${p.name} builds on ${sp.name} ($${sp.houseCost}) 🏠`, 'money')
       return OK
@@ -645,6 +694,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       if (!sp || !isStreet(sp) || !R.canSellHouseOn(s, by, a.space)) return fail('Cannot sell there')
       s.props[a.space].houses--
       p.cash += sp.houseCost / 2
+      logMoney(s, by, sp.houseCost / 2, `Sold a house on ${sp.name}`)
       log(s, `${p.name} sells a house on ${sp.name} (+$${sp.houseCost / 2})`, 'money')
       return OK
     }
@@ -655,6 +705,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       s.props[a.space].mortgaged = true
       const value = ('price' in sp ? sp.price : 0) / 2
       p.cash += value
+      logMoney(s, by, value, `Mortgaged ${sp.name}`)
       log(s, `${p.name} mortgages ${sp.name} for $${value} 💤`, 'money')
       return OK
     }
@@ -664,6 +715,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       if (!sp || !R.canUnmortgageOn(s, by, a.space)) return fail('Cannot lift that mortgage')
       const cost = R.unmortgageCost('price' in sp ? sp.price : 0)
       p.cash -= cost
+      logMoney(s, by, -cost, `Lifted mortgage on ${sp.name}`)
       s.props[a.space].mortgaged = false
       log(s, `${p.name} lifts the mortgage on ${sp.name} (-$${cost})`, 'money')
       return OK
@@ -677,7 +729,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       const amount = a.choice === 'flat' ? sp.flat : Math.ceil(R.netWorth(s, by) / 10)
       s.pendingTax = null
       log(s, `${p.name} pays Income Tax (${a.choice === 'flat' ? 'flat' : '10% of worth'}): $${amount}`, 'money')
-      charge(s, p, amount, null)
+      charge(s, p, amount, null, 'Income tax')
       advancePhase(s)
       return OK
     }
@@ -685,6 +737,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
     case 'payJail': {
       if (!p.jail || s.phase !== 'ROLL' || s.currentPlayerId !== by) return fail('Not your jail sentence')
       p.cash -= JAIL_FINE
+      logMoney(s, by, -JAIL_FINE, 'Paid jail release fine')
       p.jail = false
       log(s, `${p.name} pays $${JAIL_FINE} and walks out of jail`, 'money')
       return OK
@@ -704,9 +757,13 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       if (!d || d.debtor !== by) return fail('No debt to pay')
       if (p.cash < d.amount) return fail('Not enough cash yet — mortgage or sell below')
       p.cash -= d.amount
+      logMoney(s, by, -d.amount, 'Debt settlement')
       if (d.creditor) {
         const c = R.byId(s, d.creditor)
-        if (c) c.cash += d.amount
+        if (c) {
+          c.cash += d.amount
+          logMoney(s, c.id, d.amount, `Debt collected from ${p.name}`)
+        }
       }
       s.debt = null
       log(s, `${p.name} settles the debt of $${d.amount}`, 'good')
@@ -751,8 +808,12 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
         return fail(verr)
       }
       // Apply the swap. Jail cards move too; buildings never trade (validated above).
-      from.cash += offer.receive.cash - offer.give.cash
-      p.cash += offer.give.cash - offer.receive.cash
+      const fromDelta = offer.receive.cash - offer.give.cash
+      const toDelta = offer.give.cash - offer.receive.cash
+      from.cash += fromDelta
+      p.cash += toDelta
+      if (fromDelta !== 0) logMoney(s, from.id, fromDelta, `Trade with ${p.name}`)
+      if (toDelta !== 0) logMoney(s, p.id, toDelta, `Trade with ${from.name}`)
       for (const i of offer.give.spaces) s.props[i].owner = p.id
       for (const i of offer.receive.spaces) s.props[i].owner = from.id
       from.jailCards += offer.receive.jailCards - offer.give.jailCards

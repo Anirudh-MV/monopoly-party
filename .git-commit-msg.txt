@@ -1,0 +1,33 @@
+Interactive cards, light theme, 3D dice, transaction ledger, hang fixes
+
+Bug fixes:
+- Phone: a drawn card banner hijacked the mutually-exclusive action
+  cascade, so after any Chance/Chest draw the active player had NO
+  roll/end-turn buttons -- the game hung with the card text showing on
+  every phone (the "Advance to GO" and "school fees" hangs). The card
+  is now an info strip that never blocks actions
+- Server stall watchdog: if a live state ever leaves nobody with a
+  legal action, auto-remedy (end turn / roll / bankrupt) and log loudly
+
+Interactive card spaces (official outcomes, dramatic reveal):
+- Landing on Community Chest prompts "Open the Community Chest" on the
+  drawer's phone; the reveal animates a chest opening on phone AND TV
+- Chance prompts "Spin the wheel"; the wheel spins on both screens and
+  lands on the drawn card; chained draws (go-back-3 onto a chest)
+  prompt again; auto-draw deadline; bots draw immediately
+
+Visual overhaul:
+- Bright light theme is the default on TV, phones, and simulator; dark
+  mode via a persisted toggle (the 3D scene re-lights and re-labels too)
+- Glow/neon text effects removed or softened
+- Real 3D tumbling dice cubes on the TV; the piece waits for the dice to
+  settle before hopping tile-by-tile to its landing spot
+- Landed spotlight now shows price and the exact rent due
+- Emoji reduction: "Mortgage +$50" / "Unmortgage -$55" text buttons,
+  plain banner wording
+
+Transaction ledger:
+- Every cash movement (rent, cards, GO, trades, buildings, bankruptcy
+  estate, interest) is itemised with a memo in a shared ledger
+- Each phone shows the full history with per-player tabs (official
+  Monopoly is full-information, so everyone can read everyone's books)

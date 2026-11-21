@@ -175,7 +175,9 @@ export function allowedActions(s: RulesState, pid: string): ActionType[] {
   }
 
   if (s.phase === 'ACTION' && s.currentPlayerId === pid) {
-    if (s.pendingPurchase != null) {
+    if (s.pendingCardDraw) {
+      out.add('drawCard')
+    } else if (s.pendingPurchase != null) {
       const sp = BOARD[s.pendingPurchase]
       const price = 'price' in sp ? sp.price : Infinity
       if (p.cash >= price) out.add('buy')

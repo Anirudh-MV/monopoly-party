@@ -110,6 +110,7 @@ try {
       const acts = me.view.allowed || []
       const action =
         acts.includes('roll') ? { type: 'roll' }
+        : acts.includes('drawCard') ? { type: 'drawCard' }
         : acts.includes('buy') ? { type: 'buy' }
         : acts.includes('declineBuy') ? { type: 'declineBuy' }
         : acts.includes('payTax') ? { type: 'payTax', choice: 'flat' }

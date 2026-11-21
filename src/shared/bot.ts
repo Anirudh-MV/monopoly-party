@@ -9,6 +9,7 @@ import type { Action, ActionType, GameState, TradeSide } from './types.js'
 
 const WEIGHTS: Partial<Record<ActionType, number>> = {
   roll: 40,
+  drawCard: 80, // bots open the chest / spin immediately
   endTurn: 26,
   buy: 14,
   declineBuy: 5,

@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto'
 import type { Server as IOServer, Socket } from 'socket.io'
 import { applyAction, createGame, type PlayerMeta } from '../shared/engine.js'
 import { hostView, playerView } from '../shared/views.js'
-import { alivePlayers, netWorth } from '../shared/rules.js'
+import { allowedActions, alivePlayers, netWorth } from '../shared/rules.js'
 import type { Action, GameState, LobbyInfo, LobbyPlayer } from '../shared/types.js'
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ' // no I/O — they confuse party guests
@@ -41,6 +41,7 @@ interface Room {
   lastActive: number
   timer: ReturnType<typeof setTimeout> | null
   timerKey: string | null
+  watchdogBusy: boolean
 }
 
 interface SocketData {
@@ -144,6 +145,25 @@ function broadcastGame(io: IOServer, room: Room): void {
     if (p) p.connected = e.socketId != null
   }
 
+  // Stall watchdog: if a live game reaches a state where NOBODY can act
+  // (a rules-combination bug), auto-remedy instead of hanging the party,
+  // and log the state loudly so the bug can be fixed.
+  if (s.phase !== 'GAME_OVER' && !room.watchdogBusy && alivePlayers(s).length > 1) {
+    const stuck = alivePlayers(s).every((q) => allowedActions(s, q.id).length === 0)
+    if (stuck) {
+      console.error(`[watchdog] room ${room.code}: stuck at phase ${s.phase}, turn ${s.turn} — auto-remedying`)
+      room.watchdogBusy = true
+      try {
+        if (s.phase === 'ACTION') applyServerAction(room, [[s.currentPlayerId, { type: 'endTurn' }]])
+        else if (s.phase === 'ROLL') applyServerAction(room, [[s.currentPlayerId, { type: 'roll' }]])
+        else if (s.phase === 'DEBT' && s.debt) applyServerAction(room, [[s.debt.debtor, { type: 'bankrupt' }]])
+      } finally {
+        room.watchdogBusy = false
+      }
+      return // the nested broadcastGame (if any) has already shipped views
+    }
+  }
+
   // The deadline lives on the state so every view carries it.
   scheduleDeadline(room)
 
@@ -173,6 +193,7 @@ function currentDecision(s: GameState): Decision | null {
     return { key: `roll:${s.turn}:${s.currentPlayerId}:${d}:${s.doubles}`, playerId: s.currentPlayerId }
   }
   if (s.phase === 'ACTION') {
+    if (s.pendingCardDraw) return { key: `draw:${s.turn}:${s.pendingCardDraw.deck}:${s.pendingCardDraw.space}`, playerId: s.currentPlayerId }
     if (s.pendingPurchase != null) return { key: `buy:${s.turn}:${s.pendingPurchase}`, playerId: s.currentPlayerId }
     if (s.pendingTax) return { key: `tax:${s.turn}`, playerId: s.currentPlayerId }
     return { key: `end:${s.turn}:${s.currentPlayerId}`, playerId: s.currentPlayerId }
@@ -187,6 +208,7 @@ function autoActionsFor(room: Room, d: Decision): Array<[string, Action]> {
   const s = room.state
   if (!s || !d.playerId) return []
   if (d.key.startsWith('roll:')) return [[d.playerId, { type: 'roll' }]]
+  if (d.key.startsWith('draw:')) return [[d.playerId, { type: 'drawCard' }]]
   if (d.key.startsWith('buy:')) return [[d.playerId, { type: 'declineBuy' }]]
   if (d.key.startsWith('tax:')) {
     const flat = 200
@@ -285,6 +307,7 @@ export function attach(io: IOServer, getJoinUrls: () => string[]): void {
         lastActive: Date.now(),
         timer: null,
         timerKey: null,
+        watchdogBusy: false,
       }
       rooms.set(room.code, room)
       socket.join(hostRoom(room.code))

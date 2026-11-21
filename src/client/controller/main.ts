@@ -1,7 +1,9 @@
 // ── Phone controller ──
-// Your wallet, your properties, your decisions. The server tells us what we're
-// allowed to do (PlayerView.allowed) and the rules helpers tell us per-property
-// affordances — same code the server validates with.
+// Your wallet, your properties, your decisions — plus the full transaction
+// ledger for every player. The server tells us what we're allowed to do
+// (PlayerView.allowed) and the shared rules helpers give per-property
+// affordances. Card spaces are interactive: open the chest / spin the wheel,
+// and the reveal animates here and on the TV.
 
 import { io } from 'socket.io-client'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
@@ -13,7 +15,7 @@ import {
   netWorth,
   unmortgageCost,
 } from '../../shared/rules.js'
-import type { Action, LobbyInfo, PlayerView, Space, TradeOffer, TradeSide } from '../../shared/types.js'
+import type { Action, Card, LobbyInfo, PlayerView, Space, TradeOffer, TradeSide } from '../../shared/types.js'
 
 interface JoinAck {
   ok: boolean
@@ -29,8 +31,12 @@ interface RejoinAck {
   error?: string
 }
 
-const socket = io()
 const $app = document.getElementById('app') as HTMLElement
+
+// ── theme ──
+type Theme = 'light' | 'dark'
+let theme: Theme = (localStorage.getItem('mp-theme') as Theme | null) ?? 'light'
+document.documentElement.dataset.theme = theme
 
 let view: PlayerView | null = null
 let lobby: LobbyInfo | null = null
@@ -50,6 +56,13 @@ interface Composer {
   recvJail: number
 }
 let composer: Composer | null = null
+
+// animation bookkeeping
+let lastCardSeq = -1
+let seenFirstView = false
+
+// ledger tab (defaults to "me")
+let ledgerTab: string | null = null
 
 function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string)
@@ -75,6 +88,26 @@ setInterval(() => {
   el.classList.toggle('urgent', rem <= 10)
 }, 250)
 
+// ── card reveal overlay (chest opens / wheel spins) ──
+
+function showReveal(card: Card): void {
+  const isChest = card.deck === 'chest'
+  const overlay = document.createElement('div')
+  overlay.className = 'reveal-overlay'
+  overlay.innerHTML = `
+    <div class="reveal-box">
+      <div class="reveal-title">${isChest ? 'COMMUNITY CHEST' : 'CHANCE'}</div>
+      ${isChest
+        ? '<div class="chestwrap"><div class="chestlid"></div><div class="chestlock"></div><div class="chestbase"></div></div>'
+        : '<div class="wheelwrap"><div class="wheeldisc"></div><div class="wheelhub"></div><div class="wheelpointer"></div></div>'}
+      <div class="revealcard ${isChest ? 'chest-card' : 'chance-card'}">${esc(card.text)}</div>
+    </div>`
+  const dismiss = (): void => overlay.remove()
+  overlay.addEventListener('click', dismiss)
+  document.body.appendChild(overlay)
+  setTimeout(dismiss, isChest ? 3200 : 4200)
+}
+
 // ── Connection lifecycle ──
 
 const preCode = (new URLSearchParams(location.search).get('code') ?? '').toUpperCase()
@@ -86,6 +119,7 @@ let rejoinPending = myToken != null
 // Fires on the FIRST connect and on every automatic reconnect (Wi-Fi blip,
 // screen lock, server restart). The stored token reattaches the seat —
 // wallet, deeds and jail cards intact. This is the seamless-rejoin path.
+const socket = io()
 socket.on('connect', () => {
   if (!myToken) return
   rejoinPending = true
@@ -115,11 +149,16 @@ socket.on('view', (v: PlayerView) => {
   view = v
   lobby = null
   rejoinPending = false
+
+  // fresh card draw? play the reveal once (never replay stale ones)
+  if (lastCardSeq < 0) seenFirstView = true
+  if (v.cardDrawSeq > lastCardSeq && lastCardSeq >= 0 && v.pendingCard) {
+    showReveal(v.pendingCard)
+  }
+  lastCardSeq = v.cardDrawSeq
+
   render()
 })
-
-// First paint: never leave the phone blank while the socket warms up.
-render()
 
 // ── Actions ──
 
@@ -136,6 +175,12 @@ $app.addEventListener('click', (ev) => {
   const args = JSON.parse(el.dataset.args ?? '{}') as Record<string, unknown>
 
   switch (act) {
+    case 'theme':
+      theme = theme === 'light' ? 'dark' : 'light'
+      localStorage.setItem('mp-theme', theme)
+      document.documentElement.dataset.theme = theme
+      render()
+      break
     case 'join': {
       const code = (document.getElementById('code') as HTMLInputElement).value.trim().toUpperCase()
       const name = (document.getElementById('name') as HTMLInputElement).value.trim()
@@ -175,6 +220,7 @@ $app.addEventListener('click', (ev) => {
       break
     }
     case 'roll': send({ type: 'roll' }); break
+    case 'drawCard': send({ type: 'drawCard' }); break
     case 'buy': send({ type: 'buy' }); break
     case 'declineBuy': send({ type: 'declineBuy' }); break
     case 'endTurn': send({ type: 'endTurn' }); break
@@ -199,6 +245,7 @@ $app.addEventListener('click', (ev) => {
     case 'acceptTrade': send({ type: 'respondTrade', tradeId: String(args.id), accept: true }); break
     case 'declineTrade': send({ type: 'respondTrade', tradeId: String(args.id), accept: false }); break
     case 'cancelTrade': send({ type: 'cancelTrade', tradeId: String(args.id) }); break
+    case 'ledgerTab': ledgerTab = String(args.id); render(); break
     case 'openTrade': {
       const v = view
       if (!v) return
@@ -242,9 +289,10 @@ $app.addEventListener('click', (ev) => {
       break
     }
     case 'composerJail': {
-      if (!composer) return
-      if (args.side === 'give') composer.giveJail = Math.max(0, Math.min(me(view).jailCards, composer.giveJail === 0 ? 1 : 0))
-      else composer.recvJail = Math.max(0, Math.min(partnerPlayer(view, composer.partner)?.jailCards ?? 0, composer.recvJail === 0 ? 1 : 0))
+      const v = view
+      if (!composer || !v) return
+      if (args.side === 'give') composer.giveJail = Math.max(0, Math.min(meOf(v).jailCards, composer.giveJail === 0 ? 1 : 0))
+      else composer.recvJail = Math.max(0, Math.min(partnerPlayer(v, composer.partner)?.jailCards ?? 0, composer.recvJail === 0 ? 1 : 0))
       render()
       break
     }
@@ -254,12 +302,13 @@ $app.addEventListener('click', (ev) => {
 $app.addEventListener('input', (ev) => {
   const el = ev.target as HTMLInputElement
   if (!el.dataset.k || !composer) return
+  const v = view
+  if (!v) return
   const n = Math.max(0, Math.floor(Number(el.value) || 0))
-  if (el.dataset.k === 'giveCash') composer.giveCash = Math.min(n, me(view).cash)
-  if (el.dataset.k === 'recvCash') composer.recvCash = Math.min(n, partnerPlayer(view, composer.partner)?.cash ?? 0)
+  if (el.dataset.k === 'giveCash') composer.giveCash = Math.min(n, meOf(v).cash)
+  if (el.dataset.k === 'recvCash') composer.recvCash = Math.min(n, partnerPlayer(v, composer.partner)?.cash ?? 0)
 })
 
-function me(v: PlayerView | null): ReturnType<typeof meOf> { return meOf(v) }
 function meOf(v: PlayerView | null) {
   return v?.players.find((p) => p.id === v.you) ?? { id: '', name: '', color: '', token: '', cash: 0, pos: 0, jail: false, jailRolls: 0, jailCards: 0, bankrupt: false, connected: false }
 }
@@ -282,7 +331,7 @@ function render(): void {
     $app.innerHTML = `
       <div class="join">
         <div class="card">
-          <h2>🎮 Reconnecting…</h2>
+          <h2>Reconnecting…</h2>
           <p class="hint">Finding your seat in the game.</p>
         </div>
       </div>`
@@ -294,13 +343,13 @@ function render(): void {
 function renderJoin(): void {
   $app.innerHTML = `
     <div class="join">
-      <h1>🎲 MONOPOLY PARTY</h1>
+      <h1>MONOPOLY PARTY</h1>
       <div class="card">
         <label>Room code</label>
         <input id="code" maxlength="4" autocomplete="off" autocapitalize="characters" placeholder="ABCD" value="${esc(preCode)}" />
         <label>Your name</label>
         <input id="name" maxlength="16" autocomplete="off" placeholder="e.g. Maya" />
-        <button class="big" data-act="join">Join the game</button>
+        <button class="big primary" data-act="join">Join the game</button>
         <p class="hint">Get the code from the TV screen</p>
       </div>
     </div>`
@@ -311,22 +360,22 @@ function renderLobby(l: LobbyInfo): void {
   const players = l.players
     .map(
       (p) =>
-        `<li${p.id === l.hostId ? ' class="crowned"' : ''}><span class="dot" style="background:${p.color}"></span>${p.token} ${esc(p.name)}${p.id === l.hostId ? ' <span class="crown">👑 host</span>' : ''}${p.connected ? '' : '<em class="off"> (offline)</em>'}</li>`,
+        `<li${p.id === l.hostId ? ' class="crowned"' : ''}><span class="dot" style="background:${p.color}"></span>${p.token} ${esc(p.name)}${p.id === l.hostId ? ' <span class="crown">Host</span>' : ''}${p.connected ? '' : '<em class="off"> (offline)</em>'}</li>`,
     )
     .join('')
   const others = l.players.filter((p) => p.id !== myPlayerId)
   $app.innerHTML = `
     <div class="card">
       <h2>Room ${esc(l.code)}</h2>
-      <p class="good">✅ You're in${isHost ? " — and you're the party host 👑" : ''}!</p>
+      <p class="good">You're in${isHost ? ' — and you\u2019re the party host' : ''}.</p>
       <h3>Players (${l.players.length})</h3>
       <ul class="playerlist">${players}</ul>
       ${isHost ? `
-        <button class="big primary" data-act="startGame" ${l.canStart ? '' : 'disabled'}>▶ Start the game</button>
+        <button class="big primary" data-act="startGame" ${l.canStart ? '' : 'disabled'}>Start the game</button>
         ${!l.canStart ? '<p class="hint">Best with 3+ players — waiting…</p>' : ''}
         ${others.length > 0 ? `
           <label>Hand over host duties</label>
-          <div class="chips">${others.map((p) => `<button class="chip" data-act="handOver" data-args='{"to":"${p.id}"}'>👑 → ${esc(p.name)}</button>`).join('')}</div>` : ''}
+          <div class="chips">${others.map((p) => `<button class="chip" data-act="handOver" data-args='{"to":"${p.id}"}'>Host: ${esc(p.name)}</button>`).join('')}</div>` : ''}
       ` : '<p class="hint">Waiting for the host to start the game…<br/>Keep this tab open.</p>'}
       <div class="row"><button class="tiny" data-act="leave">Leave room</button></div>
     </div>`
@@ -345,31 +394,36 @@ function renderGame(v: PlayerView): void {
   let banner = ''
   let body = ''
 
+  // What the active player drew — an info strip, NEVER a blocker: the action
+  // cascade below must always render so the game can always advance.
+  let drawStrip = ''
+  if (v.pendingCard && !v.pendingCardDraw) {
+    drawStrip = `<div class="drawstrip">${I.id === v.currentPlayerId ? 'You drew' : `${cur ? esc(cur.name) : 'Someone'} drew`}: ${esc(v.pendingCard.text)}</div>`
+  }
+
   // Deadline chip: the 300s decision clock is hidden until its final
   // 30 seconds — then it's impossible to ignore.
   let deadlineChip = ''
   if (v.deadline != null && (v.deadlineFor === I.id || v.deadlineFor === null)) {
     const rem = v.deadline - Date.now()
     if (rem <= 30_000) {
-      deadlineChip = `<div class="deadline${rem <= 10_000 ? ' urgent' : ''}" id="deadlineChip" data-until="${v.deadline}">⏱ <span>${Math.max(0, Math.ceil(rem / 1000))}s</span> — make your move!</div>`
+      deadlineChip = `<div class="deadline${rem <= 10_000 ? ' urgent' : ''}" id="deadlineChip" data-until="${v.deadline}"><span>${Math.max(0, Math.ceil(rem / 1000))}s</span> left — make your move!</div>`
     }
   }
 
-  // ── Contextual status ──
+  // ── Contextual status (mutually exclusive) ──
   if (v.phase === 'GAME_OVER' || v.winner) {
     const winner = v.players.find((p) => p.id === v.winner)
-    banner = `<div class="banner ${winner?.id === I.id ? 'good' : ''}">${winner ? `🏆 ${esc(winner.name)} wins!` : '💀 game over'}</div>`
-  } else if (v.pendingCard) {
-    banner = `<div class="banner card-${v.pendingCard.deck}">🎴 ${esc(v.pendingCard.text)}</div>`
+    banner = `<div class="banner ${winner?.id === I.id ? 'good' : ''}">${winner ? `${esc(winner.name)} wins!` : 'Game over'}</div>`
   } else if (v.phase === 'DEBT' && v.debt && v.debt.debtor === I.id) {
     const creditor = v.debt.creditor ? v.players.find((p) => p.id === v.debt?.creditor) : null
-    banner = `<div class="banner debt">⚠ You owe $${v.debt.amount} to ${creditor ? esc(creditor.name) : 'the bank'}</div>`
+    banner = `<div class="banner debt">You owe $${v.debt.amount} to ${creditor ? esc(creditor.name) : 'the bank'}</div>`
     body += `
       <div class="card urgent">
         <h3>Raise the money</h3>
         <p>Sell houses or mortgage properties below${acts.has('payDebt') ? ', then tap Pay.' : '.'}</p>
-        ${acts.has('payDebt') ? `<button class="big good" data-act="payDebt">💵 Pay $${v.debt.amount}</button>` : ''}
-        <button class="big danger" data-act="bankrupt">💀 Declare bankruptcy</button>
+        ${acts.has('payDebt') ? `<button class="big good" data-act="payDebt">Pay $${v.debt.amount}</button>` : ''}
+        <button class="big danger" data-act="bankrupt">Declare bankruptcy</button>
       </div>`
   } else if (v.phase === 'DEBT' && v.debt) {
     const debtor = v.players.find((p) => p.id === v.debt?.debtor)
@@ -378,7 +432,7 @@ function renderGame(v: PlayerView): void {
     const sp = BOARD[v.auction.space]
     const bidder = v.players.find((p) => p.id === v.auction?.bidder)
     const mine = v.auction.bidder === I.id
-    banner = `<div class="banner auction">🔨 Auction: <b>${esc(sp.name)}</b> — $${v.auction.bid}${bidder ? ` (${esc(bidder.name)})` : ''}</div>`
+    banner = `<div class="banner auction">Auction: <b>${esc(sp.name)}</b> — $${v.auction.bid}${bidder ? ` (${esc(bidder.name)})` : ''}</div>`
     if (mine) {
       body += `<div class="card"><h3>You're the high bidder</h3><p class="hint">Waiting for the others…</p></div>`
     } else if (acts.has('bid') || acts.has('passBid')) {
@@ -400,32 +454,40 @@ function renderGame(v: PlayerView): void {
     } else {
       body += `<div class="card"><p class="hint">Waiting for bids…</p></div>`
     }
-  } else if (v.phase === 'ROLL' && I.id === v.currentPlayerId) {
-    banner = `<div class="banner good">🎲 Your turn${I.jail ? ' — you\'re in jail!' : ''}</div>`
+  } else if (v.pendingCardDraw && v.pendingCardDraw.player === I.id) {
+    const isChest = v.pendingCardDraw.deck === 'chest'
+    banner = `<div class="banner ${isChest ? 'card-chest' : 'card-chance'}">You landed on <b>${isChest ? 'Community Chest' : 'Chance'}</b></div>`
     body += `<div class="card actions">
-      <button class="big primary" data-act="roll">ROLL THE DICE</button>
+      <button class="big primary" data-act="drawCard">${isChest ? 'Open the Community Chest' : 'Spin the wheel'}</button>
+    </div>`
+  } else if (v.pendingCardDraw) {
+    banner = `<div class="banner info">${cur ? esc(cur.name) : 'The active player'} landed on ${v.pendingCardDraw.deck === 'chest' ? 'Community Chest' : 'Chance'} — waiting for the reveal…</div>`
+  } else if (v.phase === 'ROLL' && I.id === v.currentPlayerId) {
+    banner = `<div class="banner good">Your turn${I.jail ? ' — you\u2019re in jail!' : ''}</div>`
+    body += `<div class="card actions">
+      <button class="big primary" data-act="roll">Roll the dice</button>
       ${I.jail ? `
         <h3 style="margin-top:12px">Jail — attempt ${I.jailRolls}/3</h3>
         <div class="row">
           ${acts.has('payJail') ? `<button data-act="payJail">Pay $50 fine</button>` : ''}
-          ${acts.has('useJailCard') ? `<button data-act="useJailCard">🎟 Use jail card</button>` : ''}
+          ${acts.has('useJailCard') ? `<button data-act="useJailCard">Use jail card</button>` : ''}
         </div>` : ''}
     </div>`
   } else if (v.phase === 'ACTION' && I.id === v.currentPlayerId) {
     if (v.pendingPurchase != null) {
       const sp = BOARD[v.pendingPurchase]
       const price = 'price' in sp ? sp.price : 0
-      banner = `<div class="banner good">📍 You landed on <b>${esc(sp.name)}</b></div>`
+      banner = `<div class="banner good">You landed on <b>${esc(sp.name)}</b></div>`
       body += `<div class="card actions">
         <h3>Unowned — $${price}</h3>
         <div class="row">
           ${acts.has('buy') ? `<button class="big good" data-act="buy">Buy for $${price}</button>` : `<button class="big disabled" disabled>Can't afford $${price}</button>`}
-          ${acts.has('declineBuy') ? `<button class="big" data-act="declineBuy">🔨 Send to auction</button>` : ''}
+          ${acts.has('declineBuy') ? `<button class="big" data-act="declineBuy">Send to auction</button>` : ''}
         </div>
       </div>`
     } else if (v.pendingTax && v.pendingTax.player === I.id) {
       const percentCost = Math.ceil(netWorth(v, I.id) / 10)
-      banner = `<div class="banner good">💸 Income Tax</div>`
+      banner = `<div class="banner good">Income Tax</div>`
       body += `<div class="card actions">
         <h3>Choose your payment</h3>
         <div class="row">
@@ -434,8 +496,8 @@ function renderGame(v: PlayerView): void {
         </div>
       </div>`
     } else {
-      banner = `<div class="banner info">You rolled — you may still build or trade before ending your turn.</div>`
-      body += `<div class="card actions"><button class="big primary" data-act="endTurn">END TURN ➡</button></div>`
+      banner = `<div class="banner info">You rolled — you can still build or trade before ending your turn.</div>`
+      body += `<div class="card actions"><button class="big primary" data-act="endTurn">End turn</button></div>`
     }
   } else {
     banner = `<div class="banner info">${cur ? `${cur.token} <b>${esc(cur.name)}</b>'s turn` : 'Waiting…'}</div>`
@@ -446,27 +508,32 @@ function renderGame(v: PlayerView): void {
   const incoming = v.trades.filter((t) => t.to === I.id)
   const outgoing = v.trades.filter((t) => t.from === I.id)
   if (incoming.length > 0) {
-    body += `<div class="trades"><h3>🤝 Incoming offers</h3>${incoming.map((t) => tradeCard(v, t, 'incoming')).join('')}</div>`
+    body += `<div class="trades"><h3>INCOMING OFFERS</h3>${incoming.map((t) => tradeCard(v, t, 'incoming')).join('')}</div>`
   }
   if (outgoing.length > 0) {
-    body += `<div class="trades"><h3>📤 Your offers</h3>${outgoing.map((t) => tradeCard(v, t, 'outgoing')).join('')}</div>`
+    body += `<div class="trades"><h3>YOUR OFFERS</h3>${outgoing.map((t) => tradeCard(v, t, 'outgoing')).join('')}</div>`
   }
 
   // ── My portfolio ──
-  body += renderPortfolio(v, I.id, acts)
+  body += renderPortfolio(v, I.id)
+
+  // ── Transaction history (yours and everyone else's) ──
+  body += renderLedger(v, I.id)
 
   // ── New trade button ──
   if (acts.has('proposeTrade')) {
-    body += `<button class="big wide" data-act="openTrade">🤝 Propose a trade</button>`
+    body += `<button class="big wide" data-act="openTrade">Propose a trade</button>`
   }
 
   $app.innerHTML = `
     <header class="topbar" style="--c:${I.color}">
       <span class="me">${I.token} ${esc(I.name)}</span>
       <span class="money">$${I.cash}</span>
-      <span class="meta">worth $${worth}${I.jailCards > 0 ? ` · 🎟×${I.jailCards}` : ''}</span>
+      <span class="meta">worth $${worth}${I.jailCards > 0 ? ` · jail card ×${I.jailCards}` : ''}</span>
+      <button class="themebtn" data-act="theme">${theme === 'light' ? 'Dark' : 'Light'}</button>
     </header>
     ${banner}
+    ${drawStrip}
     ${deadlineChip}
     <main>${body}</main>
     ${composer && composer.open ? renderComposer(v) : ''}`
@@ -476,7 +543,7 @@ function sideSummary(side: TradeSide): string {
   const parts: string[] = []
   if (side.cash > 0) parts.push(`$${side.cash}`)
   for (const i of side.spaces) parts.push(esc(BOARD[i].name))
-  if (side.jailCards > 0) parts.push(`🎟 Get Out of Jail ×${side.jailCards}`)
+  if (side.jailCards > 0) parts.push(`jail card ×${side.jailCards}`)
   return parts.join(' + ') || 'nothing'
 }
 
@@ -491,38 +558,63 @@ function tradeCard(v: PlayerView, t: TradeOffer, dir: 'incoming' | 'outgoing'): 
   </div>`
 }
 
-function renderPortfolio(v: PlayerView, pid: string, acts: Set<string>): string {
+function renderPortfolio(v: PlayerView, pid: string): string {
   const owned = Object.entries(v.props)
     .filter(([, st]) => st.owner === pid)
     .map(([iStr, st]) => ({ i: Number(iStr), st }))
     .sort((a, b) => a.i - b.i)
   if (owned.length === 0) {
-    return `<div class="trades"><h3>🏷 Your properties</h3><p class="hint">None yet — land on something and buy it!</p></div>`
+    return `<div class="trades"><h3>YOUR PROPERTIES</h3><p class="hint">None yet — land on something and buy it!</p></div>`
   }
   const rows = owned
     .map(({ i, st }) => {
       const sp: Space = BOARD[i]
       const strip = isStreet(sp) ? `<span class="strip" style="background:${GROUP_COLORS[sp.group]}"></span>` : `<span class="strip gray"></span>`
       const marks =
-        (st.houses > 0 ? (st.houses === 5 ? '🏨 hotel' : `🏠×${st.houses}`) : '') +
-        (st.mortgaged ? ' 💤 mortgaged' : '')
+        (st.houses > 0 ? (st.houses === 5 ? 'hotel' : `${st.houses} house${st.houses > 1 ? 's' : ''}`) : '') +
+        (st.mortgaged ? ' · mortgaged' : '')
       const btns: string[] = []
-      if (canBuildOn(v, pid, i)) btns.push(`<button class="tiny good" data-act="buyHouse" data-args='{"space":${i}}'>+🏠 $${isStreet(sp) ? sp.houseCost : ''}</button>`)
-      if (canSellHouseOn(v, pid, i)) btns.push(`<button class="tiny" data-act="sellHouse" data-args='{"space":${i}}'>−🏠 +$${isStreet(sp) ? sp.houseCost / 2 : ''}</button>`)
-      if (canMortgageOn(v, pid, i)) btns.push(`<button class="tiny" data-act="mortgage" data-args='{"space":${i}}'>💤 +$${('price' in sp ? sp.price : 0) / 2}</button>`)
-      if (canUnmortgageOn(v, pid, i)) btns.push(`<button class="tiny" data-act="unmortgage" data-args='{"space":${i}}'>Wake −$${unmortgageCost('price' in sp ? sp.price : 0)}</button>`)
+      if (canBuildOn(v, pid, i)) btns.push(`<button class="tiny" data-act="buyHouse" data-args='{"space":${i}}'>House +$${isStreet(sp) ? sp.houseCost : ''}</button>`)
+      if (canSellHouseOn(v, pid, i)) btns.push(`<button class="tiny" data-act="sellHouse" data-args='{"space":${i}}'>Sell house +$${isStreet(sp) ? sp.houseCost / 2 : ''}</button>`)
+      if (canMortgageOn(v, pid, i)) btns.push(`<button class="tiny" data-act="mortgage" data-args='{"space":${i}}'>Mortgage +$${('price' in sp ? sp.price : 0) / 2}</button>`)
+      if (canUnmortgageOn(v, pid, i)) btns.push(`<button class="tiny" data-act="unmortgage" data-args='{"space":${i}}'>Unmortgage −$${unmortgageCost('price' in sp ? sp.price : 0)}</button>`)
       const relevantPhase = v.phase === 'DEBT' ? ['mortgage', 'sellHouse'] : null
       const show = btns.length > 0 && (!relevantPhase || btns.some((b) => relevantPhase.some((rt) => b.includes(`data-act="${rt}"`))))
       return `<div class="prop">
         ${strip}
         <div class="pinfo">
-          <div class="pname">${esc(sp.name)} ${marks}</div>
+          <div class="pname">${esc(sp.name)}${marks ? ` <span class="hint">${marks}</span>` : ''}</div>
           ${show ? `<div class="row">${btns.join('')}</div>` : ''}
         </div>
       </div>`
     })
     .join('')
-  return `<div class="trades"><h3>🏷 Your properties (${owned.length})</h3>${rows}</div>`
+  return `<div class="trades"><h3>YOUR PROPERTIES (${owned.length})</h3>${rows}</div>`
+}
+
+// The full-information money ledger: pick any player, read their books.
+function renderLedger(v: PlayerView, meId: string): string {
+  const sel = ledgerTab ?? meId
+  const entries = v.ledger.filter((e) => e.playerId === sel).slice(-25).reverse()
+  const chips = v.players
+    .map(
+      (p) =>
+        `<button class="chip ${p.id === sel ? 'sel' : ''}" style="${p.id === sel ? `border-color:${p.color}` : ''}" data-act="ledgerTab" data-args='{"id":"${p.id}"}' ${p.bankrupt ? 'disabled' : ''}>${p.token} ${esc(p.name)}</button>`,
+    )
+    .join('')
+  const rows = entries.length
+    ? entries
+        .map(
+          (e) =>
+            `<li><span class="amt ${e.delta > 0 ? 'plus' : 'minus'}">${e.delta > 0 ? '+' : '−'}$${Math.abs(e.delta)}</span><span class="memo">${esc(e.memo)}</span><span class="lturn">turn ${e.turn}</span></li>`,
+        )
+        .join('')
+    : '<li><span class="memo hint">No transactions yet.</span></li>'
+  return `<div class="ledger">
+    <h3>TRANSACTION HISTORY</h3>
+    <div class="chips">${chips}</div>
+    <ul class="ledger-list">${rows}</ul>
+  </div>`
 }
 
 function renderComposer(v: PlayerView): string {
@@ -531,32 +623,32 @@ function renderComposer(v: PlayerView): string {
   const I = meOf(v)
   const partners = v.players.filter((p) => !p.bankrupt && p.id !== I.id)
   const partner = partnerPlayer(v, C.partner)
-  const mySpacess = Object.entries(v.props).filter(([, st]) => st.owner === I.id)
+  const mySpaces = Object.entries(v.props).filter(([, st]) => st.owner === I.id)
   const theirSpaces = Object.entries(v.props).filter(([, st]) => st.owner === C.partner)
   const chip = (i: number, selected: boolean, which: 'give' | 'recv'): string => {
     const sp = BOARD[i]
-    const col = isStreet(sp) ? GROUP_COLORS[sp.group] : '#888'
+    const col = isStreet(sp) ? GROUP_COLORS[sp.group] : '#9aa1ad'
     return `<button class="chip ${selected ? 'sel' : ''}" style="border-color:${col}" data-act="${which === 'give' ? 'toggleGiveSpace' : 'toggleRecvSpace'}" data-args='{"space":${i}}'>${esc(sp.name)}</button>`
   }
   return `
     <div class="modal" data-act="closeTrade">
       <div class="sheet" data-act="">
-        <h3>🤝 Propose a trade</h3>
+        <h3>Propose a trade</h3>
         <label>Trade with</label>
         <div class="row">
-          ${partners.map((p) => `<button class="chip ${C.partner === p.id ? 'sel' : ''}" data-act="composerPartner" data-args='{"partner":"${p.id}"}">${p.token} ${esc(p.name)}</button>`).join('')}
+          ${partners.map((p) => `<button class="chip ${C.partner === p.id ? 'sel' : ''}" data-act="composerPartner" data-args='{"partner":"${p.id}"}'>${p.token} ${esc(p.name)}</button>`).join('')}
         </div>
         <label>You give</label>
-        <div class="chips">${mySpacess.map(([iStr]) => chip(Number(iStr), C.giveSpaces.includes(Number(iStr)), 'give')).join('')}</div>
+        <div class="chips">${mySpaces.map(([iStr]) => chip(Number(iStr), C.giveSpaces.includes(Number(iStr)), 'give')).join('')}</div>
         <div class="row">
           <input data-k="giveCash" type="number" inputmode="numeric" min="0" value="${C.giveCash}" placeholder="cash up to $${I.cash}" />
-          ${I.jailCards > 0 ? `<button class="chip ${C.giveJail > 0 ? 'sel' : ''}" data-act="composerJail" data-args='{"side":"give"}'>🎟 jail card</button>` : ''}
+          ${I.jailCards > 0 ? `<button class="chip ${C.giveJail > 0 ? 'sel' : ''}" data-act="composerJail" data-args='{"side":"give"}'>Jail card</button>` : ''}
         </div>
         <label>${partner ? `${partner.token} ${esc(partner.name)} gives` : 'They give'}</label>
         <div class="chips">${theirSpaces.map(([iStr]) => chip(Number(iStr), C.recvSpaces.includes(Number(iStr)), 'recv')).join('') || '<span class="hint">they own nothing</span>'}</div>
         <div class="row">
           <input data-k="recvCash" type="number" inputmode="numeric" min="0" value="${C.recvCash}" placeholder="cash up to $${partner?.cash ?? 0}" />
-          ${(partner?.jailCards ?? 0) > 0 ? `<button class="chip ${C.recvJail > 0 ? 'sel' : ''}" data-act="composerJail" data-args='{"side":"recv"}'>🎟 jail card</button>` : ''}
+          ${(partner?.jailCards ?? 0) > 0 ? `<button class="chip ${C.recvJail > 0 ? 'sel' : ''}" data-act="composerJail" data-args='{"side":"recv"}'>Jail card</button>` : ''}
         </div>
         <div class="row">
           <button class="big primary" data-act="sendTrade">Send offer</button>
@@ -565,3 +657,6 @@ function renderComposer(v: PlayerView): string {
       </div>
     </div>`
 }
+
+// First paint: never leave the phone blank while the socket warms up.
+render()

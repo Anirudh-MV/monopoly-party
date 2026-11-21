@@ -298,10 +298,18 @@ scenario('chance: nearest railroad charges double rent', 4, (h) => {
   h.s.chanceDeck = ['ch4']
   h.now(0)
   h.p(0).pos = 5
-  h.roll(0, [[1, 1]]) // → 7 Chance → nearest rail = 15
+  h.roll(0, [[1, 1]]) // → 7 Chance
+  h.eq(h.s.pendingCardDraw != null && h.s.pendingCardDraw.deck, 'chance', 'landing prompts the wheel, not an instant draw')
+  h.eq(allowedActions(h.s, h.id(0)).includes('drawCard'), true, 'the drawer is offered the spin')
+  h.eq(allowedActions(h.s, h.id(1)).includes('drawCard'), false, 'nobody else can spin for them')
+  h.bad(h.act(0, { type: 'endTurn' }), 'cannot end turn before drawing')
+  h.ok(h.act(0, { type: 'drawCard' }), 'spin the wheel')
+  h.eq(h.s.cardDrawSeq, 1, 'reveal counted for animations')
   h.eq(h.p(0).pos, 15, 'advanced to the railroad')
   h.eq(h.p(0).cash, 1450, 'paid 2× the single-rail rent ($50)')
   h.eq(h.p(1).cash, 1550, 'owner collected')
+  h.eq(h.s.phase, 'ROLL', 'doubles on the movement roll: Asha rolls again')
+  h.eq(allowedActions(h.s, h.id(0)).includes('roll'), true, 'the bonus roll is offered')
 })
 
 scenario('chance: nearest utility charges 10× a fresh roll', 4, (h) => {
@@ -309,7 +317,8 @@ scenario('chance: nearest utility charges 10× a fresh roll', 4, (h) => {
   h.s.chanceDeck = ['ch6']
   h.now(0)
   h.p(0).pos = 20
-  h.roll(0, [[1, 1], [5, 2]]) // → 22 Chance, then fresh utility roll 5+2
+  h.roll(0, [[1, 1]]) // → 22 Chance, then fresh utility roll 5+2
+  h.ok(h.act(0, { type: 'drawCard' }, [[5, 2]]), 'spin') // the rigged pair feeds the fresh roll
   h.eq(h.p(0).pos, 28, 'advanced to Water Works')
   h.eq(h.p(0).cash, 1430, 'paid 10 × 7 = $70')
 })
@@ -319,6 +328,7 @@ scenario('chance: advance to Illinois crosses GO and pays $200', 4, (h) => {
   h.now(0)
   h.p(0).pos = 34
   h.roll(0, [[1, 1]]) // → 36 Chance → Illinois (24)
+  h.ok(h.act(0, { type: 'drawCard' }), 'spin')
   h.eq(h.p(0).pos, 24, 'advanced to Illinois Ave')
   h.eq(h.p(0).cash, 1700, 'collected GO money on the wrap')
 })
@@ -328,10 +338,14 @@ scenario('chance: go back 3 spaces chains into Community Chest', 4, (h) => {
   h.s.chestDeck = ['cc12'] // hospital fees $100
   h.now(0)
   h.p(0).pos = 34
-  h.roll(0, [[1, 1]]) // → 36 Chance → back 3 → 33 Chest → $100
+  h.roll(0, [[1, 1]]) // → 36 Chance
+  h.ok(h.act(0, { type: 'drawCard' }), 'spin the wheel')
   h.eq(h.p(0).pos, 33, 'back 3 onto Community Chest')
+  h.eq(h.s.pendingCardDraw != null && h.s.pendingCardDraw.deck, 'chest', 'the chained chest also prompts')
+  h.ok(h.act(0, { type: 'drawCard' }), 'open the chained chest')
   h.eq(h.p(0).cash, 1400, 'drew and paid the chest card')
   h.eq(h.s.pendingCard != null && h.s.pendingCard.deck, 'chest', 'the chained chest card is showing')
+  h.eq(h.s.cardDrawSeq, 2, 'both reveals counted')
 })
 
 scenario('chance: repairs card counts houses and hotels', 4, (h) => {
@@ -342,6 +356,7 @@ scenario('chance: repairs card counts houses and hotels', 4, (h) => {
   h.now(0)
   h.p(0).pos = 34
   h.roll(0, [[1, 1]]) // → 36 Chance: $25/house, $100/hotel
+  h.ok(h.act(0, { type: 'drawCard' }), 'spin')
   h.eq(h.p(0).cash, 1500 - 2 * 25 - 100, 'paid $150 in repairs')
 })
 
@@ -378,6 +393,7 @@ scenario('debt resolution: raise funds, then pay — with a queue', 4, (h) => {
   h.now(0)
   h.p(0).pos = 15
   h.roll(0, [[1, 1]]) // → 17 Chest
+  h.ok(h.act(0, { type: 'drawCard' }), 'open the chest')
   h.eq(h.s.phase, 'DEBT', 'Cho cannot pay her $10')
   h.eq(allowedActions(h.s, h.id(1)).length, 0, 'everyone else is frozen while a debt resolves')
   h.eq(h.p(0).cash, 1510, 'collected from Ben, who could afford it')
@@ -434,6 +450,26 @@ scenario('bankruptcy to the bank puts properties under the hammer', 3, (h) => {
   h.ok(h.act(2, { type: 'passBid' }), 'Cho passes')
   h.eq(h.s.phase, 'ROLL', 'liquidations done — next player\u2019s turn')
   h.eq(h.s.currentPlayerId, h.id(1), 'Ben is up (bankrupt Asha is skipped)')
+})
+
+scenario('transaction ledger records every cash movement', 4, (h) => {
+  h.give(1, [1])
+  h.give(0, [3])
+  h.now(0)
+  h.p(0).pos = 38
+  h.roll(0, [[1, 2]]) // sum 3 → wraps GO → lands on 1, owned by Ben
+  const p0Ledger = h.s.ledger.filter((e) => e.playerId === h.id(0))
+  const p1Ledger = h.s.ledger.filter((e) => e.playerId === h.id(1))
+  h.eq(p0Ledger.length, 2, 'Asha: GO money + rent')
+  h.eq(p0Ledger[0].memo, 'Passed GO', 'GO reward is itemised')
+  h.eq(p0Ledger[1].delta, -2, 'rent recorded as a payment')
+  h.eq(p0Ledger[1].memo, 'Rent: Mediterranean Ave', 'rent memo names the space')
+  h.eq(p1Ledger.length, 1, 'Ben: rent received')
+  h.eq(p1Ledger[0].delta, 2, 'and it is the same $2')
+  h.eq(p1Ledger[0].memo, 'Received from Asha: Rent: Mediterranean Ave', 'creditor memo names the payer')
+
+  h.ok(h.act(0, { type: 'mortgage', space: 3 }), 'mortgage Baltic')
+  h.eq(h.s.ledger.filter((e) => e.playerId === h.id(0) && e.memo === 'Mortgaged Baltic Ave').length, 1, 'mortgage recorded')
 })
 
 scenario('bankrupt players are skipped in turn order', 4, (h) => {
@@ -502,6 +538,7 @@ scenario('jail cards leave and return to their decks', 4, (h) => {
   h.now(0)
   h.p(0).pos = 5
   h.roll(0, [[1, 1]]) // → 7 Chance → Get Out of Jail Free
+  h.ok(h.act(0, { type: 'drawCard' }), 'spin')
   h.eq(h.p(0).jailCards, 1, 'card kept')
   h.eq(h.s.chanceDeck.includes('ch8'), false, 'removed from the deck while held')
   h.p(0).jail = true

@@ -86,6 +86,15 @@ export interface LogEntry {
   kind: 'info' | 'good' | 'bad' | 'money'
 }
 
+// A single money movement, for the per-player transaction history.
+export interface MoneyEvent {
+  seq: number
+  turn: number
+  playerId: string
+  delta: number // + collected / − paid
+  memo: string
+}
+
 export interface GameState {
   phase: Phase
   players: PlayerState[]
@@ -96,6 +105,10 @@ export interface GameState {
   chanceDeck: string[] // remaining card ids, front = next
   chestDeck: string[]
   pendingCard: Card | null
+  // Two-step card draws: landing sets this, the player "opens the chest" /
+  // "spins the wheel" from their phone, which then performs the actual draw.
+  pendingCardDraw: { player: string; deck: 'chance' | 'chest'; space: number } | null
+  cardDrawSeq: number // bumped on every reveal so screens can animate it
   pendingPurchase: number | null
   pendingTax: { player: string; space: number } | null
   pendingMove: number | null // steps to finish after a debt is resolved (jail fine case)
@@ -106,6 +119,8 @@ export interface GameState {
   trades: TradeOffer[]
   // The space the current player most recently landed on — the TV spotlights it.
   lastLanded: { playerId: string; space: number } | null
+  // Full-information money ledger: every cash movement, visible to everyone.
+  ledger: MoneyEvent[]
   // Wall-clock deadline (epoch ms) for the active decision, maintained by the
   // room layer. Hidden on phones until the final 30 seconds.
   deadline: number | null
@@ -126,6 +141,7 @@ export interface RulesState {
   dice: [number, number] | null
   pendingPurchase: number | null
   pendingTax: { player: string; space: number } | null
+  pendingCardDraw: { player: string; deck: 'chance' | 'chest'; space: number } | null
   debt: DebtState | null
   auction: AuctionState | null
   trades: TradeOffer[]
@@ -135,6 +151,7 @@ export interface RulesState {
 
 export type Action =
   | { type: 'roll' }
+  | { type: 'drawCard' }
   | { type: 'buy' }
   | { type: 'declineBuy' }
   | { type: 'bid'; amount: number }
@@ -170,8 +187,11 @@ export interface HostView {
   props: Record<number, PropertyState>
   dice: [number, number] | null
   log: LogEntry[]
+  ledger: MoneyEvent[]
   auction: AuctionState | null
   pendingCard: Card | null
+  pendingCardDraw: { player: string; deck: 'chance' | 'chest'; space: number } | null
+  cardDrawSeq: number
   pendingPurchase: number | null
   pendingTax: { player: string; space: number } | null
   debt: DebtState | null
