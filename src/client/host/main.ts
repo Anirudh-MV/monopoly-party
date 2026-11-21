@@ -51,7 +51,7 @@ document.body.appendChild(themeBtn)
 const godBtn = document.createElement('button')
 godBtn.className = 'themetoggle godtoggle'
 godBtn.style.position = 'fixed'
-godBtn.style.top = '68px'
+godBtn.style.top = '9vh'
 godBtn.textContent = 'God'
 godBtn.addEventListener('click', () => {
   godOpen = !godOpen
