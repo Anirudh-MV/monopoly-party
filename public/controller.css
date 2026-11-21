@@ -48,14 +48,26 @@ body {
 .join h1 { font-size: 26px; text-align: center; }
 label { display: block; color: var(--dim); font-size: 13px; margin: 12px 0 4px; }
 .hint-inline { font-size: 11px; opacity: 0.8; }
-.tokgrid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; margin-top: 4px; }
+.tokgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 4px; }
 .tok {
-  font-size: 22px; min-height: 46px; padding: 4px 0;
-  background: var(--panel2); border: 2px solid var(--line); border-radius: 10px;
+  background: var(--panel2); border: 2px solid var(--line); border-radius: 12px;
   display: flex; align-items: center; justify-content: center;
+  aspect-ratio: 1 / 1; min-height: 0; padding: 2px;
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
 }
-.tok.sel { background: color-mix(in srgb, var(--accent) 18%, var(--panel)); border-color: var(--accent); transform: scale(1.06); }
-.tok.taken { opacity: 0.3; text-decoration: line-through; pointer-events: none; }
+.tok img { width: 100%; height: 100%; object-fit: contain; display: block; pointer-events: none; }
+.tok.sel { background: color-mix(in srgb, var(--accent) 18%, var(--panel)); border-color: var(--accent); transform: scale(1.04); }
+.tok.taken { opacity: 0.3; pointer-events: none; }
+
+/* colour swatches */
+.swatchgrid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-top: 4px; }
+.swatch {
+  aspect-ratio: 1 / 1; border-radius: 50%;
+  border: 3px solid var(--line); cursor: pointer; padding: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+.swatch.sel { border-color: var(--ink, #1c2333); box-shadow: 0 0 0 2px var(--panel2), 0 0 0 4px var(--accent); transform: scale(1.05); }
+.swatch.taken { opacity: 0.25; pointer-events: none; }
 
 /* two-step join: summary line + the 3D avatar pedestal */
 .join-summary {

@@ -114,27 +114,41 @@ try {
     const dres = await emitAck(phones[1].sock, 'room:setPiece', { piece: '🚢' })
     assert(dres && !dres.ok, 'a taken piece stays taken')
 
-    // the host kicks a fourth joiner; only the host can kick
-    const extra = connect()
-    let kicked = false
-    extra.on('kicked', () => {
-      kicked = true
-    })
-    const eres = await emitAck(extra, 'room:join', { code, name: 'Ravi' })
-    assert(eres.ok, 'fourth phone joined for the kick test')
-    await sleep(120)
-    const bad = await emitAck(phones[1].sock, 'room:kick', { playerId: eres.playerId })
+    // colours: chosen at join, changeable in the lobby, unique per room
+    const zoe = connect()
+    let zoeKicked = false
+    zoe.on('kicked', () => { zoeKicked = true })
+    const cres = await emitAck(zoe, 'room:join', { code, name: 'Zoe', color: '#8b5cf6' })
+    assert(cres.ok, 'a colour chosen at join is honoured')
+    await sleep(150)
+    assert(l && l.players.find((p) => p.name === 'Zoe')?.color === '#8b5cf6', 'the lobby shows the chosen colour')
+    // someone else cannot take an occupied colour
+    const c2sock = connect()
+    const c2res = await emitAck(c2sock, 'room:join', { code, name: 'Rin', color: '#8b5cf6' })
+    assert(c2res && !c2res.ok, 'an occupied colour is refused at join')
+    c2sock.disconnect()
+    const scres = await emitAck(phones[1].sock, 'room:setColor', { color: '#f43f5e' })
+    assert(scres.ok, 'lobby colour change accepted')
+    await sleep(150)
+    assert(l && l.players.find((p) => p.id === phones[1].id)?.color === '#f43f5e', 'the lobby shows the new colour')
+    const scdup = await emitAck(phones[2].sock, 'room:setColor', { color: '#f43f5e' })
+    assert(scdup && !scdup.ok, 'a taken colour stays taken')
+    const scbad = await emitAck(phones[2].sock, 'room:setColor', { color: 'hotpink' })
+    assert(scbad && !scbad.ok, 'non-palette colours are refused')
+
+    // the host kicks Zoe; only the host can kick
+    const bad = await emitAck(phones[1].sock, 'room:kick', { playerId: cres.playerId })
     assert(bad && !bad.ok, 'only the party host can kick')
-    const kres = await emitAck(phones[0].sock, 'room:kick', { playerId: eres.playerId })
-    assert(kres.ok, 'host kicked the fourth phone')
+    const kres = await emitAck(phones[0].sock, 'room:kick', { playerId: cres.playerId })
+    assert(kres.ok, 'host kicked the coloured joiner')
     await sleep(200)
-    assert(kicked, 'the kicked phone was told')
-    assert(l && l.players.length === 3 && !l.players.some((p) => p.name === 'Ravi'), 'lobby back to 3 after the kick')
+    assert(zoeKicked, 'the kicked phone was told')
+    assert(l && l.players.length === 3 && !l.players.some((p) => p.name === 'Zoe'), 'lobby back to 3 after the kick')
     const back = connect()
-    const bres = await emitAck(back, 'room:rejoin', { token: eres.token })
+    const bres = await emitAck(back, 'room:rejoin', { token: cres.token })
     assert(bres && !bres.ok, 'the kicked token is dead')
     back.disconnect()
-    extra.disconnect()
+    zoe.disconnect()
   }
 
   // ── start ──

@@ -204,6 +204,33 @@ export function createAvatar(idx: number, color: string): THREE.Group {
   return g
 }
 
+// One-time offscreen render of each avatar — the picker grids show these
+// instead of emoji, so what you tap is exactly what walks the board.
+const thumbs = new Map<number, string>()
+
+export function avatarThumbnail(idx: number): string {
+  const cached = thumbs.get(idx)
+  if (cached) return cached
+  const size = 128
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true })
+  renderer.setPixelRatio(1)
+  renderer.setSize(size, size)
+  const scene = new THREE.Scene()
+  scene.add(new THREE.AmbientLight(0xffffff, 0.85))
+  const dir = new THREE.DirectionalLight(0xffffff, 1.0)
+  dir.position.set(3, 5, 2)
+  scene.add(dir)
+  const camera = new THREE.PerspectiveCamera(36, 1, 0.1, 50)
+  camera.position.set(1.15, 1.05, 1.6)
+  camera.lookAt(0, 0.28, 0)
+  scene.add(createAvatar(idx, '#f59e0b'))
+  renderer.render(scene, camera)
+  const url = renderer.domElement.toDataURL()
+  renderer.dispose()
+  thumbs.set(idx, url)
+  return url
+}
+
 // A tiny rotating pedestal view of one avatar — the phone's piece picker.
 export class AvatarPreview {
   private renderer: THREE.WebGLRenderer

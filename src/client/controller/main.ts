@@ -8,7 +8,8 @@
 import { io } from 'socket.io-client'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
 import { TOKENS, stripEmoji } from '../../shared/tokens.js'
-import { AvatarPreview } from '../tokens3d.js'
+import { COLORS } from '../../shared/colors.js'
+import { AvatarPreview, avatarThumbnail } from '../tokens3d.js'
 import { Board3D } from '../host/board3d.js'
 import {
   canBuildOn,
@@ -79,9 +80,11 @@ let joinCode = ''
 let joinName = ''
 const joinTaken = new Set<string>() // pieces the server refused as taken
 let avatarPreview: AvatarPreview | null = null
-const PREVIEW_COLOR = '#f59e0b'
-// optimistic piece selection in the lobby (cleared once the broadcast lands)
+// the colour picked on the join screen (defaults to the first in the list)
+let joinColor = COLORS[0]
+// optimistic selections in the lobby (cleared once the broadcast lands)
 let lobbySel: string | null = null
+let lobbyColorSel: string | null = null
 
 function disposeAvatarPreview(): void {
   avatarPreview?.dispose()
@@ -525,14 +528,14 @@ $app.addEventListener('click', (ev) => {
       break
     }
     case 'join': {
-      socket.emit('room:join', { code: joinCode, name: joinName, piece: joinPiece }, (res: JoinAck) => {
+      socket.emit('room:join', { code: joinCode, name: joinName, piece: joinPiece, color: joinColor }, (res: JoinAck) => {
         if (!res.ok) {
-          // a taken piece gets crossed out in the grid, not just a toast
+          // a taken model or colour gets crossed out in the grid, not just a toast
           const m = /(\S+) is already taken/.exec(res.error ?? '')
           if (m) {
-            joinTaken.add(m[1])
+            if (TOKENS.includes(m[1])) joinTaken.add(m[1])
             renderJoin()
-            toast(`${m[1]} is taken — pick another piece`)
+            toast(`${m[1]} is taken — pick another`)
             return
           }
           return toast(res.error ?? 'Could not join')
@@ -551,12 +554,20 @@ $app.addEventListener('click', (ev) => {
       document.querySelectorAll('.tok').forEach((b) => {
         b.classList.toggle('sel', (b as HTMLElement).dataset.piece === joinPiece)
       })
-      avatarPreview?.show(TOKENS.indexOf(joinPiece), PREVIEW_COLOR)
+      avatarPreview?.show(TOKENS.indexOf(joinPiece), joinColor)
+      break
+    }
+    case 'pickColor': {
+      joinColor = el.dataset.color ?? joinColor
+      document.querySelectorAll('.swatch').forEach((b) => {
+        b.classList.toggle('sel', (b as HTMLElement).dataset.color === joinColor)
+      })
+      avatarPreview?.show(TOKENS.indexOf(joinPiece), joinColor)
       break
     }
     case 'lobbyPiece': {
-      // change your piece in the lobby — optimistic selection, server
-      // confirms with a lobby broadcast (or rejects a taken piece)
+      // change your model in the lobby — optimistic selection, server
+      // confirms with a lobby broadcast (or rejects a taken model)
       const piece = el.dataset.piece ?? ''
       const wearing = lobby?.players.find((p) => p.id === myPlayerId)?.token
       if (!piece || piece === wearing) return
@@ -564,7 +575,7 @@ $app.addEventListener('click', (ev) => {
       document.querySelectorAll('.tok').forEach((b) => {
         b.classList.toggle('sel', (b as HTMLElement).dataset.piece === piece)
       })
-      avatarPreview?.show(TOKENS.indexOf(piece), PREVIEW_COLOR)
+      avatarPreview?.show(TOKENS.indexOf(piece), lobbyColorSel ?? lobby?.players.find((p) => p.id === myPlayerId)?.color ?? COLORS[0])
       socket.emit('room:setPiece', { piece }, (res: { ok: boolean; error?: string }) => {
         if (!res.ok) {
           toast(res.error ?? 'Could not change piece')
@@ -573,6 +584,27 @@ $app.addEventListener('click', (ev) => {
         } else {
           joinPiece = piece
           lobbySel = null
+        }
+      })
+      break
+    }
+    case 'lobbyColor': {
+      // change your colour in the lobby — the avatar wears it on the board
+      const color = el.dataset.color ?? ''
+      const wearing = lobby?.players.find((p) => p.id === myPlayerId)?.color
+      if (!color || color === wearing) return
+      lobbyColorSel = color
+      document.querySelectorAll('.swatch').forEach((b) => {
+        b.classList.toggle('sel', (b as HTMLElement).dataset.color === color)
+      })
+      avatarPreview?.show(TOKENS.indexOf(lobbySel ?? lobby?.players.find((p) => p.id === myPlayerId)?.token ?? TOKENS[0]), color)
+      socket.emit('room:setColor', { color }, (res: { ok: boolean; error?: string }) => {
+        if (!res.ok) {
+          toast(res.error ?? 'Could not change colour')
+          lobbyColorSel = null
+          render()
+        } else {
+          lobbyColorSel = null
         }
       })
       break
@@ -777,7 +809,7 @@ function renderJoin(): void {
       </div>`
     return
   }
-  // piece stage: each emoji is tied to its own 3D avatar, previewed live
+  // model + colour stage: tap a 3D avatar and a colour, previewed live
   $app.innerHTML = `
     <div class="join">
       <h1>MONOPOLY PARTY</h1>
@@ -787,18 +819,24 @@ function renderJoin(): void {
         <div class="tokgrid">
           ${TOKENS.map(
             (t) =>
-              `<button type="button" class="tok${t === joinPiece ? ' sel' : ''}${joinTaken.has(t) ? ' taken' : ''}" data-piece="${t}" data-act="pickPiece"${joinTaken.has(t) ? ' disabled' : ''}>${t}</button>`,
+              `<button type="button" class="tok${t === joinPiece ? ' sel' : ''}${joinTaken.has(t) ? ' taken' : ''}" data-piece="${t}" data-act="pickPiece"${joinTaken.has(t) ? ' disabled' : ''}><img src="${avatarThumbnail(TOKENS.indexOf(t))}" alt="${t}" draggable="false" /></button>`,
+          ).join('')}
+        </div>
+        <label>Choose your colour</label>
+        <div class="swatchgrid">
+          ${COLORS.map(
+            (c) => `<button type="button" class="swatch${c === joinColor ? ' sel' : ''}" style="background:${c}" data-color="${c}" data-act="pickColor" aria-label="colour ${c}"></button>`,
           ).join('')}
         </div>
         <div id="avatarStage"></div>
         <button class="big primary" data-act="join">Join as ${esc(joinName)}</button>
-        <p class="hint">Every piece has its own 3D avatar — that's what walks the board.</p>
+        <p class="hint">Each piece is its own 3D avatar — it walks the board in your colour.</p>
       </div>
     </div>`
   const stage = document.getElementById('avatarStage')
   if (stage) {
     avatarPreview = new AvatarPreview(stage)
-    avatarPreview.show(TOKENS.indexOf(joinPiece), PREVIEW_COLOR)
+    avatarPreview.show(TOKENS.indexOf(joinPiece), joinColor)
   }
 }
 
@@ -814,13 +852,21 @@ function renderLobby(l: LobbyInfo): void {
     .join('')
   const others = l.players.filter((p) => p.id !== myPlayerId)
   const myPiece = lobbySel ?? me?.token ?? TOKENS[0]
-  // your piece is yours to change until the game starts
-  const pieceEditor = me ? `
+  const myColor = lobbyColorSel ?? me?.color ?? COLORS[0]
+  // your model + colour are yours to change until the game starts
+  const seatEditor = me ? `
       <label>Your piece — tap to change</label>
       <div class="tokgrid">
         ${TOKENS.map(
           (t) =>
-            `<button type="button" class="tok${t === myPiece ? ' sel' : ''}${l.players.some((p) => p.id !== myPlayerId && p.token === t) ? ' taken' : ''}" data-piece="${t}" data-act="lobbyPiece"${t === myPiece || l.players.some((p) => p.id !== myPlayerId && p.token === t) ? ' disabled' : ''}>${t}</button>`,
+            `<button type="button" class="tok${t === myPiece ? ' sel' : ''}${l.players.some((p) => p.id !== myPlayerId && p.token === t) ? ' taken' : ''}" data-piece="${t}" data-act="lobbyPiece"${t === myPiece || l.players.some((p) => p.id !== myPlayerId && p.token === t) ? ' disabled' : ''}><img src="${avatarThumbnail(TOKENS.indexOf(t))}" alt="${t}" draggable="false" /></button>`,
+        ).join('')}
+      </div>
+      <label>Your colour — tap to change</label>
+      <div class="swatchgrid">
+        ${COLORS.map(
+          (c) =>
+            `<button type="button" class="swatch${c === myColor ? ' sel' : ''}${l.players.some((p) => p.id !== myPlayerId && p.color === c) ? ' taken' : ''}" style="background:${c}" data-color="${c}" data-act="lobbyColor"${c === myColor || l.players.some((p) => p.id !== myPlayerId && p.color === c) ? ' disabled' : ''} aria-label="colour ${c}"></button>`,
         ).join('')}
       </div>
       <div id="avatarStage"></div>` : ''
@@ -830,7 +876,7 @@ function renderLobby(l: LobbyInfo): void {
       <p class="good">You're in${isHost ? ' — and you\u2019re the party host' : ''}.</p>
       <h3>Players (${l.players.length})</h3>
       <ul class="playerlist">${players}</ul>
-      ${pieceEditor}
+      ${seatEditor}
       ${isHost ? `
         <button class="big primary" data-act="startGame" ${l.canStart ? '' : 'disabled'}>Start the game</button>
         ${!l.canStart ? '<p class="hint">Best with 3+ players — waiting…</p>' : ''}
@@ -840,11 +886,11 @@ function renderLobby(l: LobbyInfo): void {
       ` : '<p class="hint">Waiting for the host to start the game…<br/>Keep this tab open.</p>'}
       <div class="row"><button class="tiny" data-act="leave">Leave room</button></div>
     </div>`
-  // live 3D preview of the piece you're wearing (or about to take)
+  // live 3D preview of the piece you're wearing (or about to take), in your colour
   const stage = document.getElementById('avatarStage')
   if (stage && me) {
     avatarPreview = new AvatarPreview(stage)
-    avatarPreview.show(TOKENS.indexOf(myPiece), PREVIEW_COLOR)
+    avatarPreview.show(TOKENS.indexOf(myPiece), myColor)
   }
 }
 

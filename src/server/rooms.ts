@@ -16,6 +16,7 @@ import { ALL_CARDS } from '../shared/cards.js'
 import { hostView, playerView } from '../shared/views.js'
 import { allowedActions, alivePlayers, netWorth } from '../shared/rules.js'
 import { TOKENS, stripEmoji } from '../shared/tokens.js'
+import { COLORS } from '../shared/colors.js'
 import type {
   Action,
   AuctionState,
@@ -54,8 +55,6 @@ const AUCTION_IDLE_MS = 15_000
 // on its behalf — long enough to survive a screen-lock blip, short enough
 // that one lost device can't stall the table.
 const AUCTION_DISCONNECT_GRACE_MS = 15_000
-
-const PLAYER_COLORS = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316', '#06b6d4', '#ec4899']
 
 interface PlayerEntry {
   meta: PlayerMeta
@@ -650,7 +649,9 @@ function validateSnapshot(raw: unknown): RoomSnapshot | null {
     // Colors are rendered into style attributes and pieces into markup —
     // only known-safe values survive validation.
     const color =
-      typeof meta.color === 'string' && HEX_COLOR.test(meta.color) ? meta.color : PLAYER_COLORS[seat % PLAYER_COLORS.length]
+      typeof meta.color === 'string' && HEX_COLOR.test(meta.color)
+        ? meta.color
+        : COLORS.find((c) => !players.some((q) => q.meta.color === c)) ?? COLORS[seat % COLORS.length]
     let piece = typeof meta.token === 'string' && TOKENS.includes(meta.token) ? meta.token : ''
     if (!piece) piece = TOKENS.find((t) => !usedPieces.has(t)) ?? TOKENS[0]
     const metaOut: PlayerMeta = { id, name, color, token: piece }
@@ -1027,11 +1028,23 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
         piece = TOKENS.find((t) => !room.players.some((e) => e.meta.token === t)) ?? TOKENS[0]
       }
 
-      const seat = room.players.length
+      // Colour: same contract as the piece — from the palette, unique in
+      // the room, first free colour as the fallback.
+      const wantedColor = typeof (p as { color?: unknown }).color === 'string' ? ((p as { color?: string }).color ?? '') : ''
+      let color: string
+      if (wantedColor && COLORS.includes(wantedColor)) {
+        if (room.players.some((e) => e.meta.color === wantedColor)) {
+          return ack?.({ ok: false, error: `${wantedColor} is already taken — pick another colour` })
+        }
+        color = wantedColor
+      } else {
+        color = COLORS.find((c) => !room.players.some((e) => e.meta.color === c)) ?? COLORS[0]
+      }
+
       const meta: PlayerMeta = {
         id: randomUUID(),
         name,
-        color: PLAYER_COLORS[seat % PLAYER_COLORS.length],
+        color,
         token: piece,
       }
       const entry: PlayerEntry = { meta, token: randomUUID(), socketId: socket.id, disconnectedAt: null }
@@ -1136,6 +1149,26 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
         return ack?.({ ok: false, error: `${piece} is already taken — pick another piece` })
       }
       entry.meta.token = piece
+      broadcastLobby(io, room)
+      ack?.({ ok: true })
+    })
+
+    // Swap your colour while still in the lobby — the avatar wears it on
+    // the board. One colour per player, unique in the room.
+    on('room:setColor', (raw: unknown, ack?: (res: unknown) => void) => {
+      const room = data.code ? rooms.get(data.code) : undefined
+      if (!room || !isCurrentConnection(room, data, socket.id)) return ack?.({ ok: false, error: 'Not your seat' })
+      if (room.state) return ack?.({ ok: false, error: 'The game already started' })
+      const color = (raw as { color?: unknown } | null | undefined)?.color
+      if (typeof color !== 'string' || !COLORS.includes(color)) return ack?.({ ok: false, error: 'Not a valid colour' })
+      const idx = room.players.findIndex((e) => e.meta.id === data.playerId)
+      const entry = idx >= 0 ? room.players[idx] : undefined
+      if (!entry) return ack?.({ ok: false, error: 'Not your seat' })
+      if (entry.meta.color === color) return ack?.({ ok: true }) // already wearing it
+      if (room.players.some((e, i) => i !== idx && e.meta.color === color)) {
+        return ack?.({ ok: false, error: `${color} is already taken — pick another colour` })
+      }
+      entry.meta.color = color
       broadcastLobby(io, room)
       ack?.({ ok: true })
     })

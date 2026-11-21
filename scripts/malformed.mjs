@@ -242,6 +242,12 @@ try {
     ['game:handOver', null],
     ['game:handOver', { to: { evil: BIG } }],
     ['game:start', { force: true }],
+    ['room:setPiece', null],
+    ['room:setPiece', { piece: 42 }],
+    ['room:setPiece', { piece: BIG }],
+    ['room:setColor', null],
+    ['room:setColor', { color: 'hotpink' }],
+    ['room:setColor', { color: { evil: BIG } }],
   ]
   for (const [ev, payload] of roomCases) {
     const res = await emitAck(tv, ev, payload)
