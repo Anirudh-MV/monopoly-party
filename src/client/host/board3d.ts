@@ -398,6 +398,8 @@ export class Board3D {
       const mesh = this.ensureToken(idx, p.color)
       mesh.visible = !p.bankrupt
       const prev = this.prevPos[idx] ?? p.pos
+      this.prevPos[idx] = p.pos // always track — the ?? fallback above must
+      // only apply on the very first sight of a token, never on later syncs
       if (p.pos !== prev) {
         const steps = (p.pos - prev + 40) % 40
         if (steps > 0 && steps <= 12) {
