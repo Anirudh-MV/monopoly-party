@@ -30,6 +30,14 @@ function tileCenter(i: number): { x: number; z: number; r: number; c: number; re
   return { x: (c - 6) * TILE, z: (r - 6) * TILE, r, c, region: r === 11 ? 'bottom' : c === 1 ? 'left' : r === 1 ? 'top' : 'right' }
 }
 
+// shortest-path angular interpolation (labels rotate the short way round)
+function angleLerp(current: number, target: number, k: number): number {
+  let d = (target - current) % (Math.PI * 2)
+  if (d > Math.PI) d -= Math.PI * 2
+  if (d < -Math.PI) d += Math.PI * 2
+  return current + d * k
+}
+
 const SEAT_OFFSETS: Array<[number, number]> = [
   [-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5],
   [0, -0.65], [0, 0.65], [-0.65, 0], [0.65, 0],
@@ -117,6 +125,8 @@ export class Board3D {
   private tileMats: THREE.MeshStandardMaterial[] = []
   private bandMats: THREE.MeshStandardMaterial[] = []
   private labelMeshes: THREE.Mesh[] = []
+  private labelHome: number[] = [] // outside-facing rotation per tile
+  private activeTileIndex: number | null = null // the tile whose label faces the camera
   private houseGroups: THREE.Group[] = []
   private lastHouses: number[] = []
   private tokens: THREE.Mesh[] = []
@@ -239,8 +249,15 @@ export class Board3D {
       geo.rotateX(-Math.PI / 2)
       const label = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: labelTexture(sp, !purch && sp.kind !== 'chance' && sp.kind !== 'chest', this.theme === 'dark'), transparent: true }))
       label.position.set(t.x, 0.235, t.z)
-      // orient so the label reads from outside the board
-      label.rotation.y = t.region === 'bottom' ? 0 : t.region === 'left' ? Math.PI / 2 : t.region === 'top' ? Math.PI : -Math.PI / 2
+      // orient so the label reads from OUTSIDE the board (classic layout)
+      // left column: -90° (reads from the west), right column: +90° (east)
+      const homeRot =
+        t.region === 'bottom' ? 0
+        : t.region === 'top' ? Math.PI
+        : t.region === 'left' ? -Math.PI / 2
+        : Math.PI / 2
+      label.rotation.y = homeRot
+      this.labelHome[i] = homeRot
       this.scene.add(label)
       this.labelMeshes[i] = label
 
@@ -314,6 +331,7 @@ export class Board3D {
     this.idle = true
     this.ringGold.visible = false
     this.ringBlue.visible = false
+    this.activeTileIndex = null
   }
 
   // Hold freshly-detected hops until the dice animation finishes on the TV.
@@ -426,14 +444,19 @@ export class Board3D {
       if (this.tokens[idx]) this.tokens[idx].visible = false
     }
 
-    // highlights
-    const cur = v.players.find((p) => p.id === v.currentPlayerId)
-    if (cur && !cur.bankrupt) {
-      const t = tileCenter(cur.pos)
+    // highlights — the ring and the "reads well on TV" label follow the same
+    // focus: the current player, or the debtor while a debt resolves
+    const focusPlayer = v.debt
+      ? v.players.find((p) => p.id === v.debt?.debtor)
+      : v.players.find((p) => p.id === v.currentPlayerId)
+    if (v.phase !== 'GAME_OVER' && focusPlayer && !focusPlayer.bankrupt) {
+      const t = tileCenter(focusPlayer.pos)
       this.ringBlue.position.set(t.x, 0.26, t.z)
-      this.ringBlue.visible = v.phase !== 'GAME_OVER'
+      this.ringBlue.visible = true
+      this.activeTileIndex = focusPlayer.pos
     } else {
       this.ringBlue.visible = false
+      this.activeTileIndex = null
     }
     const decision = v.pendingPurchase ?? v.auction?.space ?? null
     if (decision != null) {
@@ -506,6 +529,23 @@ export class Board3D {
     const s = 1 + Math.sin(now / 260) * 0.06
     if (this.ringGold.visible) this.ringGold.scale.setScalar(s)
     if (this.ringBlue.visible) this.ringBlue.scale.setScalar(1 + Math.sin(now / 380) * 0.04)
+
+    // labels: the ACTIVE tile rotates to face the camera (which hovers just
+    // south of the focus point), scaled up slightly so the close-up reads
+    // well on the TV; everything else settles back to its outside-facing home
+    const k = 1 - Math.pow(0.004, dt)
+    for (let i = 0; i < this.labelMeshes.length; i++) {
+      const label = this.labelMeshes[i]
+      if (!label) continue
+      const home = this.labelHome[i] ?? 0
+      if (i === this.activeTileIndex) {
+        label.rotation.y = angleLerp(label.rotation.y, 0, k)
+        label.scale.setScalar(label.scale.x + (1.18 - label.scale.x) * k)
+      } else {
+        label.rotation.y = angleLerp(label.rotation.y, home, k)
+        label.scale.setScalar(label.scale.x + (1 - label.scale.x) * k)
+      }
+    }
 
     // camera rig
     if (this.idle) {
