@@ -100,43 +100,105 @@ function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string)
 }
 
+// ── Room attach, driven by the URL ──
+// A fresh visit mints a room automatically (no "Create" click) and the code is
+// written into the URL via history.replaceState (?room=CODE), so reloading
+// this tab returns to the same TV view. Opening a room link on a screen that
+// never hosted it attaches as a view-only mirror instead of minting a second
+// room.
+function roomCodeFromUrl(): string | null {
+  const c = (new URLSearchParams(location.search).get('room') ?? '').trim().toUpperCase()
+  return /^[A-Z]{4}$/.test(c) ? c : null
+}
+
+function setRoomInUrl(code: string | null): void {
+  const u = new URL(location.href)
+  if (code) u.searchParams.set('room', code)
+  else u.searchParams.delete('room')
+  history.replaceState(null, '', u.href)
+}
+
+function createRoom(): void {
+  socket.emit('room:create', (res: HostAck) => {
+    if (!res.ok || !res.code || !res.hostToken) return
+    localStorage.setItem(`mp-host-${res.code}`, res.hostToken)
+    setRoomInUrl(res.code)
+    urls = res.urls ?? []
+    if (isWatcher) {
+      watcherCode = null
+      localStorage.removeItem('mp-watch')
+      setWatcher(false)
+    }
+    // The 'lobby' event arrived before this ack with urls still empty —
+    // repaint so the QR and join URL show the real address.
+    render()
+  })
+}
+
+function watchRoom(code: string, onFail: () => void): void {
+  socket.emit('room:watch', { code }, (res: HostAck) => {
+    if (!res.ok) {
+      onFail()
+      return
+    }
+    watcherCode = res.code ?? code
+    localStorage.setItem('mp-watch', watcherCode)
+    setRoomInUrl(watcherCode)
+    urls = res.urls ?? urls
+    // 'lobby'/'view' arrived before this ack — repaint in mirror mode
+    setWatcher(true)
+  })
+}
+
 // Reconnect the TV whenever the socket (re)connects — survives refreshes,
 // laptop sleeps, and Wi-Fi blips without losing the room.
 socket.on('connect', () => {
-  let hosted = false
-  for (const k of Object.keys(localStorage)) {
-    if (!k.startsWith('mp-host-')) continue
-    hosted = true
-    const code = k.slice('mp-host-'.length)
-    const hostToken = localStorage.getItem(k) ?? ''
-    socket.emit('room:hostJoin', { code, hostToken }, (res: HostAck) => {
-      if (!res.ok) localStorage.removeItem(k)
-      else {
-        urls = res.urls ?? urls
-        // this screen is the primary TV — mirror mode is over
-        if (isWatcher) {
+  const urlCode = roomCodeFromUrl()
+  if (urlCode) {
+    const hostToken = localStorage.getItem(`mp-host-${urlCode}`)
+    if (hostToken) {
+      // primary TV reloading its own link — reclaim the host seat
+      socket.emit('room:hostJoin', { code: urlCode, hostToken }, (res: HostAck) => {
+        if (res.ok) {
+          urls = res.urls ?? urls
+          // this screen is the primary TV — mirror mode is over
+          if (isWatcher) {
+            watcherCode = null
+            localStorage.removeItem('mp-watch')
+            setWatcher(false)
+          }
+        } else {
+          // the room is gone — drop the stale token and mint a fresh room
+          localStorage.removeItem(`mp-host-${urlCode}`)
+          setRoomInUrl(null)
+          createRoom()
+        }
+        render()
+      })
+    } else {
+      // this screen never hosted the room in the link — mirror it
+      watchRoom(urlCode, () => {
+        setRoomInUrl(null)
+        if (watcherCode === urlCode) {
           watcherCode = null
           localStorage.removeItem('mp-watch')
-          setWatcher(false)
         }
-      }
-      render()
-    })
+        createRoom()
+      })
+    }
+    return
   }
-  // this screen is a mirror, not the primary TV — reattach as a watcher
-  // (host attach wins if this screen ever created/reconnected to a room)
-  if (!hosted && watcherCode) {
-    socket.emit('room:watch', { code: watcherCode }, (res: HostAck) => {
-      if (!res.ok) {
-        watcherCode = null
-        localStorage.removeItem('mp-watch')
-        render()
-      } else {
-        urls = res.urls ?? urls
-        setWatcher(true)
-      }
+  // no room in the URL: resume a mirror if this screen was one
+  if (watcherCode && /^[A-Z]{4}$/.test(watcherCode)) {
+    watchRoom(watcherCode, () => {
+      watcherCode = null
+      localStorage.removeItem('mp-watch')
+      createRoom()
     })
+    return
   }
+  // fresh visit — a game starts by default
+  createRoom()
 })
 
 socket.on('lobby', (l: LobbyInfo) => {
@@ -156,35 +218,16 @@ $app.addEventListener('click', (ev) => {
   const el = (ev.target as HTMLElement).closest('[data-act]') as HTMLElement | null
   if (!el) return
   if (el.dataset.act === 'create') {
-    socket.emit('room:create', (res: HostAck) => {
-      if (!res.ok || !res.code || !res.hostToken) return
-      localStorage.setItem(`mp-host-${res.code}`, res.hostToken)
-      urls = res.urls ?? []
-      // The 'lobby' event arrived before this ack with urls still empty —
-      // repaint so the QR and join URL show the real address.
-      if (isWatcher) {
-        watcherCode = null
-        localStorage.removeItem('mp-watch')
-        setWatcher(false)
-      }
-      render()
-    })
+    createRoom()
   } else if (el.dataset.act === 'watch') {
     const input = document.getElementById('watchcode') as HTMLInputElement | null
     const code = (input?.value ?? '').trim().toUpperCase()
     if (!code || !/^[A-Z]{4}$/.test(code)) return
-    socket.emit('room:watch', { code }, (res: HostAck) => {
-      if (!res.ok) {
-        if (input) {
-          input.value = ''
-          input.style.outline = '2px solid #d64545'
-        }
-        return
+    watchRoom(code, () => {
+      if (input) {
+        input.value = ''
+        input.style.outline = '2px solid #d64545'
       }
-      watcherCode = res.code ?? code
-      localStorage.setItem('mp-watch', watcherCode)
-      // 'lobby'/'view' arrived before this ack — repaint in mirror mode
-      setWatcher(true)
     })
   } else if (el.dataset.act === 'start') {
     socket.emit('game:start', {}, (res: { ok: boolean; error?: string }) => {
@@ -216,7 +259,7 @@ function render(): void {
       <h1>MONOPOLY PARTY</h1>
       <p class="tag">The couch co-op edition — your phone is your wallet.</p>
       <button class="big" data-act="create">Create a game</button>
-      <p class="hint">Open this screen on the TV. Keep it running — it's the shared board.</p>
+      <p class="hint">A room is being set up for you automatically — this is only a fallback.</p>
       <div class="mirrorbox">
         <p class="hint">The game is already running on another screen? Mirror it here:</p>
         <div class="mirrorform">

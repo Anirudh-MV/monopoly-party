@@ -23,8 +23,10 @@ npm install
 npm run dev
 ```
 
-1. Open **`http://localhost:3000`** on the TV/laptop → **Create a game**.
-   You'll get a room code + QR code — with a live 3D board spinning behind it.
+1. Open **`http://localhost:3000`** on the TV/laptop — a room starts on its
+   own, no button to press. You'll get a room code + QR code — with a live 3D
+   board spinning behind it. The code is kept in the tab's URL (`?room=CODE`),
+   so reloading the TV returns to the same game.
 2. On each phone, scan the QR (or open the **LAN URL** shown on screen) →
    enter the room code + your name.
 3. The **first player to join is the party host** 👑 (the TV can also start
