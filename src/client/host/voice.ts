@@ -48,12 +48,32 @@ export function announce(text: string): void {
   speak(text)
 }
 
-// Chance: a synthesized giggle — the vibe without shipping anyone's voice.
-export function heeHee(): void {
-  speak('hee hee', { pitch: 1.8, rate: 1.5 })
+// ── card sounds ──
+// The real party clips (Chance: the giggle, Community Chest: the reaction),
+// shipped as tiny mp3s in public/sounds/ and cached once. Playback follows
+// the same 🔊 toggle; the first tap on the TV unlocks it.
+const effects: Record<string, HTMLAudioElement> = {}
+
+function playEffect(url: string): void {
+  if (!enabled) return
+  try {
+    const a = effects[url] ?? (effects[url] = new Audio(url))
+    a.currentTime = 0
+    a.volume = 1
+    void a.play().catch(() => {
+      /* autoplay still locked — the next tap unlocks it */
+    })
+  } catch {
+    /* ignore */
+  }
 }
 
-// Community Chest: the reaction, deadpan.
+// Chance: the giggle.
+export function heeHee(): void {
+  playEffect('sounds/hehe.mp3')
+}
+
+// Community Chest: the reaction.
 export function bruh(): void {
-  speak('bruh', { pitch: 0.55, rate: 0.85 })
+  playEffect('sounds/bruh.mp3')
 }
