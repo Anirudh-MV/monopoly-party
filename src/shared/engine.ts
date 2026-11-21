@@ -319,7 +319,7 @@ function drawCard(s: GameState, deck: 'chance' | 'chest', p: PlayerState, rng: (
   const card = cardById(id)
   s.pendingCard = card
   s.cardDrawSeq++
-  log(s, `${p.name} draws: “${card.text}”`)
+  log(s, `${deck === 'chance' ? 'Chance' : 'Community Chest'} said: ${card.text}`)
   applyCard(s, p, card, rng)
 }
 

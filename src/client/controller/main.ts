@@ -162,8 +162,9 @@ socket.on('view', (v: PlayerView) => {
   lobby = null
   rejoinPending = false
 
-  // fresh card draw? play the reveal once (never replay stale ones)
-  if (v.cardDrawSeq > lastCardSeq && lastCardSeq >= 0 && v.pendingCard) {
+  // fresh card draw? the chest-opening / wheel-spin animation plays ONLY on
+  // the drawer's phone; everyone else reads the info strip instead
+  if (v.cardDrawSeq > lastCardSeq && lastCardSeq >= 0 && v.pendingCard && v.currentPlayerId === v.you) {
     showReveal(v.pendingCard)
   }
   lastCardSeq = v.cardDrawSeq
@@ -421,7 +422,8 @@ function renderGame(v: PlayerView): void {
   // cascade below must always render so the game can always advance.
   let drawStrip = ''
   if (v.pendingCard && !v.pendingCardDraw) {
-    drawStrip = `<div class="drawstrip">${I.id === v.currentPlayerId ? 'You drew' : `${cur ? esc(cur.name) : 'Someone'} drew`}: ${esc(v.pendingCard.text)}</div>`
+    const deckName = v.pendingCard.deck === 'chest' ? 'Community Chest' : 'Chance'
+    drawStrip = `<div class="drawstrip"><b>${deckName}</b> said: ${esc(v.pendingCard.text)}</div>`
   }
 
   // What the active player just landed on, in its group color — visible on

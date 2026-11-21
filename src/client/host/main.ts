@@ -226,19 +226,23 @@ function renderGame(v: HostView): void {
     }
   }
 
-  // fresh card draw? play the reveal for the next few seconds
-  const freshReveal = v.cardDrawSeq > lastCardSeq && !!v.pendingCard
+  // fresh card draw? play the reveal for the next few seconds — the wheel
+  // finishes, the card is read, THEN the prompt clears and the piece moves
+  const freshCard = v.pendingCard
+  const freshReveal = v.cardDrawSeq > lastCardSeq && !!freshCard
   if (freshReveal) {
-    revealUntil = Date.now() + 3200
+    const isChest = freshCard.deck === 'chest'
+    const hold = isChest ? 2700 : 3300
+    revealUntil = Date.now() + hold
     // the reveal branch only yields if something re-renders after the window
     // — and between player actions nothing else will, so schedule it
-    setTimeout(() => render(), 3300)
+    setTimeout(() => render(), hold + 100)
   }
   lastCardSeq = v.cardDrawSeq
 
-  // hold the piece's hops until the dice settle — or until a card reveal
-  // finishes playing (wheel ~2.1s) before card-advance strolls begin
-  if (freshReveal) board3d.delayHops(2600)
+  // the piece waits for the full reveal before doing its thing:
+  // spin (2.1s) → card readable (~2.4s) → prompt clears → stroll begins
+  if (freshReveal) board3d.delayHops(freshCard.deck === 'chest' ? 3000 : 3600)
   else if (v.dice && `${v.turn}:${v.dice.join()}` !== lastDiceKey) board3d.delayHops(1150)
 
   board3d.sync(v)
@@ -361,6 +365,19 @@ function updateQueue(v: HostView): void {
 function updateTicker(v: HostView): void {
   const el = document.getElementById('ticker')
   if (!el) return
+  // While a drawn card is in play, the bottom bar carries the whole story:
+  // "Chance said: …" plus the landed property, price, and its group colour.
+  if (v.pendingCard) {
+    const isChest = v.pendingCard.deck === 'chest'
+    let propHTML = ''
+    if (v.lastLanded && v.lastLanded.playerId === v.currentPlayerId) {
+      const sp = BOARD[v.lastLanded.space]
+      const col = stripColor(sp)
+      propHTML = `<span class="tk-prop" style="--c:${col}"><i class="tk-swatch"></i>${esc(sp.name)}${'price' in sp ? ` · $${sp.price}` : ''}</span>`
+    }
+    el.innerHTML = `<span class="t">${isChest ? 'Community Chest' : 'Chance'} said: ${esc(v.pendingCard.text)}</span>${propHTML}`
+    return
+  }
   const last = v.log[v.log.length - 1]
   el.innerHTML = last ? `<span class="t ${last.kind}">${esc(last.text)}</span>` : ''
 }
