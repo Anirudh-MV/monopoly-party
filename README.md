@@ -133,10 +133,78 @@ npm run build
 PORT=3000 npm start
 ```
 
-Put it behind any reverse proxy with WebSocket support (Caddy/Nginx/Fly/Render),
-share the public URL, and the QR/room-code flow works identically over the
-internet. No config changes needed — the host screen shows whatever URL the
-phones should use.
+Put it behind any reverse proxy with WebSocket support (Caddy/Nginx/Fly/Render)
+and set `PUBLIC_URL` to the origin players reach, so the lobby QR code and join
+link point there instead of the server's LAN address:
+
+```bash
+PUBLIC_URL=https://monopoly.example.com PORT=3000 npm start
+```
+
+A bare host is accepted (`PUBLIC_URL=monopoly.example.com` implies `https://`).
+Without it, the host screen advertises the machine's LAN address, which is
+correct for local play. `SNAP_DIR` relocates room snapshots (default
+`snapshots/`); a crash or restart resumes in-progress games from them.
+
+### Party gate — short-lived public instances (`PARTY_KEY`)
+
+Game night on a public IP for one evening? Set a shared secret and every
+route — pages, bundles, and the Socket.IO handshake — requires it:
+
+```bash
+PARTY_KEY=some-long-passphrase PUBLIC_URL=https://monopoly.example.com npm start
+```
+
+Three ways in:
+
+- **Deep link**: open any URL with `?key=<PARTY_KEY>`. The server sets a
+  session cookie, so it's typed exactly once per device. The lobby QR and
+  join URL embed the key automatically — phones that scan the QR never see
+  a prompt. (The key is on the TV screen anyway: it gates the internet, not
+  the room — room codes still do that.)
+- **HTTP Basic auth** (the 401 challenge is kept as a desktop/curl fallback):
+  any username, the party key as the password.
+- **Raw clients**: `Authorization: Bearer <key>`, or socket `auth: { key }`.
+
+Smart-TV browsers are unreliable with 401 dialogs (and with the WebGL the TV
+view needs) — drive the big screen from a laptop over HDMI or cast a tab, and
+use the deep link on any device where typing credentials is awkward. Don't
+also enable proxy-level basic auth; it duplicates this gate and breaks the
+TV.
+
+Failed attempts log `AUTHFAIL ip=<ip> path=<path>` to stdout, with the client
+IP taken from `CF-Connecting-IP` / `X-Forwarded-For` behind a proxy — ready
+for fail2ban on the droplet (journald backend, no log files):
+
+```ini
+# /etc/fail2ban/filter.d/monopoly-auth.conf
+[Definition]
+failregex = AUTHFAIL ip=<HOST> path=\S+
+
+# /etc/fail2ban/jail.local
+[monopoly-auth]
+enabled  = true
+backend  = systemd
+journalmatch = _SYSTEMD_UNIT=monopoly-party.service
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+```
+
+This is a party gate, not bank-grade auth: the key is shared and appears in
+URLs, browser history, and server logs. It exists so strangers can't crash
+your evening — destroy the droplet when the party's over.
+
+**Behind the Cloudflare proxy (orange cloud):** the droplet only ever sees
+Cloudflare's source IPs, so local iptables bans are a no-op — ban at the edge
+instead. Either use fail2ban's `cloudflare-apiv4` action (an API token adds
+the real client to a Cloudflare block list; the `AUTHFAIL` lines already
+carry the true IP via `CF-Connecting-IP`), or skip fail2ban and add a
+Cloudflare rate-limiting rule on the hostname (same IP, >N req/min → block
+1h). Also firewall the droplet's 80/443 to Cloudflare's published ranges
+(https://www.cloudflare.com/ips/ — IPv4 **and** IPv6) so nobody can bypass
+the edge and hit the origin directly, and set the zone's SSL mode to
+**Full (strict)**, never Flexible.
 
 ## Legal
 
