@@ -297,6 +297,38 @@ main { display: block; }
 }
 .board-tool.on { background: #2f3a56; border-color: #6c8cff; color: #cdd7ff; }
 
+/* ── property info card (board tap / trade tap) ── */
+.propinfo-overlay {
+  position: fixed; inset: 0; z-index: 90;
+  background: rgba(10, 12, 20, 0.55);
+  display: flex; align-items: center; justify-content: center;
+  animation: fadeIn 0.15s ease-out;
+}
+.propinfo-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-top: 4px solid var(--g, var(--line));
+  border-radius: 16px;
+  padding: 18px 20px;
+  width: min(88vw, 340px);
+  box-shadow: var(--shadow);
+}
+.propinfo-title { font-size: 18px; font-weight: 800; display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.propinfo-title .ls-swatch { width: 14px; height: 14px; border-radius: 4px; background: var(--g, var(--line)); flex-shrink: 0; }
+.propinfo-row { font-size: 15px; color: var(--dim); margin: 6px 0; }
+.propinfo-row b { color: var(--ink, #1c2333); }
+
+/* trade cards: colour strips + tappable property names */
+.tradestrip {
+  display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+  vertical-align: -1px; margin-right: 3px; border: 1px solid rgba(0, 0, 0, 0.25);
+}
+.linkbtn {
+  display: inline; padding: 0; border: none; background: none;
+  color: var(--ink, #1c2333); font: inherit; font-weight: 700;
+  text-decoration: underline; text-underline-offset: 2px; cursor: pointer;
+}
+
 /* ── the dice roll moment ── */
 .roll-overlay {
   position: fixed; inset: 0; z-index: 70;

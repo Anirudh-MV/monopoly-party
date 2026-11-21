@@ -359,6 +359,8 @@ function showBoard(): void {
   phoneBoard.setTheme(theme)
   phoneBoard.setRoam(true) // free roaming — the camera is the player's
   phoneBoard.sync(view)
+  // tap any tile for its details: price, rent, owner
+  phoneBoard.onTileTap = (space) => showPropInfo(space)
   const tools = overlay.querySelector('.board-tools') as HTMLElement
   tools.addEventListener('click', (ev) => {
     const btn = (ev.target as HTMLElement).closest('[data-act]') as HTMLElement | null
@@ -386,6 +388,48 @@ function closeBoard(): void {
   phoneBoard = null
   document.querySelector('.board-overlay')?.remove()
   if (view || lobby) render()
+}
+
+// ── property info card ──
+// Shared by the pocket board (tap a tile) and the trade cards (tap a
+// property name): original price, the rent it commands right now, and who
+// owns it.
+function showPropInfo(space: number): void {
+  const v = view
+  if (!v) return
+  const sp = BOARD[space]
+  const st = v.props[space]
+  const owner = st && st.owner ? v.players.find((p) => p.id === st.owner) : null
+  const hasPrice = 'price' in sp
+  const rp = hasPrice ? rentPreview(v, space) : null
+  const strip = stripColorPhone(sp)
+  let rentLine = ''
+  if (rp) {
+    if (sp.kind === 'utility') rentLine = `earns <b>${rp.note}</b>${rp.next != null ? ` → <b>${rp.next}× dice</b> with both` : ''}`
+    else if (sp.kind === 'rail') rentLine = `earns <b>$${rp.current}</b> (${rp.note})${rp.next != null ? ` → <b>$${rp.next}</b> with another railroad` : ''}`
+    else if (isStreet(sp))
+      rentLine = rp.next != null
+        ? `earns <b>$${rp.current}</b> → <b>$${rp.next}</b> with ${rp.next === sp.rents[5] ? 'a hotel' : 'a house'}${rp.note ? ` · ${rp.note}` : ''}`
+        : `earns <b>$${rp.current}</b>${rp.note ? ` · ${rp.note}` : ''}`
+    else rentLine = `earns <b>$${rp.current}</b>`
+  }
+  if (st?.mortgaged) rentLine = 'mortgaged — earns nothing while asleep'
+  const houses = st && st.houses > 0 ? (st.houses === 5 ? ' · hotel' : ` · ${st.houses} house${st.houses > 1 ? 's' : ''}`) : ''
+  document.querySelector('.propinfo-overlay')?.remove()
+  const overlay = document.createElement('div')
+  overlay.className = 'propinfo-overlay'
+  overlay.innerHTML = `
+    <div class="propinfo-card" style="--g:${strip}">
+      <div class="propinfo-title"><span class="ls-swatch"></span>${esc(sp.name)}${houses}</div>
+      ${hasPrice ? `<div class="propinfo-row">Price <b>$${sp.price}</b></div>` : '<div class="propinfo-row">Not for sale</div>'}
+      ${rp ? `<div class="propinfo-row">${rentLine}</div>` : ''}
+      <div class="propinfo-row">Owner <b style="color:${owner?.color ?? 'inherit'}">${owner ? `${owner.token} ${esc(owner.name)}` : 'the bank'}</b></div>
+      <div class="row"><button data-act="propInfoClose">Close</button></div>
+    </div>`
+  overlay.addEventListener('click', (ev) => {
+    if ((ev.target as HTMLElement).closest('[data-act="propInfoClose"]') || ev.target === overlay) overlay.remove()
+  })
+  document.body.appendChild(overlay)
 }
 
 // ── the GO salary moment ──
@@ -640,6 +684,10 @@ $app.addEventListener('click', (ev) => {
       // Both exits (lobby "Leave room" and the in-game "Exit") start the
       // same two-step confirmation — see showExitConfirm.
       showExitConfirm(1)
+      break
+    }
+    case 'propInfo': {
+      showPropInfo(Number(args.space))
       break
     }
     case 'showBoard': {
@@ -1000,14 +1048,16 @@ function renderGame(v: PlayerView): void {
     if (mine) {
       body += `<div class="card"><h3>You're the high bidder</h3><p class="hint">Waiting for the others…</p></div>`
     } else if (acts.has('bid') || acts.has('passBid')) {
-      const min = v.auction.bid + 1
+      const au = v.auction
+      const min = au.bid + 1
+      const highBidder = au.bidder ? v.players.find((p) => p.id === au.bidder) : null
       body += `
         <div class="card">
-          <h3>Bid or pass</h3>
+          <h3>Place your bid${au.bid > 0 ? ` — current bid <b>$${au.bid}</b>${highBidder ? ` (${esc(highBidder.name)})` : ''}` : ' — no bids yet'}</h3>
           <div class="row">
             <button data-act="bid" data-args='{"amount":${min}}'>$${min}</button>
-            <button data-act="bid" data-args='{"amount":${v.auction.bid + 10}}'>+$10</button>
-            <button data-act="bid" data-args='{"amount":${v.auction.bid + 50}}'>+$50</button>
+            <button data-act="bid" data-args='{"amount":${au.bid + 10}}'>+$10</button>
+            <button data-act="bid" data-args='{"amount":${au.bid + 50}}'>+$50</button>
           </div>
           <div class="row">
             <input id="bidAmount" type="number" inputmode="numeric" placeholder="custom $${min}+" />
@@ -1129,7 +1179,12 @@ function renderGame(v: PlayerView): void {
 function sideSummary(side: TradeSide): string {
   const parts: string[] = []
   if (side.cash > 0) parts.push(`$${side.cash}`)
-  for (const i of side.spaces) parts.push(esc(BOARD[i].name))
+  for (const i of side.spaces) {
+    const col = stripColorPhone(BOARD[i])
+    parts.push(
+      `<span class="tradestrip" style="background:${col}"></span><button type="button" class="linkbtn" data-act="propInfo" data-args='{"space":${i}}'>${esc(BOARD[i].name)}</button>`,
+    )
+  }
   if (side.jailCards > 0) parts.push(`jail card ×${side.jailCards}`)
   return parts.join(' + ') || 'nothing'
 }

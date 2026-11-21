@@ -123,6 +123,7 @@ export class Board3D {
   private raf = 0
 
   private tileMats: THREE.MeshStandardMaterial[] = []
+  private tileMeshes: THREE.Mesh[] = []
   private bandMats: THREE.MeshStandardMaterial[] = []
   private labelMeshes: THREE.Mesh[] = []
   private labelHome: number[] = [] // outside-facing rotation per tile
@@ -162,9 +163,16 @@ export class Board3D {
   private groundMat: THREE.MeshStandardMaterial | null = null
   private ambLight: THREE.AmbientLight | null = null
   private dirLight: THREE.DirectionalLight | null = null
-  // touch pointers for pinch-zoom (phones have no wheel)
+  // touch pointers for pinch-zoom and two-finger pan (phones have no wheel)
   private pointers = new Map<number, { x: number; y: number }>()
-  private pinchStart: { dist: number; zoom: number } | null = null
+  private pinchStart: { dist: number; zoom: number; cx: number; cy: number } | null = null
+  // tap-to-inspect: a short, still press raycasts the tile under the finger
+  private downX = 0
+  private downY = 0
+  private downTime = 0
+  private raycaster = new THREE.Raycaster()
+  /** Set by hosts that want tile inspection (the phone's pocket board). */
+  onTileTap?: (space: number) => void
   // Free-roam mode (the pocket board): the camera stops chasing the game
   // and stops easing back after every gesture — the view stays exactly
   // where the player leaves it until they tap Reset or Follow.
@@ -220,6 +228,9 @@ export class Board3D {
     this.wheelDeadline = 0
     this.dragX = ev.clientX
     this.dragY = ev.clientY
+    this.downX = ev.clientX
+    this.downY = ev.clientY
+    this.downTime = performance.now()
     this.renderer.domElement.style.cursor = 'grabbing'
     this.startPinch()
   }
@@ -236,14 +247,9 @@ export class Board3D {
       return
     }
     this.pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY })
-    // two fingers: pinch to zoom (phones have no wheel)
+    // two fingers: pinch to zoom, or pan when the pair moves together
     if (this.pointers.size >= 2 && this.pinchStart) {
-      const [a, b] = [...this.pointers.values()]
-      const dist = Math.hypot(a.x - b.x, a.y - b.y)
-      if (this.pinchStart.dist > 0) {
-        this.userZoom = THREE.MathUtils.clamp(this.pinchStart.zoom * (dist / this.pinchStart.dist), 0.45, 2.6)
-        this.wheelDeadline = this.roam ? 0 : performance.now() + 2000
-      }
+      this.pinchOrPan()
       return
     }
     if (!this.dragging) return
@@ -256,6 +262,10 @@ export class Board3D {
   }
 
   private onPointerUp = (ev: PointerEvent): void => {
+    const wasTap =
+      this.pointers.size === 1 &&
+      Math.hypot(ev.clientX - this.downX, ev.clientY - this.downY) < 8 &&
+      performance.now() - this.downTime < 400
     this.pointers.delete(ev.pointerId)
     if (this.pointers.size < 2) this.pinchStart = null
     if (this.pointers.size === 0) {
@@ -265,13 +275,65 @@ export class Board3D {
       // the view exactly where the player left it
       this.returning = !this.roam
       this.renderer.domElement.style.cursor = 'grab'
+      // tap-to-inspect (roam view): a short, still press names the tile
+      if (wasTap && this.onTileTap && this.roam) {
+        const space = this.tryTapTile(ev.clientX, ev.clientY)
+        if (space != null) this.onTileTap(space)
+      }
     }
   }
 
   private startPinch(): void {
     if (this.pointers.size < 2) return
     const [a, b] = [...this.pointers.values()]
-    this.pinchStart = { dist: Math.hypot(a.x - b.x, a.y - b.y), zoom: this.userZoom }
+    this.pinchStart = { dist: Math.hypot(a.x - b.x, a.y - b.y), zoom: this.userZoom, cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2 }
+  }
+
+  // Two fingers: pinch when the spread changes, pan (lateral movement)
+  // when the pair moves together — map-style. Rebased every event so both
+  // stay incremental.
+  private pinchOrPan(): void {
+    if (!this.pinchStart) return
+    const [a, b] = [...this.pointers.values()]
+    const dist = Math.hypot(a.x - b.x, a.y - b.y)
+    const cx = (a.x + b.x) / 2
+    const cy = (a.y + b.y) / 2
+    const distDelta = Math.abs(dist - this.pinchStart.dist)
+    const centroidDelta = Math.hypot(cx - this.pinchStart.cx, cy - this.pinchStart.cy)
+    if (centroidDelta > 6 && distDelta < 24) {
+      this.panBy((cx - this.pinchStart.cx) / window.innerWidth, (cy - this.pinchStart.cy) / window.innerHeight)
+    } else if (this.pinchStart.dist > 0 && distDelta > 2) {
+      this.userZoom = THREE.MathUtils.clamp(this.pinchStart.zoom * (dist / this.pinchStart.dist), 0.45, 2.6)
+      this.wheelDeadline = this.roam ? 0 : performance.now() + 2000
+    }
+    this.pinchStart = { dist, zoom: this.userZoom, cx, cy }
+  }
+
+  // Translate the view along the camera's ground plane — drag moves the
+  // board with the fingers, like a map.
+  private panBy(dx: number, dy: number): void {
+    const scale = this.camera.position.distanceTo(this.lookTarget) * 0.9
+    const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0)
+    right.y = 0
+    right.normalize()
+    const fwd = new THREE.Vector3()
+    this.camera.getWorldDirection(fwd)
+    fwd.y = 0
+    fwd.normalize()
+    const delta = right.multiplyScalar(-dx * scale).add(fwd.multiplyScalar(-dy * scale))
+    this.focusGoal.add(delta)
+    this.posGoal.add(delta)
+    this.lookTarget.add(delta)
+    // keep the board somewhere in view
+    this.focusGoal.x = THREE.MathUtils.clamp(this.focusGoal.x, -16, 16)
+    this.focusGoal.z = THREE.MathUtils.clamp(this.focusGoal.z, -16, 16)
+  }
+
+  private tryTapTile(x: number, y: number): number | null {
+    const ndc = new THREE.Vector2((x / window.innerWidth) * 2 - 1, -(y / window.innerHeight) * 2 + 1)
+    this.raycaster.setFromCamera(ndc, this.camera)
+    const hits = this.raycaster.intersectObjects(this.tileMeshes, false)
+    return hits.length > 0 && typeof hits[0].object.userData.space === 'number' ? (hits[0].object.userData.space as number) : null
   }
 
   private onWheel = (ev: WheelEvent): void => {
@@ -336,8 +398,10 @@ export class Board3D {
       const base = new THREE.MeshStandardMaterial({ color: this.tileBase, roughness: 0.85 })
       const tile = new THREE.Mesh(new THREE.BoxGeometry(TILE_W, 0.22, TILE_W), base)
       tile.position.set(t.x, 0.11, t.z)
+      tile.userData.space = i
       this.scene.add(tile)
       this.tileMats[i] = base
+      this.tileMeshes[i] = tile
 
       // label
       const geo = new THREE.PlaneGeometry(1.78, 0.89)

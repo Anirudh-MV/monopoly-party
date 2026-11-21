@@ -382,9 +382,12 @@ function scheduleDeadline(room: Room): void {
   const decision = currentDecision(s)
   // Arrests run on a fixed 30-second clock even when the host has disabled
   // the general decision timer — the two-step arrest must never strand.
+  // End-of-turn waits get the same treatment: nobody should be able to sit
+  // on a finished turn forever.
   const jailClock = decision != null && decision.key.startsWith('jail:')
-  if (!decision || (room.turnTimeoutMs <= 0 && !jailClock)) {
-    // Host disabled the decision clock entirely (and no arrest is pending).
+  const endClock = decision != null && decision.key.startsWith('end:')
+  if (!decision || (room.turnTimeoutMs <= 0 && !jailClock && !endClock)) {
+    // Host disabled the decision clock entirely (and no arrest/end wait is pending).
     if (room.timer) clearTimeout(room.timer)
     room.timer = null
     room.timerKey = null
@@ -396,11 +399,14 @@ function scheduleDeadline(room: Room): void {
   if (room.timer) clearTimeout(room.timer)
   room.timerKey = decision.key
   // Auctions: a generous opening window, then a short fuse that every bid
-  // resets. Other decisions run on the host-configured clock.
+  // resets. Arrest and end-turn: a fixed 30s. The rest run on the
+  // host-configured clock.
   const auctionIdle = s.auction != null && (s.auction.bidder != null || s.auction.bid > 0)
-  const duration = jailClock ? 30_000 : decision.key.startsWith('auc:')
-    ? Math.min(room.turnTimeoutMs, auctionIdle ? AUCTION_IDLE_MS : AUCTION_OPEN_MS)
-    : room.turnTimeoutMs
+  const duration = jailClock ? 30_000
+    : endClock ? 30_000
+    : decision.key.startsWith('auc:')
+      ? Math.min(room.turnTimeoutMs, auctionIdle ? AUCTION_IDLE_MS : AUCTION_OPEN_MS)
+      : room.turnTimeoutMs
   s.deadline = Date.now() + duration
   s.deadlineFor = decision.playerId
   room.timer = setTimeout(() => {
