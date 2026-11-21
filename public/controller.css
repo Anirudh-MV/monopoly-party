@@ -137,6 +137,8 @@ button.disabled, button:disabled { opacity: 0.4; }
 .landedstrip .ls-swatch { width: 14px; height: 28px; border-radius: 4px; background: var(--g); flex: none; }
 .landedstrip .ls-text { line-height: 1.35; }
 .landedstrip .ls-group { display: block; color: var(--dim); font-size: 12px; font-weight: 500; text-transform: capitalize; }
+.landedstrip .ls-rent { display: block; color: var(--dim); font-size: 12px; font-weight: 500; margin-top: 2px; }
+.landedstrip .ls-rent b { color: var(--ink); }
 
 /* decision countdown — only visible in the final 30 seconds */
 .deadline {
@@ -160,6 +162,8 @@ main { display: block; }
 .prop .strip { width: 8px; border-radius: 4px; flex: none; }
 .prop .strip.gray { background: #9aa1ad; }
 .prop .pname { font-weight: 600; font-size: 15px; }
+.prop .pearn { color: var(--dim); font-size: 12px; margin-top: 2px; line-height: 1.35; }
+.prop .pearn b { color: var(--good); font-weight: 700; }
 .prop .row { margin-top: 6px; gap: 6px; }
 
 /* trades */

@@ -8,7 +8,7 @@
 import { io } from 'socket.io-client'
 import QRCode from 'qrcode'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
-import { rentFor } from '../../shared/rules.js'
+import { rentFor, rentPreview } from '../../shared/rules.js'
 import type { HostView, LobbyInfo, PlayerState, Space } from '../../shared/types.js'
 import { Board3D } from './board3d.js'
 
@@ -315,7 +315,11 @@ function landedCompact(v: HostView): string {
         info += ` — rent $${rentFor(v, i, diceSum)}`
       }
     } else {
-      info = v.pendingPurchase === i ? 'unowned — buy or auction' : 'unowned'
+      const rp = rentPreview(v, i)
+      const rentNote = sp.kind === 'utility' ? ` (${rp.note})` : ''
+      info = v.pendingPurchase === i
+        ? `unowned — rent $${rp.current}${rentNote} when owned`
+        : 'unowned'
     }
   } else if (sp.kind === 'chance' || sp.kind === 'chest') {
     info = 'card space'

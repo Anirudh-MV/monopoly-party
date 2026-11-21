@@ -14,6 +14,8 @@ import {
   canSellHouseOn,
   canUnmortgageOn,
   netWorth,
+  rentFor,
+  rentPreview,
   unmortgageCost,
 } from '../../shared/rules.js'
 import type { Action, Card, LobbyInfo, PlayerView, Space, TradeOffer, TradeSide } from '../../shared/types.js'
@@ -436,9 +438,23 @@ function renderGame(v: PlayerView): void {
     const col = stripColorPhone(sp)
     const drawer = v.players.find((p) => p.id === v.currentPlayerId)
     const who = I.id === v.currentPlayerId ? 'You' : `${drawer?.token ?? ''} ${esc(drawer?.name ?? '')}`
+    // rent line: what landing here is worth right now (or would be)
+    let rentLine = ''
+    if ('price' in sp) {
+      const rp = rentPreview(v, i)
+      const owner = v.props[i].owner ? v.players.find((p) => p.id === v.props[i].owner) : null
+      if (owner && owner.id !== v.currentPlayerId) {
+        const diceSum = v.dice ? v.dice[0] + v.dice[1] : 7
+        rentLine = `<span class="ls-rent">Rent due: <b>$${rentFor(v, i, diceSum)}</b>${owner.token} ${esc(owner.name)}</span>`
+      } else if (owner && owner.id === v.currentPlayerId) {
+        rentLine = `<span class="ls-rent">Yours — earns <b>$${rp.current}</b>${sp.kind === 'utility' ? ` (${rp.note})` : ''}</span>`
+      } else {
+        rentLine = `<span class="ls-rent">Rent: <b>$${rp.current}</b> when owned${sp.kind === 'utility' ? ` (${rp.note})` : ''}</span>`
+      }
+    }
     landedStrip = `<div class="landedstrip" style="--g:${col}">
       <span class="ls-swatch"></span>
-      <span class="ls-text">${who} landed on <b>${esc(sp.name)}</b>${'price' in sp ? ` · $${sp.price}` : ''}${isStreet(sp) ? ` <span class="ls-group">${sp.group.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()}</span>` : ''}</span>
+      <span class="ls-text">${who} landed on <b>${esc(sp.name)}</b>${'price' in sp ? ` · $${sp.price}` : ''}${isStreet(sp) ? ` <span class="ls-group">${sp.group.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()}</span>` : ''}${rentLine}</span>
     </div>`
   }
 
@@ -532,9 +548,12 @@ function renderGame(v: PlayerView): void {
     if (v.pendingPurchase != null) {
       const sp = BOARD[v.pendingPurchase]
       const price = 'price' in sp ? sp.price : 0
+      const rp = rentPreview(v, v.pendingPurchase)
+      const rentNote = sp.kind === 'utility' ? ` (${rp.note})` : ''
       banner = `<div class="banner good">You landed on <b>${esc(sp.name)}</b></div>`
       body += `<div class="card actions">
         <h3>Unowned — $${price}</h3>
+        <p class="hint">Rent when owned: <b>$${rp.current}${rentNote}</b>${isStreet(sp) ? ` · next tier $${rp.next}` : ''}</p>
         <div class="row">
           ${acts.has('buy') ? `<button class="big good" data-act="buy">Buy for $${price}</button>` : `<button class="big disabled" disabled>Can't afford $${price}</button>`}
           ${acts.has('declineBuy') ? `<button class="big" data-act="declineBuy">Send to auction</button>` : ''}
@@ -629,6 +648,21 @@ function renderPortfolio(v: PlayerView, pid: string): string {
       const marks =
         (st.houses > 0 ? (st.houses === 5 ? 'hotel' : `${st.houses} house${st.houses > 1 ? 's' : ''}`) : '') +
         (st.mortgaged ? ' · mortgaged' : '')
+      // earning line: what it earns now, and what the next build tier earns
+      const rp = rentPreview(v, i)
+      let earn = ''
+      if (isStreet(sp)) {
+        earn = st.houses === 5
+          ? `earns $${rp.current} (hotel)`
+          : rp.next != null
+            ? `earns $${rp.current} → <b>$${rp.next}</b> with ${rp.next === sp.rents[5] ? 'a hotel' : 'a house'}${rp.note ? ` · ${rp.note}` : ''}`
+            : `earns $${rp.current}${rp.note ? ` · ${rp.note}` : ''}`
+      } else if (sp.kind === 'rail') {
+        earn = `earns $${rp.current} (${rp.note})${rp.next != null ? ` → <b>$${rp.next}</b> with another railroad` : ''}`
+      } else if (sp.kind === 'utility') {
+        earn = `earns ${rp.note}${rp.next != null ? ` → <b>${rp.next}× dice</b> with both` : ''}`
+      }
+      if (st.mortgaged) earn = 'mortgaged — no rent while asleep'
       const btns: string[] = []
       if (canBuildOn(v, pid, i)) btns.push(`<button class="tiny" data-act="buyHouse" data-args='{"space":${i}}'>House +$${isStreet(sp) ? sp.houseCost : ''}</button>`)
       if (canSellHouseOn(v, pid, i)) btns.push(`<button class="tiny" data-act="sellHouse" data-args='{"space":${i}}'>Sell house +$${isStreet(sp) ? sp.houseCost / 2 : ''}</button>`)
@@ -640,6 +674,7 @@ function renderPortfolio(v: PlayerView, pid: string): string {
         ${strip}
         <div class="pinfo">
           <div class="pname">${esc(sp.name)}${marks ? ` <span class="hint">${marks}</span>` : ''}</div>
+          ${earn ? `<div class="pearn">${earn}</div>` : ''}
           ${show ? `<div class="row">${btns.join('')}</div>` : ''}
         </div>
       </div>`

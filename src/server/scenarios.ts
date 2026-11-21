@@ -5,7 +5,7 @@
 // Run: npm run scenarios
 
 import { applyAction, createGame, type PlayerMeta, type Result } from '../shared/engine.js'
-import { allowedActions, rentFor } from '../shared/rules.js'
+import { allowedActions, rentFor, rentPreview } from '../shared/rules.js'
 import type { Action, GameState, PlayerState, PropertyState } from '../shared/types.js'
 
 const NAMES = ['Asha', 'Ben', 'Cho', 'Dara']
@@ -127,7 +127,9 @@ scenario('rent: base, then color-set doubling on a doubles chain', 4, (h) => {
 
 scenario('rent tables: houses, hotels, rails, utilities', 4, (h) => {
   h.give(0, [1, 3])
-  h.eq(rentFor(h.s, 1, 7), 4, 'full brown set, no houses → doubled $4')
+  h.eq(rentFor(h.s, 1, 7), 4, 'full brown set, no houses, doubled $4')
+  h.eq(rentPreview(h.s, 1).current, 4, 'preview: doubled base with the full set')
+  h.eq(rentPreview(h.s, 1).next, 10, 'preview: next tier is the 1-house rent')
   h.prop(1, { houses: 1 })
   h.eq(rentFor(h.s, 1, 7), 10, '1 house')
   h.prop(1, { houses: 2 })
@@ -146,6 +148,14 @@ scenario('rent tables: houses, hotels, rails, utilities', 4, (h) => {
   h.eq(rentFor(h.s, 12, 7), 28, 'one utility, roll 7 → 4×dice')
   h.give(0, [28])
   h.eq(rentFor(h.s, 12, 7), 70, 'both utilities → 10×dice')
+  h.eq(rentPreview(h.s, 1).current, 250, 'preview: hotel rent')
+  h.eq(rentPreview(h.s, 1).next, null, 'preview: nothing above a hotel')
+  h.eq(rentPreview(h.s, 8).current, 6, 'preview: unowned street shows its base rent')
+  h.eq(rentPreview(h.s, 5).current, 200, 'rail preview: current with all four rails')
+  h.eq(rentPreview(h.s, 5).next, null, 'rail preview: nothing above four rails')
+  h.eq(rentPreview(h.s, 5).note, '4 railroads', 'rail preview notes the count')
+  h.eq(rentPreview(h.s, 12).current, 10, 'utility preview: 10× with both')
+  h.eq(rentPreview(h.s, 12).next, null, 'utility preview: nothing above both')
 })
 
 scenario('mortgaged property charges no rent but still counts for the set', 4, (h) => {

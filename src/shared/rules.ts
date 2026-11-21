@@ -80,6 +80,33 @@ export function rentFor(
 // (avoid Math.ceil(price * 0.55) — float epsilon makes 100 → 56).
 export const unmortgageCost = (price: number): number => Math.floor(price / 2) + Math.ceil(price / 20)
 
+// Display helper: what this space EARNS right now, and what the next
+// investment tier would earn — for landed info and the portfolio.
+// `current` for utilities is the dice multiplier (4 or 10), see `note`.
+export function rentPreview(s: RulesState, i: number): { current: number; next: number | null; note: string } {
+  const sp = BOARD[i]
+  const st = s.props[i]
+  const owner = st.owner
+  if (isStreet(sp)) {
+    const doubled = owner != null && ownsGroup(s, owner, sp.group)
+    const current = st.houses > 0 ? sp.rents[st.houses] : doubled ? sp.rents[0] * 2 : sp.rents[0]
+    const next = st.houses < 5 ? sp.rents[st.houses + 1] : null
+    const note = st.houses === 5 ? 'hotel' : doubled && st.houses === 0 ? 'full set — doubled' : ''
+    return { current, next, note }
+  }
+  if (sp.kind === 'rail') {
+    const n = owner != null ? countOwned(s, owner, 'rail') : 1
+    const current = 25 * Math.pow(2, Math.max(0, n - 1))
+    const next = n < 4 ? 25 * Math.pow(2, n) : null
+    return { current, next, note: `${n} railroad${n > 1 ? 's' : ''}` }
+  }
+  if (sp.kind === 'utility') {
+    const both = owner != null && countOwned(s, owner, 'utility') === 2
+    return { current: both ? 10 : 4, next: both ? null : 10, note: `${both ? '10' : '4'}× dice roll` }
+  }
+  return { current: 0, next: null, note: '' }
+}
+
 export function canBuildOn(s: RulesState, pid: string, i: number): boolean {
   const sp = BOARD[i]
   if (!sp || !isStreet(sp)) return false

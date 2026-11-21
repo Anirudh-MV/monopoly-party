@@ -15,6 +15,12 @@ const PORT = Number(process.env.PORT ?? 3000)
 
 const app = express()
 const pub = path.resolve('public')
+// Bundles must never be served stale: idle phone tabs can hold old code
+// for days, which causes missing-button bugs after a deploy.
+app.get(['/host.js', '/controller.js', '/sim.js'], (_q, res, next) => {
+  res.set('Cache-Control', 'no-store')
+  next()
+})
 app.use(express.static(pub))
 app.get('/', (_q, res) => res.sendFile(path.join(pub, 'host.html')))
 app.get('/join', (_q, res) => res.sendFile(path.join(pub, 'controller.html')))
