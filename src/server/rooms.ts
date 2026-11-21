@@ -14,6 +14,7 @@ import type { Server as IOServer, Socket } from 'socket.io'
 import { applyAction, createGame, type PlayerMeta } from '../shared/engine.js'
 import { hostView, playerView } from '../shared/views.js'
 import { allowedActions, alivePlayers, netWorth } from '../shared/rules.js'
+import { TOKENS, stripEmoji } from '../shared/tokens.js'
 import type { Action, GameState, GodCommand, LobbyInfo, LobbyPlayer } from '../shared/types.js'
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ' // no I/O — they confuse party guests
@@ -27,7 +28,6 @@ const ROOM_TTL_MS = 3 * 60 * 60 * 1000
 const DEFAULT_TURN_TIMEOUT_MS = 300_000
 
 const PLAYER_COLORS = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316', '#06b6d4', '#ec4899']
-const PLAYER_TOKENS = ['🎩', '🚗', '🐕', '🚢', '👞', '🐈', '🛴', '🍀']
 
 interface PlayerEntry {
   meta: PlayerMeta
@@ -494,16 +494,31 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
     // ── Phones ──
     socket.on(
       'room:join',
-      (payload: { code?: string; name?: string }, ack?: (res: unknown) => void) => {
+      (payload: { code?: string; name?: string; piece?: string }, ack?: (res: unknown) => void) => {
         const room = rooms.get(String(payload?.code ?? '').toUpperCase())
         if (!room) return ack?.({ ok: false, error: 'No room with that code' })
         if (room.state) return ack?.({ ok: false, error: 'That game already started' })
         if (room.players.length >= MAX_PLAYERS) return ack?.({ ok: false, error: 'Room is full (8 players)' })
 
-        const name = String(payload?.name ?? '').trim().slice(0, 16)
-        if (name.length < 1) return ack?.({ ok: false, error: 'Enter your name' })
+        // Names never carry emojis — strip server-side, never trust the client.
+        const name = stripEmoji(String(payload?.name ?? '')).slice(0, 16)
+        if (name.length < 1) return ack?.({ ok: false, error: 'Enter your name (letters and numbers)' })
         if (room.players.some((e) => e.meta.name.toLowerCase() === name.toLowerCase())) {
           return ack?.({ ok: false, error: 'Someone already took that name' })
+        }
+
+        // Piece: must come from the allowed list and be unique in the room.
+        // Missing/invalid piece falls back to the first free one (keeps
+        // old clients and the smoke test working).
+        const wanted = String(payload?.piece ?? '')
+        let piece: string
+        if (wanted && TOKENS.includes(wanted)) {
+          if (room.players.some((e) => e.meta.token === wanted)) {
+            return ack?.({ ok: false, error: `${wanted} is already taken — pick another piece` })
+          }
+          piece = wanted
+        } else {
+          piece = TOKENS.find((t) => !room.players.some((e) => e.meta.token === t)) ?? TOKENS[0]
         }
 
         const seat = room.players.length
@@ -511,7 +526,7 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
           id: randomUUID(),
           name,
           color: PLAYER_COLORS[seat % PLAYER_COLORS.length],
-          token: PLAYER_TOKENS[seat % PLAYER_TOKENS.length],
+          token: piece,
         }
         const entry: PlayerEntry = { meta, token: randomUUID(), socketId: socket.id }
         room.players.push(entry)

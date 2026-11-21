@@ -47,6 +47,14 @@ body {
 .join { min-height: 90vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; }
 .join h1 { font-size: 26px; text-align: center; }
 label { display: block; color: var(--dim); font-size: 13px; margin: 12px 0 4px; }
+.hint-inline { font-size: 11px; opacity: 0.8; }
+.tokgrid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; margin-top: 4px; }
+.tok {
+  font-size: 22px; min-height: 46px; padding: 4px 0;
+  background: var(--panel2); border: 2px solid var(--line); border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+}
+.tok.sel { background: color-mix(in srgb, var(--accent) 18%, var(--panel)); border-color: var(--accent); transform: scale(1.06); }
 input {
   width: 100%; font: inherit; color: var(--ink);
   background: var(--panel2); border: 1px solid var(--line); border-radius: 12px;

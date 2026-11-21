@@ -30,12 +30,18 @@ function tileCenter(i: number): { x: number; z: number; r: number; c: number; re
   return { x: (c - 6) * TILE, z: (r - 6) * TILE, r, c, region: r === 11 ? 'bottom' : c === 1 ? 'left' : r === 1 ? 'top' : 'right' }
 }
 
-// shortest-path angular interpolation (labels rotate the short way round)
-function angleLerp(current: number, target: number, k: number): number {
-  let d = (target - current) % (Math.PI * 2)
-  if (d > Math.PI) d -= Math.PI * 2
-  if (d < -Math.PI) d += Math.PI * 2
-  return current + d * k
+// shortest-path angular interpolation (unused for labels now that text is
+// static, kept for future camera work) — removed to keep things honest.
+
+// The camera sits OUTSIDE whichever side of the board the active piece is
+// on, so that whole edge's static labels read upright on the TV:
+// bottom row → viewed from the south, left column → from the west, etc.
+function cameraOffset(i: number): THREE.Vector3 {
+  const region = tileCenter(i).region
+  if (region === 'bottom') return new THREE.Vector3(0, 11.5, 8.5)
+  if (region === 'top') return new THREE.Vector3(0, 11.5, -8.5)
+  if (region === 'left') return new THREE.Vector3(-8.5, 11.5, 0)
+  return new THREE.Vector3(8.5, 11.5, 0)
 }
 
 const SEAT_OFFSETS: Array<[number, number]> = [
@@ -143,6 +149,16 @@ export class Board3D {
   private idle = true
   private idleAngle = 0.6
   private disposed = false
+
+  // user inspection: drag to orbit the board, release to glide back home
+  private dragging = false
+  private dragX = 0
+  private dragY = 0
+  private userYaw = 0
+  private userPitch = 0
+  private userZoom = 1
+  private returning = false
+  private wheelDeadline = 0
   private hopDelayMs = 0
   private theme: 'light' | 'dark' = 'light'
   private tileBase = 0xf3eee2
@@ -183,7 +199,49 @@ export class Board3D {
     this.ringBlue = this.makeRing(0x6c8cff)
 
     window.addEventListener('resize', this.onResize)
+    // click-and-drag inspection: orbit around the current focus, zoom with
+    // the wheel; on release (or wheel idle) the view eases back to default
+    const dom = this.renderer.domElement
+    dom.style.cursor = 'grab'
+    dom.style.touchAction = 'none'
+    dom.addEventListener('pointerdown', this.onPointerDown)
+    window.addEventListener('pointermove', this.onPointerMove)
+    window.addEventListener('pointerup', this.onPointerUp)
+    dom.addEventListener('wheel', this.onWheel, { passive: false })
     this.animate()
+  }
+
+  private onPointerDown = (ev: PointerEvent): void => {
+    if (ev.button !== 0) return
+    this.dragging = true
+    this.returning = false
+    this.wheelDeadline = 0
+    this.dragX = ev.clientX
+    this.dragY = ev.clientY
+    this.renderer.domElement.style.cursor = 'grabbing'
+  }
+
+  private onPointerMove = (ev: PointerEvent): void => {
+    if (!this.dragging) return
+    const dx = ev.clientX - this.dragX
+    const dy = ev.clientY - this.dragY
+    this.dragX = ev.clientX
+    this.dragY = ev.clientY
+    this.userYaw -= dx * 0.005
+    this.userPitch = THREE.MathUtils.clamp(this.userPitch + dy * 0.004, -1.15, 1.15)
+  }
+
+  private onPointerUp = (): void => {
+    if (!this.dragging) return
+    this.dragging = false
+    this.returning = true // ease back to the default view
+    this.renderer.domElement.style.cursor = 'grab'
+  }
+
+  private onWheel = (ev: WheelEvent): void => {
+    ev.preventDefault()
+    this.userZoom = THREE.MathUtils.clamp(this.userZoom * (ev.deltaY > 0 ? 1.08 : 0.93), 0.45, 2.6)
+    this.wheelDeadline = performance.now() + 2000 // zoom eases home after idle
   }
 
   private onResize = (): void => {
@@ -467,17 +525,19 @@ export class Board3D {
       this.ringGold.visible = false
     }
 
-    // camera focus: the active piece (or the debtor while a debt resolves,
-    // or a wide shot when the game is over)
+    // camera focus: the active piece, viewed from OUTSIDE its own side of
+    // the board — Pacific Ave (right edge) faces east, Illinois (top) faces
+    // north, and so on. Labels stay static; the camera does the moving.
     const focusIdx = v.debt ? v.players.findIndex((p) => p.id === v.debt?.debtor) : v.players.findIndex((p) => p.id === v.currentPlayerId)
     if (v.phase === 'GAME_OVER' || focusIdx < 0) {
       this.focusGoal.set(0, 0, 0)
       this.posGoal.set(0, 34, 26)
     } else {
+      const player = v.players[focusIdx]
       const mesh = this.tokens[focusIdx]
-      if (mesh) {
+      if (player && mesh) {
         this.focusGoal.copy(mesh.position)
-        this.posGoal.copy(mesh.position).add(new THREE.Vector3(0, 11.5, 8.5))
+        this.posGoal.copy(mesh.position).add(cameraOffset(player.pos))
       }
     }
 
@@ -489,6 +549,10 @@ export class Board3D {
     this.disposed = true
     cancelAnimationFrame(this.raf)
     window.removeEventListener('resize', this.onResize)
+    window.removeEventListener('pointermove', this.onPointerMove)
+    window.removeEventListener('pointerup', this.onPointerUp)
+    this.renderer.domElement.removeEventListener('pointerdown', this.onPointerDown)
+    this.renderer.domElement.removeEventListener('wheel', this.onWheel)
     this.renderer.dispose()
     this.renderer.domElement.remove()
   }
@@ -530,20 +594,16 @@ export class Board3D {
     if (this.ringGold.visible) this.ringGold.scale.setScalar(s)
     if (this.ringBlue.visible) this.ringBlue.scale.setScalar(1 + Math.sin(now / 380) * 0.04)
 
-    // labels: the ACTIVE tile rotates to face the camera (which hovers just
-    // south of the focus point), scaled up slightly so the close-up reads
-    // well on the TV; everything else settles back to its outside-facing home
+    // labels: text is STATIC — every tile keeps its outside-facing home
+    // rotation; only the active tile's label scales up a touch for the
+    // close-up (the camera handles readability by facing the piece's side)
     const k = 1 - Math.pow(0.004, dt)
     for (let i = 0; i < this.labelMeshes.length; i++) {
       const label = this.labelMeshes[i]
       if (!label) continue
-      const home = this.labelHome[i] ?? 0
-      if (i === this.activeTileIndex) {
-        label.rotation.y = angleLerp(label.rotation.y, 0, k)
-        label.scale.setScalar(label.scale.x + (1.18 - label.scale.x) * k)
-      } else {
-        label.rotation.y = angleLerp(label.rotation.y, home, k)
-        label.scale.setScalar(label.scale.x + (1 - label.scale.x) * k)
+      const target = i === this.activeTileIndex ? 1.18 : 1
+      if (Math.abs(label.scale.x - target) > 0.001) {
+        label.scale.setScalar(label.scale.x + (target - label.scale.x) * k)
       }
     }
 
@@ -561,15 +621,48 @@ export class Board3D {
         const mesh = this.tokens[hop.playerIdx]
         if (mesh) {
           followFocus.copy(mesh.position)
-          this.posGoal.copy(mesh.position).add(new THREE.Vector3(0, 11.5, 8.5))
+          this.posGoal.copy(mesh.position).add(cameraOffset(hop.path[hop.path.length - 1]))
         }
       }
     }
     const ease = 1 - Math.pow(0.0012, dt)
     const easeLook = 1 - Math.pow(0.0018, dt)
-    this.camera.position.lerp(this.posGoal, ease)
-    this.lookTarget.lerp(followFocus, easeLook)
-    this.camera.lookAt(this.lookTarget)
+
+    // user inspection: while dragging (or easing back after release), the
+    // camera is placed directly from the default offset + the user's orbit
+    const inspecting =
+      this.dragging ||
+      Math.abs(this.userYaw) > 0.0005 ||
+      Math.abs(this.userPitch) > 0.0005 ||
+      Math.abs(this.userZoom - 1) > 0.0005
+    if (!this.dragging && inspecting && (this.returning || (this.wheelDeadline > 0 && now > this.wheelDeadline))) {
+      // release (or wheel idle): glide the orbit back to the default view
+      const k = 1 - Math.pow(0.02, dt)
+      this.userYaw += (0 - this.userYaw) * k
+      this.userPitch += (0 - this.userPitch) * k
+      this.userZoom += (1 - this.userZoom) * k
+      if (Math.abs(this.userYaw) < 0.0005 && Math.abs(this.userPitch) < 0.0005 && Math.abs(this.userZoom - 1) < 0.0005) {
+        this.userYaw = 0
+        this.userPitch = 0
+        this.userZoom = 1
+        this.returning = false
+        this.wheelDeadline = 0
+      }
+    }
+    if (inspecting) {
+      // pivot keeps tracking the focus so nothing jumps after the release
+      this.lookTarget.lerp(followFocus, easeLook)
+      const base = this.posGoal.clone().sub(this.lookTarget).multiplyScalar(this.userZoom)
+      const sph = new THREE.Spherical().setFromVector3(base)
+      sph.theta += this.userYaw
+      sph.phi = THREE.MathUtils.clamp(sph.phi - this.userPitch, 0.12, Math.PI / 2 - 0.02)
+      this.camera.position.copy(this.lookTarget).add(new THREE.Vector3().setFromSpherical(sph))
+      this.camera.lookAt(this.lookTarget)
+    } else {
+      this.camera.position.lerp(this.posGoal, ease)
+      this.lookTarget.lerp(followFocus, easeLook)
+      this.camera.lookAt(this.lookTarget)
+    }
 
     this.renderer.render(this.scene, this.camera)
   }

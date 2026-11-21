@@ -7,6 +7,7 @@
 
 import { io } from 'socket.io-client'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
+import { TOKENS, stripEmoji } from '../../shared/tokens.js'
 import {
   canBuildOn,
   canMortgageOn,
@@ -62,6 +63,9 @@ let lastCardSeq = -1
 
 // ledger tab (defaults to "me")
 let ledgerTab: string | null = null
+
+// the piece picked on the join screen (defaults to the first in the list)
+let joinPiece = TOKENS[0]
 
 function stripColorPhone(sp: Space): string {
   if (isStreet(sp)) return GROUP_COLORS[sp.group]
@@ -190,15 +194,23 @@ $app.addEventListener('click', (ev) => {
       break
     case 'join': {
       const code = (document.getElementById('code') as HTMLInputElement).value.trim().toUpperCase()
-      const name = (document.getElementById('name') as HTMLInputElement).value.trim()
-      if (!code || !name) return toast('Room code and name, please!')
-      socket.emit('room:join', { code, name }, (res: JoinAck) => {
+      const name = stripEmoji((document.getElementById('name') as HTMLInputElement).value)
+      if (!code || !name) return toast('Room code and a name, please!')
+      socket.emit('room:join', { code, name, piece: joinPiece }, (res: JoinAck) => {
         if (!res.ok) return toast(res.error ?? 'Could not join')
         localStorage.setItem('mp-token', res.token ?? '')
         myToken = res.token ?? null
         myPlayerId = res.playerId ?? null
         localStorage.setItem('mp-playerid', myPlayerId ?? '')
         myName = name
+      })
+      break
+    }
+    case 'pickPiece': {
+      // toggle imperatively — a full re-render would wipe the name input
+      joinPiece = el.dataset.piece ?? joinPiece
+      document.querySelectorAll('.tok').forEach((b) => {
+        b.classList.toggle('sel', (b as HTMLElement).dataset.piece === joinPiece)
       })
       break
     }
@@ -354,8 +366,12 @@ function renderJoin(): void {
       <div class="card">
         <label>Room code</label>
         <input id="code" maxlength="4" autocomplete="off" autocapitalize="characters" placeholder="ABCD" value="${esc(preCode)}" />
-        <label>Your name</label>
+        <label>Your name <span class="hint-inline">(no emojis)</span></label>
         <input id="name" maxlength="16" autocomplete="off" placeholder="e.g. Maya" />
+        <label>Pick your piece</label>
+        <div class="tokgrid">
+          ${TOKENS.map((t) => `<button type="button" class="tok${t === joinPiece ? ' sel' : ''}" data-piece="${t}" data-act="pickPiece">${t}</button>`).join('')}
+        </div>
         <button class="big primary" data-act="join">Join the game</button>
         <p class="hint">Get the code from the TV screen</p>
       </div>
