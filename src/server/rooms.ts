@@ -12,10 +12,20 @@ import * as fsp from 'node:fs/promises'
 import path from 'node:path'
 import type { Server as IOServer, Socket } from 'socket.io'
 import { applyAction, createGame, type PlayerMeta } from '../shared/engine.js'
+import { ALL_CARDS } from '../shared/cards.js'
 import { hostView, playerView } from '../shared/views.js'
 import { allowedActions, alivePlayers, netWorth } from '../shared/rules.js'
 import { TOKENS, stripEmoji } from '../shared/tokens.js'
-import type { Action, GameState, LobbyInfo, LobbyPlayer } from '../shared/types.js'
+import type {
+  Action,
+  AuctionState,
+  DebtState,
+  GameState,
+  LobbyInfo,
+  LobbyPlayer,
+  TradeOffer,
+  TradeSide,
+} from '../shared/types.js'
 import { validAction, validCode, validGodCommand, validToken } from '../shared/validate.js'
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ' // no I/O — they confuse party guests
@@ -537,6 +547,270 @@ function loadSnapshots(): void {
   }
 }
 
+// ── Snapshot validation (the god import path) ──
+// The import validates BEFORE anything touches the room: a fully checked,
+// normalized snapshot is built first, and only committed if every field
+// passed. The TV is a browser like any other — a 5000-seat room, a color
+// like `red"><img onerror=…`, or a state that throws in the view layer must
+// never reach the room, the clients, or the disk.
+const SNAPSHOT_MAX_BYTES = 256 * 1024 // real snapshots top out around 20KB
+const MAX_OPEN_TRADES = 16
+const MAX_LEDGER = 600
+const MAX_LOG = 1000
+const PHASES = new Set(['LOBBY', 'ROLL', 'ACTION', 'AUCTION', 'DEBT', 'GAME_OVER'])
+const HEX_COLOR = /^#[0-9a-f]{6}$/i
+const CARD_IDS = new Set(ALL_CARDS.map((c) => c.id))
+const LOG_KINDS = new Set(['info', 'good', 'bad', 'money'])
+
+function snapStr(x: unknown, max: number): string | null {
+  return typeof x === 'string' && x.length > 0 && x.length <= max ? x : null
+}
+
+function snapInt(x: unknown, min: number, max: number): number | null {
+  return typeof x === 'number' && Number.isInteger(x) && x >= min && x <= max ? x : null
+}
+
+function snapTradeSide(raw: unknown): TradeSide | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const d = raw as Record<string, unknown>
+  const cash = snapInt(d.cash, 0, 1_000_000_000)
+  const jailCards = snapInt(d.jailCards, 0, 5)
+  if (cash === null || jailCards === null) return null
+  if (!Array.isArray(d.spaces) || d.spaces.length > 40) return null
+  const spaces: number[] = []
+  for (const sp of d.spaces) {
+    const i = snapInt(sp, 0, 39)
+    if (i === null) return null
+    spaces.push(i)
+  }
+  return { cash, spaces, jailCards }
+}
+
+function snapDeck(raw: unknown, what: string): string[] | null {
+  if (!Array.isArray(raw) || raw.length > 32) return null
+  for (const id of raw) if (!CARD_IDS.has(id)) return null
+  return raw as string[]
+}
+
+// Returns a normalized snapshot whose every renderable field is known-safe,
+// or null if anything about the input is off.
+function validateSnapshot(raw: unknown): RoomSnapshot | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  let bytes: number
+  try {
+    bytes = JSON.stringify(raw).length
+  } catch {
+    return null
+  }
+  if (bytes > SNAPSHOT_MAX_BYTES) return null
+  const d = raw as Record<string, unknown>
+
+  // ── seats: 2..8, clean metas, unique ids and pieces ──
+  if (!Array.isArray(d.players) || d.players.length < MIN_PLAYERS || d.players.length > MAX_PLAYERS) return null
+  const players: Array<{ meta: PlayerMeta; token: string }> = []
+  const metas = new Map<string, PlayerMeta>()
+  const usedPieces = new Set<string>()
+  for (let seat = 0; seat < d.players.length; seat++) {
+    const e = d.players[seat]
+    if (!e || typeof e !== 'object') return null
+    const m = (e as { meta?: unknown }).meta
+    if (!m || typeof m !== 'object') return null
+    const meta = m as Record<string, unknown>
+    const id = snapStr(meta.id, 64)
+    const name = stripEmoji(typeof meta.name === 'string' ? meta.name : '').slice(0, 16)
+    if (!id || !name || metas.has(id)) return null
+    // Colors are rendered into style attributes and pieces into markup —
+    // only known-safe values survive validation.
+    const color =
+      typeof meta.color === 'string' && HEX_COLOR.test(meta.color) ? meta.color : PLAYER_COLORS[seat % PLAYER_COLORS.length]
+    let piece = typeof meta.token === 'string' && TOKENS.includes(meta.token) ? meta.token : ''
+    if (!piece) piece = TOKENS.find((t) => !usedPieces.has(t)) ?? TOKENS[0]
+    const metaOut: PlayerMeta = { id, name, color, token: piece }
+    metas.set(id, metaOut)
+    usedPieces.add(piece)
+    const rejoin = snapStr((e as { token?: unknown }).token, 64) ?? randomUUID()
+    players.push({ meta: metaOut, token: rejoin })
+  }
+
+  const hostPlayerId = d.hostPlayerId == null ? null : snapStr(d.hostPlayerId, 64)
+  if (hostPlayerId != null && !metas.has(hostPlayerId)) return null
+  const turnTimeoutMs = snapInt(d.turnTimeoutMs, 0, 3_600_000) ?? DEFAULT_TURN_TIMEOUT_MS
+
+  // ── state: null (lobby) or a fully checked GameState ──
+  let state: GameState | null = null
+  if (d.state != null) {
+    if (typeof d.state !== 'object' || Array.isArray(d.state)) return null
+    const st = d.state as Record<string, unknown>
+    if (typeof st.phase !== 'string' || !PHASES.has(st.phase)) return null
+
+    if (!Array.isArray(st.players) || st.players.length !== players.length) return null
+    for (const p of st.players as unknown[]) {
+      if (!p || typeof p !== 'object') return null
+      const q = p as Record<string, unknown>
+      const meta = metas.get(snapStr(q.id, 64) ?? '')
+      if (!meta) return null
+      if (snapInt(q.cash, 0, 1_000_000_000) === null) return null
+      if (snapInt(q.pos, 0, 39) === null) return null
+      if (typeof q.jail !== 'boolean' || typeof q.bankrupt !== 'boolean' || typeof q.connected !== 'boolean') return null
+      if (snapInt(q.jailRolls, 0, 3) === null || snapInt(q.jailCards, 0, 5) === null) return null
+      // display copies are forced to the validated meta values
+      q.name = meta.name
+      q.color = meta.color
+      q.token = meta.token
+      q.jailReason = typeof q.jailReason === 'string' ? q.jailReason.slice(0, 120) : null
+    }
+
+    const currentPlayerId = snapStr(st.currentPlayerId, 64)
+    if (currentPlayerId == null || !metas.has(currentPlayerId)) return null
+
+    const props = st.props
+    if (!props || typeof props !== 'object' || Array.isArray(props)) return null
+    for (const [, t] of Object.entries(props)) {
+      if (!t || typeof t !== 'object') return null
+      const q = t as Record<string, unknown>
+      if (q.owner != null && !metas.has(snapStr(q.owner, 64) ?? '')) return null
+      if (snapInt(q.houses, 0, 5) === null || typeof q.mortgaged !== 'boolean') return null
+    }
+
+    const chanceDeck = snapDeck(st.chanceDeck, 'chance')
+    const chestDeck = snapDeck(st.chestDeck, 'chest')
+    if (chanceDeck === null || chestDeck === null) return null
+
+    const snapDebt = (x: unknown): DebtState | null => {
+      if (x == null) return null
+      if (!x || typeof x !== 'object') return null
+      const q = x as Record<string, unknown>
+      const debtor = metas.has(snapStr(q.debtor, 64) ?? '') ? (q.debtor as string) : null
+      const amount = snapInt(q.amount, 1, 1_000_000_000)
+      const creditor = q.creditor == null ? null : metas.has(snapStr(q.creditor, 64) ?? '') ? (q.creditor as string) : null
+      if (debtor === null || amount === null) return null
+      return { debtor, amount, creditor }
+    }
+    const debt = snapDebt(st.debt)
+    if (debt === null && st.debt != null) return null
+    if (!Array.isArray(st.debtQueue) || st.debtQueue.length > 8) return null
+    const debtQueue: DebtState[] = []
+    for (const x of st.debtQueue) {
+      const dq = snapDebt(x)
+      if (dq === null) return null
+      debtQueue.push(dq)
+    }
+
+    const snapAuction = (x: unknown): AuctionState | null => {
+      if (x == null) return null
+      if (!x || typeof x !== 'object') return null
+      const q = x as Record<string, unknown>
+      const space = snapInt(q.space, 0, 39)
+      const bid = snapInt(q.bid, 0, 1_000_000_000)
+      if (space === null || bid === null) return null
+      const bidder = q.bidder == null ? null : metas.has(snapStr(q.bidder, 64) ?? '') ? (q.bidder as string) : null
+      if (!Array.isArray(q.passed)) return null
+      const passed: string[] = []
+      for (const pid of q.passed) {
+        const id = metas.has(snapStr(pid, 64) ?? '') ? (pid as string) : null
+        if (id === null) return null
+        passed.push(id)
+      }
+      return { space, bid, bidder, passed }
+    }
+    const auction = snapAuction(st.auction)
+    if (auction === null && st.auction != null) return null
+    if (!Array.isArray(st.auctionQueue) || st.auctionQueue.length > 40) return null
+    const auctionQueue: number[] = []
+    for (const x of st.auctionQueue) {
+      const i = snapInt(x, 0, 39)
+      if (i === null) return null
+      auctionQueue.push(i)
+    }
+
+    if (!Array.isArray(st.trades) || st.trades.length > MAX_OPEN_TRADES) return null
+    const trades: TradeOffer[] = []
+    for (const x of st.trades) {
+      if (!x || typeof x !== 'object') return null
+      const q = x as Record<string, unknown>
+      const id = snapStr(q.id, 64)
+      const from = metas.has(snapStr(q.from, 64) ?? '') ? (q.from as string) : null
+      const to = metas.has(snapStr(q.to, 64) ?? '') ? (q.to as string) : null
+      const give = snapTradeSide(q.give)
+      const receive = snapTradeSide(q.receive)
+      if (id === null || from === null || to === null || !give || !receive) return null
+      trades.push({ id, from, to, give, receive })
+    }
+
+    let pendingTax: { player: string; space: number } | null = null
+    if (st.pendingTax != null) {
+      if (!st.pendingTax || typeof st.pendingTax !== 'object') return null
+      const q = st.pendingTax as Record<string, unknown>
+      const player = metas.has(snapStr(q.player, 64) ?? '') ? (q.player as string) : null
+      const space = snapInt(q.space, 0, 39)
+      if (player === null || space === null) return null
+      pendingTax = { player, space }
+    }
+
+    if (!Array.isArray(st.ledger) || st.ledger.length > MAX_LEDGER) return null
+    for (const x of st.ledger) {
+      if (!x || typeof x !== 'object') return null
+      const q = x as Record<string, unknown>
+      if (snapInt(q.seq, 0, 1_000_000) === null || snapInt(q.turn, 0, 100_000) === null) return null
+      if (!metas.has(snapStr(q.playerId, 64) ?? '')) return null
+      if (snapInt(q.delta, -1_000_000_000, 1_000_000_000) === null) return null
+      if (snapInt(q.balance, 0, 1_000_000_000) === null) return null
+      if (typeof q.memo !== 'string' || q.memo.length > 120) return null
+    }
+
+    if (!Array.isArray(st.log) || st.log.length > MAX_LOG) return null
+    for (const x of st.log) {
+      if (!x || typeof x !== 'object') return null
+      const q = x as Record<string, unknown>
+      if (typeof q.text !== 'string' || q.text.length > 200) return null
+      if (typeof q.kind !== 'string' || !LOG_KINDS.has(q.kind)) return null
+    }
+
+    // Dice and counters must be sane wherever they exist.
+    if (st.dice != null) {
+      if (!Array.isArray(st.dice) || st.dice.length !== 2) return null
+      if (snapInt(st.dice[0], 1, 6) === null || snapInt(st.dice[1], 1, 6) === null) return null
+    }
+    if (snapInt(st.doubles, 0, 3) === null) return null
+    if (snapInt(st.cardDrawSeq, 0, 1_000_000) === null) return null
+    if (snapInt(st.turn, 0, 100_000) === null) return null
+    if (st.winner != null && !metas.has(snapStr(st.winner, 64) ?? '')) return null
+
+    // Rebuild the state as the normalized object: known-safe values only.
+    // Transient reveal pendings (card draw, jail sentence, pending card)
+    // don't survive an import — the room re-schedules its clock on the next
+    // broadcast, so the game simply continues from a stable point.
+    state = {
+      ...(st as unknown as GameState),
+      chanceDeck,
+      chestDeck,
+      debt,
+      debtQueue,
+      auction,
+      auctionQueue,
+      trades,
+      pendingTax,
+      pendingCard: null,
+      pendingCardDraw: null,
+      pendingJail: null,
+      pendingPurchase: null,
+      pendingMove: null,
+      deadline: null,
+      deadlineFor: null,
+    }
+  }
+
+  return {
+    v: 1,
+    code: snapStr(d.code, 4) ?? '',
+    hostToken: snapStr(d.hostToken, 64) ?? '',
+    hostPlayerId,
+    turnTimeoutMs,
+    players,
+    state,
+  }
+}
+
 // ── God console ──
 // Emergency operator controls for the TV host: rescue turns, edit wallets,
 // reassign properties, force reveals, export/import the whole game.
@@ -556,21 +830,16 @@ function godMutate(io: IOServer, room: Room, note: string, fn: (s: GameState) =>
   return true
 }
 
-function restoreRoomFromSnapshot(room: Room, data: unknown): boolean {
-  if (!data || typeof data !== 'object') return false
-  const d = data as Record<string, unknown>
-  const st = (d.state ?? null) as GameState | null
-  if (st && (!Array.isArray(st.players) || typeof st.phase !== 'string')) return false
-  if (!Array.isArray(d.players)) return false
+// Consumes a snapshot that validateSnapshot already accepted — every field
+// is known-safe. Same-room imports keep live sockets attached to seats that
+// survive.
+function restoreRoomFromSnapshot(room: Room, snap: RoomSnapshot): boolean {
   const prevConnected = new Map(room.players.map((e) => [e.meta.id, e.socketId]))
   // re-key rejoin tokens to the incoming seats
   for (const [tok, ref] of playerTokens) if (ref.code === room.code) playerTokens.delete(tok)
-  room.hostPlayerId = (d.hostPlayerId as string | null) ?? null
-  const rawTimeout = Number(d.turnTimeoutMs ?? room.turnTimeoutMs)
-  room.turnTimeoutMs = Number.isFinite(rawTimeout)
-    ? Math.max(0, Math.min(3_600_000, Math.floor(rawTimeout)))
-    : room.turnTimeoutMs
-  room.players = (d.players as Array<{ meta: PlayerMeta; token: string }>).map((e) => ({
+  room.hostPlayerId = snap.hostPlayerId
+  room.turnTimeoutMs = snap.turnTimeoutMs
+  room.players = snap.players.map((e) => ({
     meta: e.meta,
     token: e.token,
     // same-room imports keep live sockets attached to their seats
@@ -578,7 +847,7 @@ function restoreRoomFromSnapshot(room: Room, data: unknown): boolean {
     disconnectedAt: null,
   }))
   for (const e of room.players) playerTokens.set(e.token, { code: room.code, playerId: e.meta.id })
-  room.state = st
+  room.state = snap.state
   return true
 }
 
@@ -1057,9 +1326,13 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
         }
 
         case 'import': {
-          if (!restoreRoomFromSnapshot(room, payload.json)) {
+          // Validate the ENTIRE snapshot first — the room is only touched if
+          // every field is known-safe (see validateSnapshot).
+          const snap = validateSnapshot(payload.json)
+          if (!snap) {
             return ack?.({ ok: false, error: 'That file is not a valid game snapshot' })
           }
+          restoreRoomFromSnapshot(room, snap)
           if (room.state) {
             godLog(room.state, 'imported a game snapshot')
             broadcastGame(io, room)

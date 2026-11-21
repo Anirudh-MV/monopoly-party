@@ -282,6 +282,76 @@ try {
   })
   assert(alive(), 'server alive after poisoned import (ack ok=' + poison.ok + ')')
 
+  // ── god import: validate-then-commit ──
+  // The room is only touched if EVERY field of the snapshot is known-safe;
+  // hostile values are normalized (never rendered) or the import is rejected.
+  {
+    const tvg = connect()
+    await new Promise((r) => tvg.emit('room:create', r))
+    const seats = (n) =>
+      Array.from({ length: n }, (_, i) => ({
+        meta: { id: `p${i}`, name: `P${i}`, color: '#000000', token: '🎩' },
+        token: `t${i}`,
+      }))
+    const bare = (over) => ({
+      phase: 'ROLL',
+      players: [],
+      currentPlayerId: 'p0',
+      props: {},
+      chanceDeck: [],
+      chestDeck: [],
+      trades: [],
+      ledger: [],
+      log: [],
+      turn: 1,
+      doubles: 0,
+      cardDrawSeq: 0,
+      ...over,
+    })
+    const tries = [
+      ['5000 seats', { players: seats(5000) }],
+      ['one seat', { players: seats(1) }],
+      ['bad phase', { players: seats(2), state: bare({ phase: 'NOT_A_PHASE' }) }],
+      [
+        'huge ledger',
+        {
+          players: seats(2),
+          state: bare({
+            ledger: Array.from({ length: 10000 }, () => ({ seq: 1, turn: 1, playerId: 'p0', delta: 1, memo: 'x', balance: 1 })),
+          }),
+        },
+      ],
+      ['state with no players', { players: seats(2), state: bare({}) }],
+    ]
+    for (const [label, json] of tries) {
+      const res = await emitAck(tvg, 'god:command', { cmd: 'import', json })
+      assert(!res.ok, `import rejected: ${label}`)
+      assert(alive(), `server alive after import: ${label}`)
+    }
+
+    const big = { players: seats(2), junk: 'x'.repeat(300 * 1024) }
+    const bres = await emitAck(tvg, 'god:command', { cmd: 'import', json: big })
+    assert(!bres.ok, 'import rejected: oversized payload')
+    assert(alive(), 'server alive after the oversized import')
+
+    // a hostile COLOR/PIECE is normalized to safe values, never rendered
+    const xres = await emitAck(tvg, 'god:command', {
+      cmd: 'import',
+      json: {
+        players: [
+          { meta: { id: 'p0', name: 'Evil', color: 'red"><img src=x onerror=alert(1)>', token: '<script>alert(1)</script>' }, token: 'tk0' },
+          { meta: { id: 'p1', name: 'Good', color: '#123456', token: '🚗' }, token: 'tk1' },
+        ],
+      },
+    })
+    const eres = await emitAck(tvg, 'god:command', { cmd: 'export' })
+    const snapPlayers = eres.snapshot && eres.snapshot.players
+    const okColor = Array.isArray(snapPlayers) && snapPlayers.every((p) => /^#[0-9a-f]{6}$/i.test(p.meta.color))
+    const okToken = Array.isArray(snapPlayers) && snapPlayers.every((p) => typeof p.meta.token === 'string' && p.meta.token.length <= 8 && !p.meta.token.includes('<'))
+    assert(xres.ok && okColor && okToken, 'injected color/piece normalized to safe values')
+    tvg.close()
+  }
+
   // ── the game must still be fully playable ──
   // The TV socket moved to fresh rooms during the create storm; the original
   // game room is still live on the phone sockets — check through them.
