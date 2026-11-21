@@ -44,6 +44,10 @@ export interface PlayerState {
   jail: boolean
   jailRolls: number
   jailCards: number
+  /** Which deck each held Get Out of Jail Free card came from — so a used
+   *  card returns to its own deck, never "the one that's missing". Absent
+   *  in pre-upgrade snapshots (treated as unknown). */
+  jailCardDecks?: Array<'chance' | 'chest'>
   /** Why this player is in jail ("landed on Go To Jail" etc.), for displays. */
   jailReason: string | null
   bankrupt: boolean
@@ -122,6 +126,8 @@ export interface GameState {
   debt: DebtState | null
   debtQueue: DebtState[]
   trades: TradeOffer[]
+  // Collision-free trade-id counter (monotonic per game).
+  tradeSeq?: number
   // The space the current player most recently landed on — the TV spotlights it.
   lastLanded: { playerId: string; space: number } | null
   // How the active piece last moved — the exact tile-by-tile path, so the TV

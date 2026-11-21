@@ -635,6 +635,33 @@ scenario('bankruptcy on the third failed jail roll ends the turn cleanly', 4, (h
   h.eq(allowedActions(h.s, 'p1').includes('roll'), true, 'the game is still live')
 })
 
+scenario('a used jail card returns to the deck it came from', 4, (h) => {
+  // p0 draws the Chance jail card, p1 the Chest one — both cards are out.
+  h.s.chanceDeck = ['ch8']
+  h.now(0)
+  h.p(0).pos = 5
+  h.roll(0, [[1, 1]]) // → 7, Chance
+  h.ok(h.act(0, { type: 'drawCard' }), 'p0 draws the chance jail card')
+  h.eq(h.p(0).jailCards, 1, 'p0 holds it')
+
+  h.s.chestDeck = ['cc5']
+  h.now(1)
+  h.p(1).pos = 15
+  h.roll(1, [[1, 1]]) // → 17, Community Chest
+  h.ok(h.act(1, { type: 'drawCard' }), 'p1 draws the chest jail card')
+  h.eq(h.p(1).jailCards, 1, 'p1 holds one too')
+
+  // p1 uses theirs while p0's chance card is still out. "The deck that's
+  // missing its card" would put the CHANCE card back in play — duplicating
+  // it and losing the chest one forever. It must return to the CHEST deck.
+  h.p(1).jail = true
+  h.now(1)
+  h.ok(h.act(1, { type: 'useJailCard' }), 'p1 uses theirs')
+  h.eq(h.s.chestDeck.includes('cc5'), true, 'returned to the chest deck it came from')
+  h.eq(h.s.chanceDeck.includes('ch8'), false, 'the chance card stays in p0\u2019s hand — not duplicated')
+  h.eq(h.p(0).jailCards, 1, 'p0 still holds theirs')
+})
+
 scenario('the bank repossesses bankrupt properties unmortgaged', 4, (h) => {
   h.give(0, [1])
   h.prop(1, { mortgaged: true })

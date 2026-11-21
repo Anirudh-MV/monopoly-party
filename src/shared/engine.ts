@@ -345,15 +345,15 @@ function drawCard(s: GameState, deck: 'chance' | 'chest', p: PlayerState, rng: (
   applyCard(s, p, card, rng)
 }
 
-function returnJailCardsToDecks(s: GameState, count: number): void {
-  let left = count
-  if (left > 0 && !s.chanceDeck.includes(CHANCE_JAIL_CARD_ID)) {
-    s.chanceDeck.push(CHANCE_JAIL_CARD_ID)
-    left--
-  }
-  if (left > 0 && !s.chestDeck.includes(CHEST_JAIL_CARD_ID)) {
-    s.chestDeck.push(CHEST_JAIL_CARD_ID)
-    left--
+function returnJailCardsToDecks(s: GameState, count: number, decks: Array<'chance' | 'chest'> = []): void {
+  // Each card goes back to the deck it came from when known; unknown cards
+  // (pre-upgrade snapshots) fall back to "the deck that's missing its
+  // card", which is the best guess available.
+  for (let i = 0; i < count; i++) {
+    const from = decks[i] ?? (s.chanceDeck.includes(CHANCE_JAIL_CARD_ID) ? 'chest' : 'chance')
+    const deck = from === 'chance' ? s.chanceDeck : s.chestDeck
+    const id = from === 'chance' ? CHANCE_JAIL_CARD_ID : CHEST_JAIL_CARD_ID
+    if (!deck.includes(id)) deck.push(id)
   }
 }
 
@@ -432,6 +432,9 @@ function applyCard(s: GameState, p: PlayerState, card: Card, rng: () => number):
     }
     case 'jailcard': {
       p.jailCards++
+      // Remember which deck this card came from — a count alone can't say
+      // where it belongs when it's used.
+      ;(p.jailCardDecks ??= []).push(card.deck)
       log(s, `${p.name} keeps a Get Out of Jail Free card`, 'good')
       break
     }
@@ -551,9 +554,14 @@ function declareBankruptcy(s: GameState, p: PlayerState): Result {
   }
 
   if (p.jailCards > 0) {
-    if (cred) cred.jailCards += p.jailCards
-    else returnJailCardsToDecks(s, p.jailCards)
+    if (cred) {
+      cred.jailCards += p.jailCards
+      ;(cred.jailCardDecks ??= []).push(...(p.jailCardDecks ?? []))
+    } else {
+      returnJailCardsToDecks(s, p.jailCards, p.jailCardDecks ?? [])
+    }
     p.jailCards = 0
+    p.jailCardDecks = []
   }
 
   p.bankrupt = true
@@ -812,7 +820,13 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       if (!p.jail || p.jailCards <= 0) return fail('No jail card to use')
       p.jailCards--
       releaseFromJail(s, p)
-      returnJailCardsToDecks(s, 1)
+      // The card goes back to the deck it came from — not "the deck that's
+      // missing its card", which duplicated one jail card and made the
+      // other vanish when both were out at once.
+      const decks = p.jailCardDecks ?? []
+      const from = decks.shift()
+      p.jailCardDecks = decks
+      returnJailCardsToDecks(s, 1, from != null ? [from] : [])
       log(s, `${p.name} uses a Get Out of Jail Free card 🎟`, 'good')
       return OK
     }
@@ -846,7 +860,14 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       if (!t || t.id === by || t.bankrupt) return fail('Bad trade partner')
       const verr = validateTradeSide(s, p, a.give) ?? validateTradeSide(s, t, a.receive)
       if (verr) return fail(verr)
-      const id = `t${Date.now()}-${Math.floor(Math.random() * 1000)}`
+      // Caps: a phone can hold 3 open offers, the table 16 — spam would
+      // bloat every view pushed to every client, and the clock would tick
+      // for a room that's 90% junk.
+      if (s.trades.filter((x) => x.from === by).length >= 3) return fail('Withdraw an offer first (max 3 open)')
+      if (s.trades.length >= 16) return fail('Too many open offers at the table')
+      // Monotonic, collision-free — Date.now() ids could collide.
+      s.tradeSeq = (s.tradeSeq ?? 0) + 1
+      const id = `t${s.turn}-${s.tradeSeq}`
       s.trades.push({ id, from: by, to: t.id, give: a.give, receive: a.receive })
       log(s, `${p.name} sends a trade offer to ${t.name} 🤝`)
       return OK
@@ -883,6 +904,16 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       for (const i of offer.receive.spaces) s.props[i].owner = from.id
       from.jailCards += offer.receive.jailCards - offer.give.jailCards
       p.jailCards += offer.give.jailCards - offer.receive.jailCards
+      // The deck identities move with the cards, so a traded card still
+      // returns to the deck it originally came from.
+      const shiftDecks = (loser: PlayerState, n: number, winner: PlayerState): void => {
+        if (n <= 0) return
+        const moved = (loser.jailCardDecks ?? []).slice(0, n)
+        loser.jailCardDecks = (loser.jailCardDecks ?? []).slice(n)
+        ;(winner.jailCardDecks ??= []).push(...moved)
+      }
+      shiftDecks(from, offer.give.jailCards, p)
+      shiftDecks(p, offer.receive.jailCards, from)
       s.trades.splice(idx, 1)
       log(s, `🤝 Trade accepted: ${from.name} ↔ ${p.name}`, 'good')
       return OK

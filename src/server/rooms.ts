@@ -32,6 +32,13 @@ const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ' // no I/O — they confuse party g
 const MAX_PLAYERS = 8
 const MIN_PLAYERS = 2
 const ROOM_TTL_MS = 3 * 60 * 60 * 1000
+// An empty, unstarted room with no TV attached is junk (create-spam, or a
+// TV that closed before anyone joined) — it doesn't need the full TTL.
+const EMPTY_ROOM_TTL_MS = 10 * 60 * 1000
+// Room-minting caps: one screen needs one room. A create storm must not be
+// able to fill the ~330k code space, eat memory and litter the disk.
+const MAX_ROOMS_PER_SOCKET = 5
+const MAX_ROOMS = 200
 // Every decision point gets 5 minutes by default (host-configurable in the
 // lobby, or live from the god console). Phones only show the countdown in
 // the final 30 seconds; on expiry the server plays a sensible default so a
@@ -75,6 +82,7 @@ interface SocketData {
   code?: string
   role?: 'host' | 'player' | 'watcher'
   playerId?: string
+  roomsCreated?: number
 }
 
 const rooms = new Map<string, Room>()
@@ -241,12 +249,16 @@ function broadcastGame(io: IOServer, room: Room): void {
     if (p) p.connected = e.socketId != null
   }
 
-  // Stall watchdog: if a live game reaches a state where NOBODY can act
-  // (a rules-combination bug), attempt a targeted rescue instead of hanging
-  // the party — and fall through to normal emission either way, so a failed
-  // remedy never leaves clients on a stale view.
+  // Stall watchdog: if the game is waiting on a decision whose owner has no
+  // legal move (a rules-combination bug), attempt a targeted rescue instead
+  // of hanging the party — and fall through to normal emission either way,
+  // so a failed remedy never leaves clients on a stale view. The check is
+  // precise: the decision's OWNER must be able to act. ("Nobody can act"
+  // was too coarse — proposeTrade and bankrupt are almost always available,
+  // which blinded the old check to real stalls.)
   if (s.phase !== 'GAME_OVER' && !room.watchdogBusy && alivePlayers(s).length > 1) {
-    const stuck = alivePlayers(s).every((q) => allowedActions(s, q.id).length === 0)
+    const decision = currentDecision(s)
+    const stuck = decision != null && decision.playerId != null && allowedActions(s, decision.playerId).length === 0
     if (stuck) {
       console.error(`[watchdog] room ${room.code}: stuck at phase ${s.phase}, turn ${s.turn} — attempting remedy`)
       const remedy = remedyActionsFor(s)
@@ -389,24 +401,31 @@ function scheduleDeadline(room: Room): void {
       room.timerKey = null
       const st = room.state
       if (!st || key !== decision.key) return // decision already resolved
+      let committed = false
       if (decision.playerId != null) {
-        applyServerAction(room, autoActionsFor(room, decision))
+        committed = applyServerAction(room, autoActionsFor(room, decision))
       } else {      // Auction silence: pass everyone who could still bid — the hammer falls.
         const au = st.auction
         if (!au) return
         for (const q of alivePlayers(st)) {
           if (!au.passed.includes(q.id) && q.id !== au.bidder) {
-            applyServerAction(room, [[q.id, { type: 'passBid' }]])
+            if (applyServerAction(room, [[q.id, { type: 'passBid' }]])) committed = true
             if (!room.state || room.state.phase !== 'AUCTION') break
           }
         }
       }
+      // A rejected auto-action must not silently kill the clock: nothing
+      // was committed, so re-broadcast (which re-arms whatever decision
+      // the state waits on now). The watchdog rides along if it's stuck.
+      if (!committed && ioRef && room.state) broadcastGame(ioRef, room)
     })
   }, duration)
 }
 
 // Timer-side commit path: same clone-apply-commit rules as player actions,
-// but no socket to ack to.
+// but no socket to ack to. Auto-actions are NOT human activity — they must
+// never extend the room's idle TTL, or an abandoned auto-playing game
+// lives forever.
 function applyServerAction(room: Room, autos: Array<[string, Action]>): boolean {
   let committed = false
   for (const [by, action] of autos) {
@@ -416,7 +435,6 @@ function applyServerAction(room: Room, autos: Array<[string, Action]>): boolean 
     const res = applyAction(next, action, by)
     if (res.ok) {
       room.state = next
-      room.lastActive = Date.now()
       committed = true
     }
     // A failed auto-action just means the state moved on; the broadcast
@@ -658,6 +676,7 @@ function validateSnapshot(raw: unknown): RoomSnapshot | null {
       q.color = meta.color
       q.token = meta.token
       q.jailReason = typeof q.jailReason === 'string' ? q.jailReason.slice(0, 120) : null
+      q.jailCardDecks = Array.isArray(q.jailCardDecks) ? q.jailCardDecks.filter((x) => x === 'chance' || x === 'chest') : []
     }
 
     const currentPlayerId = snapStr(st.currentPlayerId, 64)
@@ -877,6 +896,12 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
     on('room:create', (_raw: unknown, ack?: (res: unknown) => void) => {
       // Well-formed TVs emit only the ack; a payload in that slot is
       // simply ignored (the ack is picked out by the registrar).
+      if ((data.roomsCreated ?? 0) >= MAX_ROOMS_PER_SOCKET) {
+        return ack?.({ ok: false, error: 'This screen has made too many rooms — reload the page' })
+      }
+      if (rooms.size >= MAX_ROOMS) {
+        return ack?.({ ok: false, error: 'Server is full — try again in a few minutes' })
+      }
       const room: Room = {
         code: newCode(),
         hostToken: randomUUID(),
@@ -891,6 +916,7 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
         watchdogBusy: false,
       }
       rooms.set(room.code, room)
+      data.roomsCreated = (data.roomsCreated ?? 0) + 1
       // one connection, one room: detach from any previous room first
       leaveCurrentRoom(io, socket, data)
       socket.join(hostRoom(room.code))
@@ -1371,12 +1397,16 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
     })
   })
 
-  // Idle-room cleanup so a night of partying doesn't leak memory.
+  // Idle-room cleanup so a night of partying doesn't leak memory. Empty
+  // rooms die fast (10 min) as long as no TV is watching them; real rooms
+  // keep the 3-hour TTL measured from the last HUMAN action.
   setInterval(() => {
     safe('idle-room cleanup', undefined, () => {
       const now = Date.now()
       for (const [code, room] of rooms) {
-        if (now - room.lastActive > ROOM_TTL_MS && room.hostSockets.size === 0) {
+        const emptyJunk = room.hostSockets.size === 0 && room.players.length === 0 && !room.state
+        const expired = now - room.lastActive > (emptyJunk ? EMPTY_ROOM_TTL_MS : ROOM_TTL_MS)
+        if (expired && room.hostSockets.size === 0) {
           rooms.delete(code)
           for (const [tok, ref] of playerTokens) if (ref.code === code) playerTokens.delete(tok)
           try {
@@ -1387,5 +1417,5 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
         }
       }
     })
-  }, 15 * 60 * 1000).unref?.()
+  }, 5 * 60 * 1000).unref?.()
 }
