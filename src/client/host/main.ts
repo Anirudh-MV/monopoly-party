@@ -210,6 +210,7 @@ function renderGame(v: HostView): void {
     $app.innerHTML = `
       <div class="game">
         <div class="overlay queue" id="queue"></div>
+        <div class="overlay topbar" id="topbar"></div>
         <div class="overlay ticker" id="ticker"></div>
         <div class="dicebox" id="dicebox"></div>
         <div class="center3d" id="center"></div>
@@ -243,6 +244,7 @@ function renderGame(v: HostView): void {
   board3d.sync(v)
   updateDice(v)
   updateQueue(v)
+  updateTopbar(v)
   updateTicker(v)
   updateCenter(v)
   if (godOpen) updateGodPanel(v)
@@ -263,10 +265,67 @@ function updateDice(v: HostView): void {
   const key = `${v.turn}:${v.dice.join()}`
   if (key === lastDiceKey) return // never touch mid-animation
   lastDiceKey = key
-  // hold the piece's hops until the tumbling dice settle
-  board3d.delayHops(1150)
-  el.innerHTML = `<div class="diceroll" aria-hidden="true">${dieHTML(v.dice[0], 0)}${dieHTML(v.dice[1], 0)}</div>`
+  el.innerHTML = `
+    <div class="diceroll" aria-hidden="true">${dieHTML(v.dice[0], 0)}${dieHTML(v.dice[1], 0)}</div>
+    <div class="roll-label">${v.dice[0]} + ${v.dice[1]} = ${v.dice[0] + v.dice[1]}</div>`
   kickDiceAnimation()
+}
+
+// Compact turn strip, top-center — out of the 3D action's way.
+function updateTopbar(v: HostView): void {
+  const el = document.getElementById('topbar')
+  if (!el) return
+  const cur = v.players.find((p) => p.id === v.currentPlayerId)
+  if (v.phase === 'GAME_OVER') {
+    el.innerHTML = ''
+    return
+  }
+  const captions: string[] = []
+  if (v.pendingPurchase != null) captions.push(`Buy or auction ${BOARD[v.pendingPurchase].name}?`)
+  if (v.pendingTax) captions.push('Choosing how to pay Income Tax…')
+  if (v.trades.length > 0) captions.push(`${v.trades.length} trade offer${v.trades.length > 1 ? 's' : ''} on the table`)
+  if (v.phase === 'ROLL') captions.push('Roll on your phone')
+  el.innerHTML = `
+    ${cur ? `<div class="tb-turn">${cur.token} <b>${esc(cur.name)}</b>'s turn</div>` : ''}
+    <div class="tb-caps">${captions.map((c) => `<span class="tb-cap">${c}</span>`).join('')}</div>`
+}
+
+// Compact landed spotlight — lives in the queue column so the screen center
+// belongs to the 3D action.
+function landedCompact(v: HostView): string {
+  if (!v.lastLanded || v.lastLanded.playerId !== v.currentPlayerId) return ''
+  const i = v.lastLanded.space
+  const sp = BOARD[i]
+  const st = v.props[i]
+  let info = ''
+  if ('price' in sp && st) {
+    const owner = st.owner ? v.players.find((p) => p.id === st.owner) : null
+    if (owner) {
+      const badges =
+        (st.mortgaged ? ' · mortgaged' : '') +
+        (st.houses > 0 ? ` · ${st.houses === 5 ? 'hotel' : `${st.houses} house${st.houses > 1 ? 's' : ''}`}` : '')
+      info = `${owner.token} ${esc(owner.name)}${badges}`
+      if (owner.id !== v.currentPlayerId) {
+        const diceSum = v.dice ? v.dice[0] + v.dice[1] : 7
+        info += ` — rent $${rentFor(v, i, diceSum)}`
+      }
+    } else {
+      info = v.pendingPurchase === i ? 'unowned — buy or auction' : 'unowned'
+    }
+  } else if (sp.kind === 'chance' || sp.kind === 'chest') {
+    info = 'card space'
+  } else if (sp.kind === 'tax') {
+    info = sp.percent ? 'pay $200 or 10% of worth' : `pay $${sp.flat}`
+  } else if (sp.kind === 'go') {
+    info = 'collect $200'
+  } else if (sp.kind === 'jail') {
+    info = 'just visiting'
+  }
+  return `<div class="qlanded">
+    <div class="ql-head">LANDED</div>
+    <div class="ql-name" style="border-left: 4px solid ${stripColor(sp)}; padding-left: 6px;">${esc(sp.name)}${'price' in sp ? ` · $${sp.price}` : ''}</div>
+    <div class="ql-info">${info}</div>
+  </div>`
 }
 
 function updateQueue(v: HostView): void {
@@ -295,7 +354,8 @@ function updateQueue(v: HostView): void {
       <span class="qc">$${p.cash}</span>
     </div>`,
       )
-      .join('')}`
+      .join('')}
+    ${landedCompact(v)}`
 }
 
 function updateTicker(v: HostView): void {
@@ -406,7 +466,6 @@ function kickDiceAnimation(): void {
 function updateCenter(v: HostView): void {
   const el = document.getElementById('center')
   if (!el) return
-  const cur = v.players.find((p) => p.id === v.currentPlayerId)
 
   if (v.phase === 'GAME_OVER' || v.winner) {
     const winner = v.players.find((p) => p.id === v.winner)
@@ -481,16 +540,10 @@ function updateCenter(v: HostView): void {
     // reveal finished: fall through to the turn display below
   }
 
-  const captions: string[] = []
-  if (v.pendingPurchase != null) captions.push(`Buy or auction ${BOARD[v.pendingPurchase].name}?`)
-  if (v.pendingTax) captions.push('Choosing how to pay Income Tax…')
-  if (v.trades.length > 0) captions.push(`${v.trades.length} trade offer${v.trades.length > 1 ? 's' : ''} on the table`)
-  if (v.phase === 'ROLL') captions.push('Roll the dice!')
-
-  el.innerHTML = `
-    ${cur ? `<div class="turn">${cur.token} <b>${esc(cur.name)}</b>'s turn</div>` : ''}
-    ${landedCard(v)}
-    ${captions.map((c) => `<div class="sub">${c}</div>`).join('')}`
+  // Default state: the center of the screen belongs to the 3D scene —
+  // the piece strolling, the camera riding along. Turn info lives in the
+  // top strip; landed info in the queue column; dice in the side box.
+  el.innerHTML = ''
 }
 
 // ── god console ──

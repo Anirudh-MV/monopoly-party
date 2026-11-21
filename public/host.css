@@ -69,11 +69,47 @@ label { color: var(--dim); font-size: 14px; display: block; margin: 10px 0 4px; 
 .chip.sel { background: color-mix(in srgb, var(--accent) 22%, var(--panel)); border-color: var(--accent); }
 button.tiny { min-height: 30px; font-size: 12px; padding: 4px 8px; border-radius: 8px; }
 
-/* the dice live outside the re-rendered center so the tumble never restarts */
+/* the dice live outside the re-rendered center so the tumble never restarts;
+   tucked into the side with the rolled numbers spelled out */
 .dicebox {
-  position: absolute; left: 50%; bottom: 7%; transform: translateX(-50%);
-  z-index: 4; pointer-events: none;
+  position: absolute; right: 20px; bottom: 76px; z-index: 4;
+  pointer-events: none; text-align: center;
 }
+.dicebox .diceroll { transform: scale(0.68); transform-origin: center bottom; }
+.roll-label {
+  display: inline-block; margin-top: 6px;
+  font-size: 1.8vh; font-weight: 800; color: var(--ink);
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 4px 12px;
+}
+
+/* compact turn strip, top-center — out of the 3D action's way */
+.overlay.topbar {
+  position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+  z-index: 5; text-align: center; max-width: 48vw;
+}
+.tb-turn {
+  display: inline-block;
+  font-size: 2.3vh; font-weight: 800; color: var(--ink);
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 0.8vh 1.8vw; box-shadow: var(--shadow);
+}
+.tb-caps { margin-top: 6px; }
+.tb-cap {
+  display: inline-block; margin: 0 4px;
+  font-size: 1.6vh; color: var(--dim);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 3px 12px;
+}
+
+/* landed spotlight, inside the queue column */
+.qlanded { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
+.ql-head { color: var(--dim); font-size: 10px; letter-spacing: 0.22em; margin-bottom: 3px; }
+.ql-name { font-weight: 800; font-size: 15px; color: var(--ink); }
+.ql-info { color: var(--dim); font-size: 12px; margin-top: 2px; }
 
 /* ── god console drawer ── */
 .godpanel {
@@ -242,6 +278,7 @@ button:hover { filter: brightness(1.06); }
 }
 .center.gameover { background: radial-gradient(600px 400px at 50% 40%, rgba(251, 191, 36, 0.25) 0%, transparent 90%); }
 .center .turn, .center3d .turn { font-size: 3vh; font-weight: 700; color: var(--ink); }
+.center .dice span { font-size: 7vh; color: var(--ink); margin: 0 6px; }
 .center .sub { color: var(--dim); font-size: 1.8vh; }
 .center .banner { font-size: 2.4vh; font-weight: 700; padding: 1vh 2vw; border-radius: 12px; background: var(--panel); border: 1px solid var(--line); }
 .center .banner.debt { background: #fde8e8; color: #7f1d1d; border-color: #f5c6c6; }
