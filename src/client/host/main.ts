@@ -125,6 +125,9 @@ $app.addEventListener('click', (ev) => {
       if (!res.ok || !res.code || !res.hostToken) return
       localStorage.setItem(`mp-host-${res.code}`, res.hostToken)
       urls = res.urls ?? []
+      // The 'lobby' event arrived before this ack with urls still empty —
+      // repaint so the QR and join URL show the real address.
+      render()
     })
   } else if (el.dataset.act === 'start') {
     socket.emit('game:start', {}, (res: { ok: boolean; error?: string }) => {
