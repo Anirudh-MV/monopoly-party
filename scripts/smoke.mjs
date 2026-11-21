@@ -114,6 +114,7 @@ try {
         : acts.includes('buy') ? { type: 'buy' }
         : acts.includes('declineBuy') ? { type: 'declineBuy' }
         : acts.includes('payTax') ? { type: 'payTax', choice: 'flat' }
+        : acts.includes('passBid') ? { type: 'passBid' } // a declined buy starts an auction — pass to keep the script moving
         : acts.includes('endTurn') ? { type: 'endTurn' }
         : null
       if (!action) break
@@ -148,6 +149,24 @@ try {
   assert(phones[1].view != null && phones[1].view.you === phones[1].id, 'reconnected phone got its seat back')
 
   await playRounds(8, 'post-reconnect gameplay')
+
+  // ── a stale socket must not steal the crown ──
+  // The host's phone reconnects on a new socket; only afterwards does the
+  // OLD socket get closed (in real life socket.io notices ~45s later).
+  {
+    const old = phones[0].sock
+    const fresh = connect()
+    fresh.on('view', (v) => {
+      phones[0].view = v
+    })
+    const rres2 = await emitAck(fresh, 'room:rejoin', { token: phones[0].token })
+    assert(rres2.ok, 'host phone reconnected on a second socket')
+    phones[0].sock = fresh
+    await sleep(150)
+    old.disconnect() // the stale socket dies late
+    await sleep(300)
+    assert(lastHostView.hostId === phones[0].id, 'stale socket could not steal the crown')
+  }
 
   // ── god console ──
   // phones are never allowed in

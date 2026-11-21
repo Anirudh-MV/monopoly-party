@@ -15,7 +15,8 @@ import { applyAction, createGame, type PlayerMeta } from '../shared/engine.js'
 import { hostView, playerView } from '../shared/views.js'
 import { allowedActions, alivePlayers, netWorth } from '../shared/rules.js'
 import { TOKENS, stripEmoji } from '../shared/tokens.js'
-import type { Action, GameState, GodCommand, LobbyInfo, LobbyPlayer } from '../shared/types.js'
+import type { Action, GameState, LobbyInfo, LobbyPlayer } from '../shared/types.js'
+import { validAction, validCode, validGodCommand, validToken } from '../shared/validate.js'
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ' // no I/O — they confuse party guests
 const MAX_PLAYERS = 8
@@ -27,12 +28,23 @@ const ROOM_TTL_MS = 3 * 60 * 60 * 1000
 // stalled phone can never stall the table.
 const DEFAULT_TURN_TIMEOUT_MS = 300_000
 
+// Auction pacing: the opening window is more generous than the restarts —
+// every bid resets a short fuse, so the hammer only falls after real silence,
+// never mid-bidding-war.
+const AUCTION_OPEN_MS = 30_000
+const AUCTION_IDLE_MS = 15_000
+// How long a missing phone may hold up an auction before the server passes
+// on its behalf — long enough to survive a screen-lock blip, short enough
+// that one lost device can't stall the table.
+const AUCTION_DISCONNECT_GRACE_MS = 15_000
+
 const PLAYER_COLORS = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316', '#06b6d4', '#ec4899']
 
 interface PlayerEntry {
   meta: PlayerMeta
   token: string // rejoin secret, stored in the phone's localStorage
   socketId: string | null
+  disconnectedAt: number | null // when the live socket went away (grace timers)
 }
 
 interface Room {
@@ -60,11 +72,14 @@ const playerTokens = new Map<string, { code: string; playerId: string }>()
 let ioRef: IOServer | null = null
 
 function newCode(): string {
-  let c = ''
-  do {
-    c = Array.from({ length: 4 }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join('')
-  } while (rooms.has(c))
-  return c
+  // The 24^4 space holds ~330k codes — a few hundred attempts all colliding
+  // means the map is effectively full. Fail (the handler acks {ok:false})
+  // instead of spinning forever.
+  for (let i = 0; i < 500; i++) {
+    const c = Array.from({ length: 4 }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join('')
+    if (!rooms.has(c)) return c
+  }
+  throw new Error('room code space exhausted')
 }
 
 function hostRoom(code: string): string {
@@ -116,7 +131,60 @@ function promoteHostOnDisconnect(room: Room): void {
   if (!room.hostPlayerId) return
   const idx = room.players.findIndex((e) => e.meta.id === room.hostPlayerId)
   if (idx < 0) return
+  const n = room.players.length
+  // Prefer a player whose phone is actually at the table — the crown must
+  // never end up with someone who isn't there while someone else is.
+  for (let step = 1; step <= n; step++) {
+    const cand = room.players[(idx + step) % n]
+    if (cand && cand.socketId != null) {
+      room.hostPlayerId = cand.meta.id
+      return
+    }
+  }
   room.hostPlayerId = nextHostInQueue(room, idx)
+}
+
+// Nothing a client sends may take the process down: every socket handler and
+// every timer runs inside safe(), which turns a throw into a logged error
+// plus a {ok:false} ack — instead of a crash that kills every room at once.
+function safe(label: string, ack: unknown, fn: () => void): void {
+  try {
+    fn()
+  } catch (e) {
+    console.error(`[guard] ${label} threw:`, e)
+    if (typeof ack === 'function') {
+      try {
+        ack({ ok: false, error: 'Bad request' })
+      } catch {
+        /* client vanished mid-ack */
+      }
+    }
+  }
+}
+
+// A connection belongs to exactly one room. Attaching (create, hostJoin,
+// watch, join, rejoin) detaches from any previous room first, so a TV that
+// mints a second room can never receive two rooms' events mixed together,
+// and its god/start/settings always land in the room it currently shows.
+function leaveCurrentRoom(io: IOServer, socket: Socket, data: SocketData): void {
+  const room = data.code ? rooms.get(data.code) : undefined
+  if (!room) return
+  if (data.role === 'host' || data.role === 'watcher') {
+    socket.leave(hostRoom(room.code))
+    room.hostSockets.delete(socket.id)
+  }
+  if (data.role === 'player' && data.playerId) {
+    socket.leave(playerRoom(room.code, data.playerId))
+    const e = room.players.find((x) => x.meta.id === data.playerId)
+    if (e && e.socketId === socket.id) {
+      e.socketId = null
+      e.disconnectedAt = Date.now()
+    }
+  }
+  data.code = undefined
+  data.role = undefined
+  data.playerId = undefined
+  broadcast(room, io)
 }
 
 function broadcastLobby(io: IOServer, room: Room): void {
@@ -127,23 +195,34 @@ function broadcastLobby(io: IOServer, room: Room): void {
 }
 
 function broadcastGame(io: IOServer, room: Room): void {
-  const s = room.state
+  let s = room.state
   if (!s) return
 
-  // Safety: if a phone is disconnected mid-auction, auto-pass on its behalf
-  // so a missing device can never stall the whole table.
+  // Safety: a phone that has been gone for a while mid-auction is auto-passed
+  // so a missing device can never stall the table — but a screen-lock blip
+  // gets a grace period first. Copy-and-commit, like every other state
+  // change: a failed pass never leaves half-applied state behind.
   if (s.phase === 'AUCTION' && s.auction) {
+    const due: Array<[string, Action]> = []
     for (const e of room.players) {
       const p = s.players.find((q) => q.id === e.meta.id)
       if (
         p &&
         !p.bankrupt &&
         e.socketId == null &&
+        e.disconnectedAt != null &&
+        Date.now() - e.disconnectedAt >= AUCTION_DISCONNECT_GRACE_MS &&
         !s.auction.passed.includes(p.id) &&
         s.auction.bidder !== p.id
       ) {
-        applyAction(s, { type: 'passBid' }, p.id)
+        due.push([p.id, { type: 'passBid' }])
       }
+    }
+    if (due.length > 0) {
+      const next = structuredClone(s)
+      for (const [by, act] of due) applyAction(next, act, by)
+      room.state = next
+      s = next
     }
   }
 
@@ -234,7 +313,11 @@ function currentDecision(s: GameState): Decision | null {
     return { key: `end:${s.turn}:${s.currentPlayerId}`, playerId: s.currentPlayerId }
   }
   if (s.phase === 'DEBT' && s.debt) return { key: `debt:${s.turn}:${s.debt.debtor}`, playerId: s.debt.debtor }
-  if (s.phase === 'AUCTION' && s.auction) return { key: `auc:${s.turn}:${s.auction.space}`, playerId: null }
+  if (s.phase === 'AUCTION' && s.auction) {
+    // The bid and bidder are in the key so every new bid restarts the clock
+    // — the hammer falls only after real silence, never mid-bidding-war.
+    return { key: `auc:${s.turn}:${s.auction.space}:${s.auction.bid}:${s.auction.bidder ?? '-'}`, playerId: null }
+  }
   return null
 }
 
@@ -265,17 +348,12 @@ function autoActionsFor(room: Room, d: Decision): Array<[string, Action]> {
 function scheduleDeadline(room: Room): void {
   const s = room.state
   if (!s) return
-  if (room.turnTimeoutMs <= 0) {
-    // Host disabled the decision clock entirely.
-    if (room.timer) clearTimeout(room.timer)
-    room.timer = null
-    room.timerKey = null
-    s.deadline = null
-    s.deadlineFor = null
-    return
-  }
   const decision = currentDecision(s)
-  if (!decision) {
+  // Arrests run on a fixed 30-second clock even when the host has disabled
+  // the general decision timer — the two-step arrest must never strand.
+  const jailClock = decision != null && decision.key.startsWith('jail:')
+  if (!decision || (room.turnTimeoutMs <= 0 && !jailClock)) {
+    // Host disabled the decision clock entirely (and no arrest is pending).
     if (room.timer) clearTimeout(room.timer)
     room.timer = null
     room.timerKey = null
@@ -286,29 +364,34 @@ function scheduleDeadline(room: Room): void {
   if (room.timerKey === decision.key) return // already ticking for this decision
   if (room.timer) clearTimeout(room.timer)
   room.timerKey = decision.key
-  // Arrests run on a fixed 30-second clock even when the general decision
-  // timer is disabled by the host.
-  const duration = decision.key.startsWith('jail:') ? 30_000 : room.turnTimeoutMs
+  // Auctions: a generous opening window, then a short fuse that every bid
+  // resets. Other decisions run on the host-configured clock.
+  const auctionIdle = s.auction != null && (s.auction.bidder != null || s.auction.bid > 0)
+  const duration = jailClock ? 30_000 : decision.key.startsWith('auc:')
+    ? Math.min(room.turnTimeoutMs, auctionIdle ? AUCTION_IDLE_MS : AUCTION_OPEN_MS)
+    : room.turnTimeoutMs
   s.deadline = Date.now() + duration
   s.deadlineFor = decision.playerId
   room.timer = setTimeout(() => {
-    room.timer = null
-    const key = room.timerKey
-    room.timerKey = null
-    const st = room.state
-    if (!st || key !== decision.key) return // decision already resolved
-    if (decision.playerId != null) {
-      applyServerAction(room, autoActionsFor(room, decision))
-    } else {      // Auction silence: pass everyone who could still bid — the hammer falls.
-      const au = st.auction
-      if (!au) return
-      for (const q of alivePlayers(st)) {
-        if (!au.passed.includes(q.id) && q.id !== au.bidder) {
-          applyServerAction(room, [[q.id, { type: 'passBid' }]])
-          if (!room.state || room.state.phase !== 'AUCTION') break
+    safe(`deadline ${decision.key}`, undefined, () => {
+      room.timer = null
+      const key = room.timerKey
+      room.timerKey = null
+      const st = room.state
+      if (!st || key !== decision.key) return // decision already resolved
+      if (decision.playerId != null) {
+        applyServerAction(room, autoActionsFor(room, decision))
+      } else {      // Auction silence: pass everyone who could still bid — the hammer falls.
+        const au = st.auction
+        if (!au) return
+        for (const q of alivePlayers(st)) {
+          if (!au.passed.includes(q.id) && q.id !== au.bidder) {
+            applyServerAction(room, [[q.id, { type: 'passBid' }]])
+            if (!room.state || room.state.phase !== 'AUCTION') break
+          }
         }
       }
-    }
+    })
   }, duration)
 }
 
@@ -362,18 +445,65 @@ function serializeRoom(room: Room): RoomSnapshot {
 
 let SNAP_DIR = 'snapshots'
 
-async function saveRoom(room: Room): Promise<void> {
-  try {
-    await fsp.mkdir(SNAP_DIR, { recursive: true })
-    await fsp.writeFile(path.join(SNAP_DIR, `${room.code}.json`), JSON.stringify(serializeRoom(room)))
-  } catch (e) {
-    console.error(`[snapshots] failed to save ${room.code}:`, e)
-  }
+// Serialized, atomic snapshot writes. Rooms are marked dirty and flushed in
+// batches: one write in flight at a time, each written to a temp file and
+// renamed into place — so bursts of updates coalesce, and a crash mid-write
+// can never leave a half-written JSON behind for the restore to choke on.
+const dirtyRooms = new Set<Room>()
+let flushing = false
+let flushChain: Promise<void> = Promise.resolve()
+
+function flushSnapshot(room: Room): Promise<void> {
+  const file = path.join(SNAP_DIR, `${room.code}.json`)
+  const tmp = `${file}.tmp`
+  return fsp
+    .mkdir(SNAP_DIR, { recursive: true })
+    .then(() => fsp.writeFile(tmp, JSON.stringify(serializeRoom(room))))
+    .then(() => fsp.rename(tmp, file))
+}
+
+function saveRoom(room: Room): void {
+  dirtyRooms.add(room)
+  if (flushing) return // a flush is already draining — this mark rides it
+  flushing = true
+  flushChain = flushChain
+    .then(async () => {
+      // Let a burst of updates coalesce before the first disk write.
+      await new Promise((r) => setTimeout(r, 250))
+      while (dirtyRooms.size > 0) {
+        const batch = [...dirtyRooms]
+        dirtyRooms.clear()
+        for (const r of batch) {
+          try {
+            await flushSnapshot(r)
+          } catch (e) {
+            console.error(`[snapshots] failed to save ${r.code}:`, e)
+          }
+        }
+      }
+    })
+    .catch(() => {})
+    .finally(() => {
+      flushing = false
+      // anything marked while the last write was closing gets a new flush
+      if (dirtyRooms.size > 0) {
+        const first = dirtyRooms.values().next().value
+        if (first) saveRoom(first)
+      }
+    })
 }
 
 function loadSnapshots(): void {
   try {
     mkdirSync(SNAP_DIR, { recursive: true })
+    // Orphaned temp files from a crash mid-write are never valid state.
+    for (const f of readdirSync(SNAP_DIR).filter((x) => x.endsWith('.tmp'))) {
+      try {
+        unlinkSync(path.join(SNAP_DIR, f))
+      } catch {
+        /* already gone */
+      }
+    }
     for (const f of readdirSync(SNAP_DIR).filter((x) => x.endsWith('.json'))) {
       try {
         const raw = JSON.parse(readFileSync(path.join(SNAP_DIR, f), 'utf8')) as RoomSnapshot
@@ -382,10 +512,12 @@ function loadSnapshots(): void {
           code: raw.code,
           hostToken: String(raw.hostToken ?? ''),
           hostPlayerId: raw.hostPlayerId ?? null,
-          turnTimeoutMs: Number(raw.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS),
+          turnTimeoutMs: Number.isFinite(Number(raw.turnTimeoutMs))
+            ? Math.max(0, Math.min(3_600_000, Math.floor(Number(raw.turnTimeoutMs))))
+            : DEFAULT_TURN_TIMEOUT_MS,
           state: raw.state ?? null,
           hostSockets: new Set(),
-          players: raw.players.map((e) => ({ meta: e.meta, token: e.token, socketId: null })),
+          players: raw.players.map((e) => ({ meta: e.meta, token: e.token, socketId: null, disconnectedAt: null })),
           lastActive: Date.now(),
           timer: null,
           timerKey: null,
@@ -434,12 +566,16 @@ function restoreRoomFromSnapshot(room: Room, data: unknown): boolean {
   // re-key rejoin tokens to the incoming seats
   for (const [tok, ref] of playerTokens) if (ref.code === room.code) playerTokens.delete(tok)
   room.hostPlayerId = (d.hostPlayerId as string | null) ?? null
-  room.turnTimeoutMs = Number(d.turnTimeoutMs ?? room.turnTimeoutMs)
+  const rawTimeout = Number(d.turnTimeoutMs ?? room.turnTimeoutMs)
+  room.turnTimeoutMs = Number.isFinite(rawTimeout)
+    ? Math.max(0, Math.min(3_600_000, Math.floor(rawTimeout)))
+    : room.turnTimeoutMs
   room.players = (d.players as Array<{ meta: PlayerMeta; token: string }>).map((e) => ({
     meta: e.meta,
     token: e.token,
     // same-room imports keep live sockets attached to their seats
     socketId: prevConnected.get(e.meta.id) ?? null,
+    disconnectedAt: null,
   }))
   for (const e of room.players) playerTokens.set(e.token, { code: room.code, playerId: e.meta.id })
   room.state = st
@@ -457,8 +593,21 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       if (room) room.lastActive = Date.now()
     })
 
+    // Register a handler that can never take the process down: safe() turns
+    // any throw into a logged error plus a {ok:false} ack. The ack is
+    // whichever argument arrived as a function — most events are
+    // (payload, ack), a few are (ack) only.
+    const on = (ev: string, handler: (raw: unknown, ack?: (res: unknown) => void) => void): void => {
+      socket.on(ev, (...args: unknown[]) => {
+        const ack = args.find((a): a is (res: unknown) => void => typeof a === 'function')
+        safe(ev, ack, () => handler(args[0], ack))
+      })
+    }
+
     // ── TV ──
-    socket.on('room:create', (ack?: (res: unknown) => void) => {
+    on('room:create', (_raw: unknown, ack?: (res: unknown) => void) => {
+      // Well-formed TVs emit only the ack; a payload in that slot is
+      // simply ignored (the ack is picked out by the registrar).
       const room: Room = {
         code: newCode(),
         hostToken: randomUUID(),
@@ -473,6 +622,8 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
         watchdogBusy: false,
       }
       rooms.set(room.code, room)
+      // one connection, one room: detach from any previous room first
+      leaveCurrentRoom(io, socket, data)
       socket.join(hostRoom(room.code))
       room.hostSockets.add(socket.id)
       data.code = room.code
@@ -481,12 +632,15 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       ack?.({ ok: true, code: room.code, hostToken: room.hostToken, urls: getJoinUrls() })
     })
 
-    socket.on('room:hostJoin', (payload: { code?: string; hostToken?: string }, ack?: (res: unknown) => void) => {
-      const room = rooms.get(String(payload?.code ?? '').toUpperCase())
-      if (!room || room.hostToken !== payload?.hostToken) {
-        ack?.({ ok: false, error: 'Room not found' })
-        return
+    on('room:hostJoin', (raw: unknown, ack?: (res: unknown) => void) => {
+      const code = validCode((raw as { code?: unknown } | null | undefined)?.code)
+      const hostToken = validToken((raw as { hostToken?: unknown } | null | undefined)?.hostToken)
+      if (!code || !hostToken) return ack?.({ ok: false, error: 'Room not found' })
+      const room = rooms.get(code)
+      if (!room || room.hostToken !== hostToken) {
+        return ack?.({ ok: false, error: 'Room not found' })
       }
+      leaveCurrentRoom(io, socket, data)
       socket.join(hostRoom(room.code))
       room.hostSockets.add(socket.id)
       data.code = room.code
@@ -499,9 +653,12 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
     // Extra TVs: mirror the room on any other screen. The watcher joins the
     // host broadcast room but NEVER hostSockets — god, start and settings
     // check that set, so mirrored screens are view-only by construction.
-    socket.on('room:watch', (payload: { code?: string }, ack?: (res: unknown) => void) => {
-      const room = rooms.get(String(payload?.code ?? '').toUpperCase())
+    on('room:watch', (raw: unknown, ack?: (res: unknown) => void) => {
+      const code = validCode((raw as { code?: unknown } | null | undefined)?.code)
+      if (!code) return ack?.({ ok: false, error: 'Room not found' })
+      const room = rooms.get(code)
       if (!room) return ack?.({ ok: false, error: 'Room not found' })
+      leaveCurrentRoom(io, socket, data)
       socket.join(hostRoom(room.code))
       data.code = room.code
       data.role = 'watcher'
@@ -511,67 +668,72 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
     })
 
     // ── Phones ──
-    socket.on(
-      'room:join',
-      (payload: { code?: string; name?: string; piece?: string }, ack?: (res: unknown) => void) => {
-        const room = rooms.get(String(payload?.code ?? '').toUpperCase())
-        if (!room) return ack?.({ ok: false, error: 'No room with that code' })
-        if (room.state) return ack?.({ ok: false, error: 'That game already started' })
-        if (room.players.length >= MAX_PLAYERS) return ack?.({ ok: false, error: 'Room is full (8 players)' })
+    on('room:join', (raw: unknown, ack?: (res: unknown) => void) => {
+      const p = (raw ?? {}) as { code?: unknown; name?: unknown; piece?: unknown }
+      const code = validCode(p.code)
+      if (!code) return ack?.({ ok: false, error: 'No room with that code' })
+      const room = rooms.get(code)
+      if (!room) return ack?.({ ok: false, error: 'No room with that code' })
+      if (room.state) return ack?.({ ok: false, error: 'That game already started' })
+      if (room.players.length >= MAX_PLAYERS) return ack?.({ ok: false, error: 'Room is full (8 players)' })
 
-        // Names never carry emojis — strip server-side, never trust the client.
-        const name = stripEmoji(String(payload?.name ?? '')).slice(0, 16)
-        if (name.length < 1) return ack?.({ ok: false, error: 'Enter your name (letters and numbers)' })
-        if (room.players.some((e) => e.meta.name.toLowerCase() === name.toLowerCase())) {
-          return ack?.({ ok: false, error: 'Someone already took that name' })
+      // Names never carry emojis — strip server-side, never trust the client.
+      const name = stripEmoji(typeof p.name === 'string' ? p.name : '').slice(0, 16)
+      if (name.length < 1) return ack?.({ ok: false, error: 'Enter your name (letters and numbers)' })
+      if (room.players.some((e) => e.meta.name.toLowerCase() === name.toLowerCase())) {
+        return ack?.({ ok: false, error: 'Someone already took that name' })
+      }
+
+      // Piece: must come from the allowed list and be unique in the room.
+      // Missing/invalid piece falls back to the first free one (keeps
+      // old clients and the smoke test working).
+      const wanted = typeof p.piece === 'string' ? p.piece : ''
+      let piece: string
+      if (wanted && TOKENS.includes(wanted)) {
+        if (room.players.some((e) => e.meta.token === wanted)) {
+          return ack?.({ ok: false, error: `${wanted} is already taken — pick another piece` })
         }
+        piece = wanted
+      } else {
+        piece = TOKENS.find((t) => !room.players.some((e) => e.meta.token === t)) ?? TOKENS[0]
+      }
 
-        // Piece: must come from the allowed list and be unique in the room.
-        // Missing/invalid piece falls back to the first free one (keeps
-        // old clients and the smoke test working).
-        const wanted = String(payload?.piece ?? '')
-        let piece: string
-        if (wanted && TOKENS.includes(wanted)) {
-          if (room.players.some((e) => e.meta.token === wanted)) {
-            return ack?.({ ok: false, error: `${wanted} is already taken — pick another piece` })
-          }
-          piece = wanted
-        } else {
-          piece = TOKENS.find((t) => !room.players.some((e) => e.meta.token === t)) ?? TOKENS[0]
-        }
+      const seat = room.players.length
+      const meta: PlayerMeta = {
+        id: randomUUID(),
+        name,
+        color: PLAYER_COLORS[seat % PLAYER_COLORS.length],
+        token: piece,
+      }
+      const entry: PlayerEntry = { meta, token: randomUUID(), socketId: socket.id, disconnectedAt: null }
+      room.players.push(entry)
+      playerTokens.set(entry.token, { code: room.code, playerId: meta.id })
 
-        const seat = room.players.length
-        const meta: PlayerMeta = {
-          id: randomUUID(),
-          name,
-          color: PLAYER_COLORS[seat % PLAYER_COLORS.length],
-          token: piece,
-        }
-        const entry: PlayerEntry = { meta, token: randomUUID(), socketId: socket.id }
-        room.players.push(entry)
-        playerTokens.set(entry.token, { code: room.code, playerId: meta.id })
+      // First joiner is the party host by default.
+      if (!room.hostPlayerId) room.hostPlayerId = meta.id
 
-        // First joiner is the party host by default.
-        if (!room.hostPlayerId) room.hostPlayerId = meta.id
+      leaveCurrentRoom(io, socket, data)
+      socket.join(playerRoom(room.code, meta.id))
+      data.code = room.code
+      data.role = 'player'
+      data.playerId = meta.id
+      broadcastLobby(io, room)
+      ack?.({ ok: true, code: room.code, playerId: meta.id, token: entry.token })
+    })
 
-        socket.join(playerRoom(room.code, meta.id))
-        data.code = room.code
-        data.role = 'player'
-        data.playerId = meta.id
-        broadcastLobby(io, room)
-        ack?.({ ok: true, code: room.code, playerId: meta.id, token: entry.token })
-      },
-    )
-
-    socket.on('room:rejoin', (payload: { token?: string }, ack?: (res: unknown) => void) => {
-      const t = playerTokens.get(String(payload?.token ?? ''))
+    on('room:rejoin', (raw: unknown, ack?: (res: unknown) => void) => {
+      const token = validToken((raw as { token?: unknown } | null | undefined)?.token)
+      if (!token) return ack?.({ ok: false, error: 'Session expired — rejoin with the room code' })
+      const t = playerTokens.get(token)
       if (!t) return ack?.({ ok: false, error: 'Session expired — rejoin with the room code' })
       const room = rooms.get(t.code)
       const entry = room?.players.find((e) => e.meta.id === t.playerId)
       if (!room || !entry) return ack?.({ ok: false, error: 'Session expired — rejoin with the room code' })
 
+      leaveCurrentRoom(io, socket, data)
       socket.join(playerRoom(room.code, entry.meta.id))
       entry.socketId = socket.id
+      entry.disconnectedAt = null
       data.code = room.code
       data.role = 'player'
       data.playerId = entry.meta.id
@@ -579,7 +741,7 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       ack?.({ ok: true, code: room.code, playerId: entry.meta.id })
     })
 
-    socket.on('room:leave', (_payload: unknown, ack?: (res: unknown) => void) => {
+    on('room:leave', (_raw: unknown, ack?: (res: unknown) => void) => {
       const room = data.code ? rooms.get(data.code) : undefined
       if (!room || data.role !== 'player' || room.state) return ack?.({ ok: false })
       const idx = room.players.findIndex((e) => e.meta.id === data.playerId)
@@ -593,24 +755,22 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
     })
 
     // ── Party host powers (migratable player role) ──
-    socket.on(
-      'game:handOver',
-      (payload: { to?: string }, ack?: (res: unknown) => void) => {
-        const room = data.code ? rooms.get(data.code) : undefined
-        if (!room || room.state) return ack?.({ ok: false, error: 'Only in the lobby' })
-        if (data.role !== 'player' || !data.playerId || data.playerId !== room.hostPlayerId) {
-          return ack?.({ ok: false, error: 'Only the host can do that' })
-        }
-        const target = room.players.find((e) => e.meta.id === payload?.to)
-        if (!target || target.meta.id === data.playerId) return ack?.({ ok: false, error: 'Pick another player' })
-        room.hostPlayerId = target.meta.id
-        broadcastLobby(io, room)
-        ack?.({ ok: true })
-      },
-    )
+    on('game:handOver', (raw: unknown, ack?: (res: unknown) => void) => {
+      const room = data.code ? rooms.get(data.code) : undefined
+      if (!room || room.state) return ack?.({ ok: false, error: 'Only in the lobby' })
+      if (data.role !== 'player' || !data.playerId || data.playerId !== room.hostPlayerId) {
+        return ack?.({ ok: false, error: 'Only the host can do that' })
+      }
+      const to = typeof (raw as { to?: unknown })?.to === 'string' ? (raw as { to?: string }).to : ''
+      const target = room.players.find((e) => e.meta.id === to)
+      if (!target || target.meta.id === data.playerId) return ack?.({ ok: false, error: 'Pick another player' })
+      room.hostPlayerId = target.meta.id
+      broadcastLobby(io, room)
+      ack?.({ ok: true })
+    })
 
     // ── Game flow ──
-    socket.on('game:start', (_payload: unknown, ack?: (res: unknown) => void) => {
+    on('game:start', (_raw: unknown, ack?: (res: unknown) => void) => {
       const room = data.code ? rooms.get(data.code) : undefined
       if (!room) return ack?.({ ok: false, error: 'Room not found' })
       const isTvHost = room.hostSockets.has(socket.id)
@@ -623,7 +783,11 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       ack?.({ ok: true })
     })
 
-    socket.on('game:action', (action: Action, ack?: (res: unknown) => void) => {
+    on('game:action', (raw: unknown, ack?: (res: unknown) => void) => {
+      // The engine is I/O-free and trusts its inputs; the boundary check
+      // here is what makes that safe. Nothing malformed reaches applyAction.
+      const action = validAction(raw)
+      if (!action) return ack?.({ ok: false, error: 'Malformed action' })
       const room = data.code ? rooms.get(data.code) : undefined
       if (!room?.state) return ack?.({ ok: false, error: 'No game running' })
       if (data.role !== 'player' || !data.playerId) return ack?.({ ok: false, error: 'Players only' })
@@ -641,16 +805,21 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
     })
 
     // ── Host lobby settings ──
-    socket.on(
+    on(
       'room:settings',
-      (payload: { turnTimeoutMs?: number }, ack?: (res: unknown) => void) => {
+      (raw: unknown, ack?: (res: unknown) => void) => {
         const room = data.code ? rooms.get(data.code) : undefined
         if (!room) return ack?.({ ok: false, error: 'Room not found' })
         const isTvHost = room.hostSockets.has(socket.id)
         const isPartyHost = data.role === 'player' && data.playerId === room.hostPlayerId
         if (!isTvHost && !isPartyHost) return ack?.({ ok: false, error: 'Hosts only' })
-        const raw = Number(payload?.turnTimeoutMs)
-        const ms = Number.isFinite(raw) ? Math.max(0, Math.min(3_600_000, Math.floor(raw))) : room.turnTimeoutMs
+        const rawMs = (raw as { turnTimeoutMs?: unknown } | null | undefined)?.turnTimeoutMs
+        // Whole minutes-of-seconds only: no NaN, no strings, no floats.
+        const ms =
+          typeof rawMs === 'number' && Number.isInteger(rawMs)
+            ? Math.max(0, Math.min(3_600_000, rawMs))
+            : null
+        if (ms === null) return ack?.({ ok: false, error: 'Bad timer value' })
         room.turnTimeoutMs = ms
         if (room.state) {
           godMutate(io, room, `decision timer ${ms === 0 ? 'disabled' : `set to ${Math.round(ms / 1000)}s`}`, () => {})
@@ -663,11 +832,15 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
     )
 
     // ── God console (TV hosts only) ──
-    socket.on('god:command', (payload: GodCommand, ack?: (res: unknown) => void) => {
+    on('god:command', (raw: unknown, ack?: (res: unknown) => void) => {
       const room = data.code ? rooms.get(data.code) : undefined
       if (!room || !room.hostSockets.has(socket.id)) {
         return ack?.({ ok: false, error: 'The god console is only available on the TV screen' })
       }
+      // God payloads are validated like everything else — a hostile or
+      // half-broken TV browser must not write NaN into the state either.
+      const payload = validGodCommand(raw)
+      if (!payload) return ack?.({ ok: false, error: 'Unknown god command' })
       const s = room.state
 
       switch (payload.cmd) {
@@ -883,32 +1056,43 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
     })
 
     socket.on('disconnect', () => {
-      const room = data.code ? rooms.get(data.code) : undefined
-      if (!room) return
-      if (data.role === 'host') room.hostSockets.delete(socket.id)
-      if (data.role === 'player') {
-        const e = room.players.find((x) => x.meta.id === data.playerId)
-        if (e && e.socketId === socket.id) e.socketId = null
-        // The party crown never goes dark: hand it down the queue.
-        if (data.playerId === room.hostPlayerId) promoteHostOnDisconnect(room)
-      }
-      broadcast(room, io)
+      safe('disconnect', undefined, () => {
+        const room = data.code ? rooms.get(data.code) : undefined
+        if (!room) return
+        if (data.role === 'host') room.hostSockets.delete(socket.id)
+        if (data.role === 'player') {
+          const e = room.players.find((x) => x.meta.id === data.playerId)
+          // Only the player's CURRENT connection counts: a stale socket
+          // dying long after the phone already reconnected (socket.io
+          // notices ~45s later) must not touch the seat or steal the crown.
+          const wasCurrent = e != null && e.socketId === socket.id
+          if (wasCurrent) {
+            e.socketId = null
+            e.disconnectedAt = Date.now()
+          }
+          // The party crown never goes dark: hand it down the queue.
+          if (wasCurrent && data.playerId === room.hostPlayerId) promoteHostOnDisconnect(room)
+        }
+        broadcast(room, io)
+      })
     })
   })
 
   // Idle-room cleanup so a night of partying doesn't leak memory.
   setInterval(() => {
-    const now = Date.now()
-    for (const [code, room] of rooms) {
-      if (now - room.lastActive > ROOM_TTL_MS && room.hostSockets.size === 0) {
-        rooms.delete(code)
-        for (const [tok, ref] of playerTokens) if (ref.code === code) playerTokens.delete(tok)
-        try {
-          unlinkSync(path.join(SNAP_DIR, `${code}.json`))
-        } catch {
-          /* already gone */
+    safe('idle-room cleanup', undefined, () => {
+      const now = Date.now()
+      for (const [code, room] of rooms) {
+        if (now - room.lastActive > ROOM_TTL_MS && room.hostSockets.size === 0) {
+          rooms.delete(code)
+          for (const [tok, ref] of playerTokens) if (ref.code === code) playerTokens.delete(tok)
+          try {
+            unlinkSync(path.join(SNAP_DIR, `${code}.json`))
+          } catch {
+            /* already gone */
+          }
         }
       }
-    }
+    })
   }, 15 * 60 * 1000).unref?.()
 }

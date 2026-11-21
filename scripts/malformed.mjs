@@ -1,0 +1,286 @@
+// Network-layer hardening test: boots the real server and throws malformed,
+// hostile and half-broken payloads at EVERY message type — wrong shapes,
+// missing fields, wrong-typed fields, huge strings, fractional numbers,
+// prototype-pollution attempts, and the known crash vectors from the
+// security review. The server must survive it all, reject everything with
+// {ok:false} (or a silent no-op where no ack exists), and keep playing a
+// normal game afterwards. Run: npm run malformed
+//
+// Server must stay up: this is the one property under test.
+
+import { spawn } from 'node:child_process'
+import { io } from 'socket.io-client'
+
+const PORT = 3124
+const URL = `http://localhost:${PORT}`
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+let failed = 0
+function assert(cond, msg) {
+  if (cond) console.log(`  \u2713 ${msg}`)
+  else {
+    failed++
+    console.error(`  \u2717 ${msg}`)
+  }
+}
+
+function connect() {
+  return io(URL, { reconnection: false })
+}
+function emitAck(sock, event, ...args) {
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve({ ok: false, error: 'no ack' }), 5000)
+    sock.emit(event, ...args, (res) => {
+      clearTimeout(t)
+      resolve(res ?? { ok: false, error: 'no ack' })
+    })
+  })
+}
+
+console.log('booting server …')
+const server = spawn(process.execPath, ['dist/server/index.js'], {
+  env: { ...process.env, PORT: String(PORT), SNAP_DIR: 'snapshots-test' },
+  stdio: ['ignore', 'pipe', 'pipe'],
+})
+server.stdout.on('data', (d) => process.stdout.write(d))
+server.stderr.on('data', (d) => process.stderr.write(d))
+server.on('exit', (code) => {
+  server.dead = true
+})
+
+let banner = ''
+await new Promise((resolve, reject) => {
+  const t = setTimeout(() => reject(new Error('server did not announce itself within 20s')), 20000)
+  server.stdout.on('data', (d) => {
+    banner += String(d)
+    if (banner.includes('localhost')) {
+      clearTimeout(t)
+      resolve()
+    }
+  })
+  server.on('exit', (code) => {
+    clearTimeout(t)
+    reject(new Error(`server exited early (code ${code}) — is port ${PORT} already in use?`))
+  })
+})
+
+try {
+  const alive = () => !server.dead
+
+  // ── stage a normal game so payloads have something to bite ──
+  const tv = connect()
+  const created = await emitAck(tv, 'room:create')
+  assert(created.ok, 'room created')
+  const code = created.code
+  const players = []
+  for (const n of ['Maya', 'Leo', 'Sam']) {
+    const s = connect()
+    const res = await emitAck(s, 'room:join', { code, name: n })
+    assert(res.ok, `phone joined as ${n}`)
+    players.push({ sock: s, id: res.playerId, view: null })
+  }
+  for (const p of players) p.sock.on('view', (v) => { p.view = v })
+  let hv = null
+  tv.on('view', (v) => { hv = v })
+  const started = await emitAck(tv, 'game:start', {})
+  assert(started.ok, 'game started')
+
+  // ── the battery ──
+  const BIG = 'x'.repeat(100_000)
+
+  const badActions = [
+    null,
+    undefined,
+    42,
+    'roll',
+    true,
+    [],
+    {},
+    { type: null },
+    { type: 7 },
+    { type: 'roll', extra: BIG },
+    { type: 'roll', __proto__: null },
+    { type: 'nope' },
+    { type: 'bid' },
+    { type: 'bid', amount: 'ten' },
+    { type: 'bid', amount: NaN },
+    { type: 'bid', amount: 0 },
+    { type: 'bid', amount: -5 },
+    { type: 'bid', amount: 1.5 },
+    { type: 'bid', amount: 1e15 },
+    { type: 'bid', amount: { value: 10 } },
+    { type: 'buyHouse' },
+    { type: 'buyHouse', space: -1 },
+    { type: 'buyHouse', space: 40 },
+    { type: 'buyHouse', space: 5.5 },
+    { type: 'buyHouse', space: '5' },
+    { type: 'mortgage', space: 1e9 },
+    { type: 'payTax' },
+    { type: 'payTax', choice: 'sometimes' },
+    { type: 'payTax', choice: null },
+    { type: 'proposeTrade', to: players[1].id }, // missing give/receive — crashed the server pre-fix
+    { type: 'proposeTrade', to: players[1].id, give: null, receive: null },
+    { type: 'proposeTrade', to: players[1].id, give: {}, receive: {} },
+    { type: 'proposeTrade', to: players[1].id, give: { cash: 'abc', spaces: [], jailCards: 0 }, receive: { cash: 0, spaces: [], jailCards: 0 } }, // NaN-poison pre-fix
+    { type: 'proposeTrade', to: players[1].id, give: { cash: 0, spaces: [], jailCards: 0.5 }, receive: { cash: 0, spaces: [], jailCards: 0 } },
+    { type: 'proposeTrade', to: players[1].id, give: { cash: -1, spaces: [], jailCards: 0 }, receive: { cash: 0, spaces: [], jailCards: 0 } },
+    { type: 'proposeTrade', to: players[1].id, give: { cash: 0, spaces: [3, 3], jailCards: 0 }, receive: { cash: 0, spaces: [], jailCards: 0 } },
+    { type: 'proposeTrade', to: players[1].id, give: { cash: 0, spaces: 'nope', jailCards: 0 }, receive: { cash: 0, spaces: [], jailCards: 0 } },
+    { type: 'proposeTrade', to: players[1].id, give: { cash: 0, spaces: [], jailCards: 9 }, receive: { cash: 0, spaces: [], jailCards: 0 } },
+    { type: 'proposeTrade', to: BIG, give: { cash: 0, spaces: [], jailCards: 0 }, receive: { cash: 0, spaces: [], jailCards: 0 } },
+    { type: 'respondTrade' },
+    { type: 'respondTrade', tradeId: 5, accept: 'yes' },
+    { type: 'respondTrade', tradeId: 't', accept: 1 },
+    { type: 'cancelTrade', tradeId: { deep: { deeper: [BIG] } } },
+    { type: { type: 'type' } },
+    { __proto__: { type: 'roll' } },
+  ]
+
+  let rejected = 0
+  const brief = (x) => String(JSON.stringify(x ?? null)).slice(0, 48)
+  for (const bad of badActions) {
+    // any connected player sends it; who sends it must not matter
+    const sender = players[Math.floor(Math.random() * players.length)].sock
+    const res = await emitAck(sender, 'game:action', bad)
+    if (!res.ok) rejected++
+    else console.log('      NOTE: accepted', brief(bad), '→ likely a legal move, fine')
+    assert(alive(), `server alive after ${brief(bad)}`)
+  }
+  assert(rejected >= badActions.length - 3, `malformed actions rejected (${rejected}/${badActions.length} — a couple may be legal moves)`)
+
+  // ── hostile god commands from the TV (valid seat) ──
+  const badGods = [
+    null,
+    'skipTurn',
+    { cmd: null },
+    { cmd: 'nope' },
+    { cmd: 'setCash' },
+    { cmd: 'setCash', playerId: players[0].id }, // missing amount
+    { cmd: 'setCash', playerId: players[0].id, amount: 'rich' }, // NaN pre-fix
+    { cmd: 'setCash', playerId: players[0].id, amount: 1.5 },
+    { cmd: 'setCash', playerId: players[0].id, amount: -1 },
+    { cmd: 'setCash', playerId: BIG, amount: 100 },
+    { cmd: 'setPos', playerId: players[0].id, pos: 99 },
+    { cmd: 'setPos', playerId: players[0].id, pos: -1 },
+    { cmd: 'setPos', playerId: players[0].id, pos: 4.2 },
+    { cmd: 'setJail', playerId: players[0].id, jail: 'yes' },
+    { cmd: 'setJailCards', playerId: players[0].id, count: 99 },
+    { cmd: 'setJailCards', playerId: players[0].id, count: 0.5 },
+    { cmd: 'setProperty', space: 999, owner: null },
+    { cmd: 'setProperty', space: 1, owner: 42 },
+    { cmd: 'setHouses', space: 1, count: 'many' },
+    { cmd: 'setHouses', space: 1, count: -2 },
+    { cmd: 'setMortgaged', space: 1, mortgaged: 'maybe' },
+    { cmd: 'forceDraw', deck: 'uno' },
+    { cmd: 'setTimer', ms: 'soon' },
+    { cmd: 'setTimer', ms: -100 },
+    { cmd: 'setTimer', ms: 1e12 },
+    { cmd: 'replayTurn', playerId: { nested: BIG } },
+    { cmd: 'endGame', winner: 7 },
+    { cmd: 'import' }, // no json
+    { cmd: 'import', json: 'not-an-object' },
+    { cmd: 'import', json: { players: 'nope' } },
+  ]
+  for (const bad of badGods) {
+    const res = await emitAck(tv, 'god:command', bad)
+    assert(!res.ok, `god rejected ${brief(bad)}`)
+    assert(alive(), `server alive after god ${brief(bad)}`)
+  }
+
+  // ── hostile room-level messages ──
+  const roomCases = [
+    ['room:hostJoin', null],
+    ['room:hostJoin', { code: code, hostToken: { guess: BIG } }],
+    ['room:hostJoin', { code: BIG, hostToken: 'x' }],
+    ['room:hostJoin', { code: code.toLowerCase(), hostToken: created.hostToken }], // case-folded but real: must SUCCEED
+    ['room:watch', null],
+    ['room:watch', { code: 'OIOI' }],
+    ['room:watch', { code: BIG }],
+    ['room:watch', 5],
+    ['room:join', null],
+    ['room:join', { code: code, name: 42 }],
+    ['room:join', { code: code, name: null }],
+    ['room:join', { code: code, name: BIG }],
+    ['room:join', { code: BIG, name: 'okay' }],
+    ['room:rejoin', null],
+    ['room:rejoin', { token: 7 }],
+    ['room:rejoin', { token: BIG }],
+    ['room:settings', null],
+    ['room:settings', { turnTimeoutMs: 'ten minutes' }],
+    ['room:settings', { turnTimeoutMs: [] }],
+    ['room:settings', { turnTimeoutMs: 1.5 }],
+    ['room:settings', { turnTimeoutMs: -50 }],
+    ['game:handOver', null],
+    ['game:handOver', { to: { evil: BIG } }],
+    ['game:start', { force: true }],
+  ]
+  for (const [ev, payload] of roomCases) {
+    const res = await emitAck(tv, ev, payload)
+    assert(alive(), `server alive after ${ev} ${JSON.stringify(payload).slice(0, 40)}`)
+    if (ev === 'room:hostJoin' && payload && payload.hostToken === created.hostToken) {
+      assert(res.ok, 'legit hostJoin (case-folded code) still works')
+    } else if (res.ok !== undefined && res.ok === true && ev !== 'room:watch' && ev !== 'room:join') {
+      // room:watch/join with garbage codes legitimately fail; a stray ok elsewhere is worth seeing
+      console.log(`      NOTE: ${ev} accepted ${JSON.stringify(payload).slice(0, 40)}`)
+    }
+  }
+
+  // a payload where the ack callback belongs (crashed the server pre-fix)
+  tv.emit('room:create', { hostile: true })
+  await sleep(300)
+  assert(alive(), 'server alive after room:create sent with a payload in the ack slot')
+
+  // …and twice in a row, plus a create storm on one connection
+  for (let i = 0; i < 5; i++) {
+    const res = await emitAck(tv, 'room:create')
+    assert(res.ok && /^[A-Z]{4}$/.test(res.code || ''), `room:create #${i + 2} on the same connection ok (${res.code})`)
+    assert(alive(), 'server alive')
+  }
+  // one connection, one room: the latest create won; older rooms detached
+  assert(alive(), 'server alive after the create storm')
+
+  // ── prototype pollution attempt through a snapshot import ──
+  const poison = await emitAck(tv, 'god:command', {
+    cmd: 'import',
+    json: {
+      code: 'AAAA',
+      hostToken: 't',
+      hostPlayerId: null,
+      turnTimeoutMs: 300000,
+      players: [{ meta: { id: '__proto__', name: 'x', color: '#000', token: '??' }, token: 'tok' }],
+      state: { phase: 'ACTION', players: [], currentPlayerId: '__proto__', dice: null, doubles: 0, props: {}, chanceDeck: [], chestDeck: [], pendingCard: null, pendingCardDraw: null, cardDrawSeq: 0, pendingJail: null, pendingPurchase: null, pendingTax: null, pendingMove: null, auction: null, auctionQueue: [], debt: null, debtQueue: [], trades: [], lastLanded: null, lastMove: null, ledger: [], deadline: null, deadlineFor: null, log: [], turn: 1, winner: null },
+    },
+  })
+  assert(alive(), 'server alive after poisoned import (ack ok=' + poison.ok + ')')
+
+  // ── the game must still be fully playable ──
+  // The TV socket moved to fresh rooms during the create storm; the original
+  // game room is still live on the phone sockets — check through them.
+  await sleep(300)
+  const phoneView = players.find((p) => p.view && p.view.phase)
+  assert(phoneView != null, 'phones still receive views from the original game')
+  const active = players.find((p) => p.view && (p.view.allowed || []).length > 0)
+  assert(active != null, 'a phone still has legal moves after the barrage')
+  if (active) {
+    const first = active.view.allowed.find((a) =>
+      ['roll', 'drawCard', 'buy', 'declineBuy', 'payTax', 'passBid', 'endTurn'].includes(a),
+    )
+    const action = first === 'payTax' ? { type: 'payTax', choice: 'flat' } : { type: first }
+    const res = await emitAck(active.sock, 'game:action', action)
+    assert(res.ok, `legal action still accepted after the barrage (${first})`)
+  }
+  assert(alive(), 'server alive at the end')
+
+  // NaN must never be in any player's cash
+  const cashes = ((phoneView && phoneView.view.players) || []).map((p) => p.cash)
+  assert(cashes.length > 0 && cashes.every((c) => Number.isInteger(c)), `cash never corrupted (${cashes.join(', ')})`)
+
+  console.log(failed === 0 ? '\nMALFORMED-PAYLOAD TEST PASSED ✅' : `\nMALFORMED-PAYLOAD TEST FAILED (${failed}) ❌`)
+} catch (e) {
+  failed++
+  console.error('test error:', e)
+} finally {
+  server.kill()
+}
+
+process.exit(failed === 0 && !server.dead ? 0 : 1)

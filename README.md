@@ -53,8 +53,9 @@ npm run dev
 |---|---|
 | `npm run dev` | Dev mode: server with hot-reload + client rebuilds |
 | `npm run simulate` | CLI fuzz-test: random bot games against the rules engine |
-| `npm run scenarios` | 28 deterministic rule scenarios (182 checks) |
+| `npm run scenarios` | 28 deterministic rule scenarios (249 checks) |
 | `npm run smoke` | End-to-end test: boots the server, plays a real game over sockets, reconnects a phone + the TV |
+| `npm run malformed` | Network-layer hardening test: hostile payloads at every message type — the server must stay up and keep playing |
 | `npm run build` | Production build (server → `dist/`, clients → `public/*.js`) |
 | `npm start` | Run the production build (`PORT` env to override, default 3000) |
 | `npm run typecheck` | Strict TypeScript check across server + clients |
@@ -65,10 +66,15 @@ npm run dev
   the *rules helpers* (`rentFor`, `canBuildOn`, `allowedActions` …), and view types.
   Shared on purpose: **the server validates with the same functions the phone UI
   uses to decide which buttons to show.** No client/server drift about what's legal.
-- **`src/server/engine.ts`** — the full official-rules engine as a deterministic
+- **`src/shared/engine.ts`** — the full official-rules engine as a deterministic
   state machine: `applyAction(state, action, playerId, rng)`. No I/O, no sockets.
+- **`src/shared/validate.ts`** — the boundary: every client message is checked
+  against a schema (whole numbers, fixed ranges, capped strings) before it
+  reaches the engine. The engine stays I/O-free *because* this gate exists.
 - **`src/server/rooms.ts`** — socket glue: room codes, host/player tokens,
   per-device view projection, auto-pass for phones that drop mid-auction.
+  Every handler runs inside a guard, so a malformed message can never crash
+  the process — and one connection belongs to exactly one room.
 - **`src/server/index.ts`** — express + socket.io; binds `0.0.0.0` so LAN phones
   can reach it, prints its LAN URL at startup.
 - **`src/client/host/`** — the TV app: lobby (code + QR), 11×11 board, tokens,
@@ -96,11 +102,15 @@ phone can never stall the party.
 
 - `npm run simulate` — weighted-random bots play full games; asserts no
   exceptions, no deadlocks, no negative money, guaranteed termination.
-- `npm run scenarios` — 28 deterministic situations (182 checks): GO payouts,
+- `npm run scenarios` — 28 deterministic situations (249 checks): GO payouts,
   rent tables, jail in every exit, chained card draws, even-building rules,
   exact mortgage math, multi-debt queues, both bankruptcy flavors, auction
   regressions, trade validation, tamper-proof action gating.
 - `npm run smoke` — the full stack over real sockets, including reconnects.
+- `npm run malformed` — hostile and half-broken payloads at every message
+  type: wrong shapes, fractional cash, string numbers, 100k-char strings,
+  prototype pollution, stale-socket crown theft. The server must survive it
+  all and keep playing a normal game afterwards.
 
 Together they've caught and fixed real bugs: float drift on mortgage buyback,
 a wedged auction when the last active player bid, queued debts surviving a
@@ -216,8 +226,7 @@ trademark of Hasbro; this project is unaffiliated. It uses only rules/mechanics
 
 ## Roadmap ideas
 
-- Timed decisions + a ticking sound (auction panic!)
 - House-rules toggle sheet (landing on GO pays $400, free-parking pot, …)
 - Emoji reactions beamed to the TV
-- Spectator mode with a live "hot takes" feed
-- Bot seats so 2 humans can still have a full table
+- Spectator mode with a live "hot takes" feed (beyond the TV mirrors that exist today)
+- Bot seats at a real table (the `/simulate` page already runs full bot games)
