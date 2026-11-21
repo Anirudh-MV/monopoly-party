@@ -165,6 +165,10 @@ export class Board3D {
   // touch pointers for pinch-zoom (phones have no wheel)
   private pointers = new Map<number, { x: number; y: number }>()
   private pinchStart: { dist: number; zoom: number } | null = null
+  // Free-roam mode (the pocket board): the camera stops chasing the game
+  // and stops easing back after every gesture — the view stays exactly
+  // where the player leaves it until they tap Reset or Follow.
+  private roam = false
 
   constructor(container: HTMLElement) {
     this.renderer = new THREE.WebGLRenderer({ antialias: true })
@@ -238,7 +242,7 @@ export class Board3D {
       const dist = Math.hypot(a.x - b.x, a.y - b.y)
       if (this.pinchStart.dist > 0) {
         this.userZoom = THREE.MathUtils.clamp(this.pinchStart.zoom * (dist / this.pinchStart.dist), 0.45, 2.6)
-        this.wheelDeadline = performance.now() + 2000
+        this.wheelDeadline = this.roam ? 0 : performance.now() + 2000
       }
       return
     }
@@ -257,7 +261,9 @@ export class Board3D {
     if (this.pointers.size === 0) {
       if (!this.dragging) return
       this.dragging = false
-      this.returning = true // ease back to the default view
+      // tracking mode glides back to the followed action; roaming keeps
+      // the view exactly where the player left it
+      this.returning = !this.roam
       this.renderer.domElement.style.cursor = 'grab'
     }
   }
@@ -271,7 +277,8 @@ export class Board3D {
   private onWheel = (ev: WheelEvent): void => {
     ev.preventDefault()
     this.userZoom = THREE.MathUtils.clamp(this.userZoom * (ev.deltaY > 0 ? 1.08 : 0.93), 0.45, 2.6)
-    this.wheelDeadline = performance.now() + 2000 // zoom eases home after idle
+    // zoom eases home after idle only when tracking the game — roaming keeps it
+    this.wheelDeadline = this.roam ? 0 : performance.now() + 2000
   }
 
   private onResize = (): void => {
@@ -414,6 +421,25 @@ export class Board3D {
   }
 
   // ── public API ──
+
+  // Free-roam mode for the pocket board: the whole board in view, no
+  // chasing the current player, no snap-back after gestures.
+  setRoam(on: boolean): void {
+    this.roam = on
+    if (on) this.resetRoamView()
+  }
+
+  // The overview the player can always return to with one tap.
+  resetRoamView(): void {
+    this.userYaw = 0
+    this.userPitch = 0
+    this.userZoom = 1
+    this.returning = false
+    this.wheelDeadline = 0
+    this.focusGoal.set(0, 0, 0)
+    this.posGoal.set(0, 34, 26)
+    this.lookTarget.set(0, 0, 0)
+  }
 
   setIdle(): void {
     this.idle = true
@@ -558,21 +584,26 @@ export class Board3D {
     // camera focus: the active piece, viewed from OUTSIDE its own side of
     // the board — Pacific Ave (right edge) faces east, Illinois (top) faces
     // north, and so on. Labels stay static; the camera does the moving.
-    const focusIdx = v.debt ? v.players.findIndex((p) => p.id === v.debt?.debtor) : v.players.findIndex((p) => p.id === v.currentPlayerId)
-    if (v.phase === 'GAME_OVER' || focusIdx < 0) {
-      this.focusGoal.set(0, 0, 0)
-      this.posGoal.set(0, 34, 26)
+    // Roaming skips all of this: the player owns the camera.
+    if (this.roam) {
+      // keep the clock/reschedule bookkeeping consistent, drop the goals
     } else {
-      const player = v.players[focusIdx]
-      // Focus the tile the player is ON, never the mesh: on the landing
-      // view the mesh still sits at the pre-hop tile while the hop plays
-      // out, so a mesh-based focus left the camera easing back to the OLD
-      // position once the stroll ended. The hop chase still tracks the
-      // live token; this is the resting goal it eases back to.
-      if (player) {
-        const t = tileCenter(player.pos)
-        this.focusGoal.set(t.x, 0, t.z)
-        this.posGoal.set(t.x, 0, t.z).add(cameraOffset(player.pos))
+      const focusIdx = v.debt ? v.players.findIndex((p) => p.id === v.debt?.debtor) : v.players.findIndex((p) => p.id === v.currentPlayerId)
+      if (v.phase === 'GAME_OVER' || focusIdx < 0) {
+        this.focusGoal.set(0, 0, 0)
+        this.posGoal.set(0, 34, 26)
+      } else {
+        const player = v.players[focusIdx]
+        // Focus the tile the player is ON, never the mesh: on the landing
+        // view the mesh still sits at the pre-hop tile while the hop plays
+        // out, so a mesh-based focus left the camera easing back to the OLD
+        // position once the stroll ended. The hop chase still tracks the
+        // live token; this is the resting goal it eases back to.
+        if (player) {
+          const t = tileCenter(player.pos)
+          this.focusGoal.set(t.x, 0, t.z)
+          this.posGoal.set(t.x, 0, t.z).add(cameraOffset(player.pos))
+        }
       }
     }
 
@@ -650,7 +681,8 @@ export class Board3D {
     }
     const followFocus = !this.idle && this.hops.length > 0 ? this.focusGoal.clone() : this.focusGoal
     // while a token is hopping, the camera chases its live position
-    if (!this.idle) {
+    // (roaming owns the camera — no chase)
+    if (!this.idle && !this.roam) {
       const hop = this.hops[0]
       if (hop) {
         const mesh = this.tokens[hop.playerIdx]

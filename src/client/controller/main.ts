@@ -332,8 +332,10 @@ function animateMoney(from: number, to: number): void {
 }
 
 // ── pocket board ──
-// The full 3D board on the phone: drag to orbit, pinch to zoom, close to
-// return. It tracks the live game — every view syncs it while it's open.
+// The full 3D board on the phone: FREE roaming by default — drag to orbit,
+// pinch to zoom, and the view stays exactly where you leave it. Reset
+// snaps back to the whole-board overview, Follow re-pins to the action,
+// Close returns to the controller. It stays live with the game while open.
 let phoneBoard: Board3D | null = null
 
 function showBoard(): void {
@@ -341,15 +343,37 @@ function showBoard(): void {
   closeBoard()
   const overlay = document.createElement('div')
   overlay.className = 'board-overlay'
-  const close = document.createElement('button')
-  close.className = 'board-close'
-  close.textContent = '✕ Close board'
-  overlay.appendChild(close)
+  overlay.innerHTML = `
+    <div class="board-tools">
+      <button class="board-tool" data-act="boardReset">⟲ Reset view</button>
+      <button class="board-tool" data-act="boardFollow">▶ Follow game</button>
+      <button class="board-tool board-closebtn" data-act="boardClose">✕ Close</button>
+    </div>`
   document.body.appendChild(overlay)
   phoneBoard = new Board3D(overlay)
   phoneBoard.setTheme(theme)
+  phoneBoard.setRoam(true) // free roaming — the camera is the player's
   phoneBoard.sync(view)
-  close.addEventListener('click', closeBoard)
+  const tools = overlay.querySelector('.board-tools') as HTMLElement
+  tools.addEventListener('click', (ev) => {
+    const btn = (ev.target as HTMLElement).closest('[data-act]') as HTMLElement | null
+    if (!btn) return
+    if (btn.dataset.act === 'boardClose') {
+      closeBoard()
+    } else if (btn.dataset.act === 'boardReset') {
+      phoneBoard?.resetRoamView()
+      const follow = tools.querySelector('[data-act="boardFollow"]') as HTMLElement | null
+      if (follow) {
+        follow.classList.remove('on')
+        follow.textContent = '▶ Follow game'
+      }
+    } else if (btn.dataset.act === 'boardFollow') {
+      const on = btn.classList.toggle('on')
+      // following = TV-style tracking (with its snap-back); off = roaming
+      phoneBoard?.setRoam(!on)
+      btn.textContent = on ? '⏸ Roam free' : '▶ Follow game'
+    }
+  })
 }
 
 function closeBoard(): void {
