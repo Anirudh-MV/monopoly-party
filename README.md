@@ -28,7 +28,9 @@ npm run dev
    board spinning behind it. The code is kept in the tab's URL (`?room=CODE`),
    so reloading the TV returns to the same game.
 2. On each phone, scan the QR (or open the **LAN URL** shown on screen) →
-   enter the room code + your name.
+   enter the room code + your name → **pick your piece**, with a live 3D
+   preview of the avatar that will walk the board. No two players can pick
+   the same piece.
 3. The **first player to join is the party host** 👑 (the TV can also start
    things). The host can hand duties to anyone; if the host leaves or drops,
    the crown slides down the queue automatically.
@@ -79,8 +81,13 @@ npm run dev
   can reach it, prints its LAN URL at startup.
 - **`src/client/host/`** — the TV app: lobby (code + QR), 11×11 board, tokens,
   ownership tinting, houses/hotels, auction + card + debt overlays, activity feed.
-- **`src/client/controller/`** — the phone app: sticky wallet, contextual action
-  buttons, per-property management, trade composer, auction bidding, debt resolution.
+- **`src/client/controller/`** — the phone app: sticky wallet (with animated
+  balance changes), contextual action buttons, per-property management, trade
+  composer, auction bidding, debt resolution — rent is paid by hand, a
+  Collect prompt marks passing GO, the dice roll plays on every screen, and
+  a **pocket board** button opens the full 3D board to roam and inspect.
+- **`src/client/tokens3d.ts`** — one distinct 3D avatar per emoji, shared by
+  the TV board and the phone's piece picker (with a live preview).
 
 ### Reconnects are a feature, not an afterthought
 
