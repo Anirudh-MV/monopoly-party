@@ -6,7 +6,7 @@
 // the host screen advertises the machine's LAN address. For a short-lived
 // public instance, PARTY_KEY gates every page and socket (see README).
 
-import express from 'express'
+import express, { type ErrorRequestHandler } from 'express'
 import { timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingHttpHeaders } from 'node:http'
 import { networkInterfaces } from 'node:os'
@@ -44,7 +44,17 @@ function parseCookies(header: string | undefined): Record<string, string> {
   const out: Record<string, string> = {}
   for (const part of header?.split(';') ?? []) {
     const i = part.indexOf('=')
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim())
+    if (i > 0) {
+      const k = part.slice(0, i).trim()
+      const raw = part.slice(i + 1).trim()
+      // A foreign app's malformed cookie value (bad %-escape) must never be
+      // able to crash the process — keep the raw string if it won't decode.
+      try {
+        out[k] = decodeURIComponent(raw)
+      } catch {
+        out[k] = raw
+      }
+    }
   }
   return out
 }
@@ -80,22 +90,28 @@ const app = express()
 // express, so the socket side is guarded separately below (io.use).
 if (PARTY_KEY) {
   app.use((req, res, next) => {
-    if (keyMatches(req.query.key)) {
-      const secure = req.secure || req.headers['x-forwarded-proto'] === 'https'
-      res.append(
-        'Set-Cookie',
-        `${KEY_COOKIE}=${encodeURIComponent(PARTY_KEY)}; Path=/; HttpOnly; SameSite=Lax${secure ? '; Secure' : ''}`,
+    try {
+      if (keyMatches(req.query.key)) {
+        const secure = req.secure || req.headers['x-forwarded-proto'] === 'https'
+        res.append(
+          'Set-Cookie',
+          `${KEY_COOKIE}=${encodeURIComponent(PARTY_KEY)}; Path=/; HttpOnly; SameSite=Lax${secure ? '; Secure' : ''}`,
+        )
+        return next()
+      }
+      if (keyMatches(parseCookies(req.headers.cookie)[KEY_COOKIE])) return next()
+      if (keyMatches(headerCredential(req.headers.authorization))) return next()
+      console.log(`AUTHFAIL ip=${clientIp(req.headers, req.socket.remoteAddress)} path=${req.url}`)
+      res.set('WWW-Authenticate', 'Basic realm="Monopoly Party", charset="UTF-8"')
+      res.status(401).send(
+        'Private party server. Open the share link that includes ?key=…, ' +
+          'or sign in with any username and the party key as the password.',
       )
-      return next()
+    } catch (e) {
+      // Fail closed, and never leak a stack trace to the client.
+      console.error('[gate] express auth check threw:', e)
+      res.status(500).send('Server error')
     }
-    if (keyMatches(parseCookies(req.headers.cookie)[KEY_COOKIE])) return next()
-    if (keyMatches(headerCredential(req.headers.authorization))) return next()
-    console.log(`AUTHFAIL ip=${clientIp(req.headers, req.socket.remoteAddress)} path=${req.url}`)
-    res.set('WWW-Authenticate', 'Basic realm="Monopoly Party", charset="UTF-8"')
-    res.status(401).send(
-      'Private party server. Open the share link that includes ?key=…, ' +
-        'or sign in with any username and the party key as the password.',
-    )
   })
 }
 const pub = path.resolve('public')
@@ -110,25 +126,40 @@ app.get('/', (_q, res) => res.sendFile(path.join(pub, 'host.html')))
 app.get('/join', (_q, res) => res.sendFile(path.join(pub, 'controller.html')))
 app.get('/simulate', (_q, res) => res.sendFile(path.join(pub, 'sim.html')))
 
+// Last-resort error handler: log the details server-side, show the client a
+// plain message — express's default page leaks stack traces.
+app.use(((err, _req, res, next) => {
+  console.error('[http] request failed:', err)
+  if (res.headersSent) return next(err)
+  res.status(500).send('Server error')
+}) as ErrorRequestHandler)
+
 const http = createServer(app)
 const io = new Server(http)
 
 // Socket gate: browsers carry the cookie minted by the page load on the
 // handshake; raw clients may use auth.key, ?key=, or a bearer/basic header.
+// The gate itself must never throw — a malformed cookie from any other app
+// on the domain used to kill the process here.
 io.use((socket, next) => {
-  if (!PARTY_KEY) return next()
-  const h = socket.handshake
-  const q = h.query as Record<string, unknown>
-  if (
-    keyMatches(q?.key) ||
-    keyMatches(h.auth?.key) ||
-    keyMatches(parseCookies(h.headers.cookie)[KEY_COOKIE]) ||
-    keyMatches(headerCredential(h.headers.authorization))
-  ) {
-    return next()
+  try {
+    if (!PARTY_KEY) return next()
+    const h = socket.handshake
+    const q = h.query as Record<string, unknown>
+    if (
+      keyMatches(q?.key) ||
+      keyMatches(h.auth?.key) ||
+      keyMatches(parseCookies(h.headers.cookie)[KEY_COOKIE]) ||
+      keyMatches(headerCredential(h.headers.authorization))
+    ) {
+      return next()
+    }
+    console.log(`AUTHFAIL ip=${clientIp(h.headers, h.address)} path=socket.io`)
+    next(new Error('unauthorized'))
+  } catch (e) {
+    console.error('[gate] socket auth check threw:', e)
+    next(new Error('unauthorized'))
   }
-  console.log(`AUTHFAIL ip=${clientIp(h.headers, h.address)} path=socket.io`)
-  next(new Error('unauthorized'))
 })
 
 function joinUrls(): string[] {

@@ -13,6 +13,10 @@ import { io } from 'socket.io-client'
 
 const PORT = 3124
 const URL = `http://localhost:${PORT}`
+// The suite runs the server WITH a party key so the auth gate (express
+// middleware + io.use) is exercised — that's where a malformed cookie used
+// to crash the whole process.
+const PARTY_KEY = 'testpartykey'
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 let failed = 0
@@ -25,7 +29,7 @@ function assert(cond, msg) {
 }
 
 function connect() {
-  return io(URL, { reconnection: false })
+  return io(URL, { reconnection: false, auth: { key: PARTY_KEY } })
 }
 function emitAck(sock, event, ...args) {
   return new Promise((resolve) => {
@@ -39,7 +43,7 @@ function emitAck(sock, event, ...args) {
 
 console.log('booting server …')
 const server = spawn(process.execPath, ['dist/server/index.js'], {
-  env: { ...process.env, PORT: String(PORT), SNAP_DIR: 'snapshots-test' },
+  env: { ...process.env, PORT: String(PORT), SNAP_DIR: 'snapshots-test', PARTY_KEY },
   stdio: ['ignore', 'pipe', 'pipe'],
 })
 server.stdout.on('data', (d) => process.stdout.write(d))
@@ -66,6 +70,31 @@ await new Promise((resolve, reject) => {
 
 try {
   const alive = () => !server.dead
+
+  // ── the auth gate must fail closed on hostile headers ──
+  // A malformed cookie from ANY other app on the domain used to crash the
+  // process (URIError inside io.use). It must simply be rejected.
+  {
+    const hostile = io(URL, {
+      transports: ['polling'],
+      extraHeaders: { Cookie: 'x=%zz' },
+      reconnection: false,
+    })
+    const outcome = await new Promise((resolve) => {
+      hostile.on('connect', () => resolve('connected'))
+      hostile.on('connect_error', () => resolve('rejected'))
+      setTimeout(() => resolve('timeout'), 5000)
+    })
+    hostile.close()
+    assert(outcome === 'rejected', `poisoned-cookie socket rejected (${outcome})`)
+    assert(alive(), 'server alive after the poisoned cookie')
+
+    const noKey = await fetch(URL).catch(() => null)
+    assert(noKey && noKey.status === 401, `express gate 401 without key (${noKey && noKey.status})`)
+    const withKey = await fetch(`${URL}/?key=${PARTY_KEY}`).catch(() => null)
+    assert(withKey && withKey.status === 200, 'express gate 200 with key')
+    assert(alive(), 'server alive after gate pokes')
+  }
 
   // ── stage a normal game so payloads have something to bite ──
   const tv = connect()
