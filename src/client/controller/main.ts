@@ -591,13 +591,13 @@ function renderGame(v: PlayerView): void {
   // ── My portfolio ──
   body += renderPortfolio(v, I.id)
 
-  // ── Transaction history (yours and everyone else's) ──
-  body += renderLedger(v, I.id)
-
-  // ── New trade button ──
+  // ── New trade button — directly above the transaction history ──
   if (acts.has('proposeTrade')) {
     body += `<button class="big wide" data-act="openTrade">Propose a trade</button>`
   }
+
+  // ── Transaction history (yours and everyone else's) ──
+  body += renderLedger(v, I.id)
 
   $app.innerHTML = `
     <header class="topbar" style="--c:${I.color}">
