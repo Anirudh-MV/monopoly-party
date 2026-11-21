@@ -87,8 +87,14 @@ npm run dev
 Phones lock, screens sleep, Wi-Fi blips. Each phone stores a rejoin token in
 `localStorage` and re-attaches automatically on **every** socket reconnect —
 seat, wallet, deeds, and jail cards intact. The TV has the same treatment via
-a host token. A phone that drops mid-auction is **auto-passed** so the table
-never stalls.
+a host token. A phone that drops mid-auction is **auto-passed** (after a
+grace period) so the table never stalls.
+
+Leaving on purpose is harder than leaving by accident: **Exit** on a phone
+asks for confirmation **twice** (different wording each step, and tapping the
+backdrop counts as "stay"). Mid-game the seat stays at the table and the
+rejoin token is destroyed — that phone can never rejoin the room, but it's
+free to go enter a different room code right away.
 
 ### Decision clocks
 

@@ -743,14 +743,34 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
 
     on('room:leave', (_raw: unknown, ack?: (res: unknown) => void) => {
       const room = data.code ? rooms.get(data.code) : undefined
-      if (!room || data.role !== 'player' || room.state) return ack?.({ ok: false })
+      if (!room || data.role !== 'player' || !data.playerId) return ack?.({ ok: false })
       const idx = room.players.findIndex((e) => e.meta.id === data.playerId)
-      if (idx >= 0) {
-        const [gone] = room.players.splice(idx, 1)
-        playerTokens.delete(gone.token)
-        promoteHostOnLeave(room, gone.meta.id, idx)
-        broadcastLobby(io, room)
+      if (idx < 0) return ack?.({ ok: false })
+
+      if (room.state) {
+        // Mid-game exit: the seat stays at the table — the game plays on and
+        // the decision clock covers their turns — but this phone is out for
+        // good: its rejoin token is destroyed, so it can never wander back.
+        const entry = room.players[idx]
+        if (entry) {
+          playerTokens.delete(entry.token)
+          entry.socketId = null
+          entry.disconnectedAt = Date.now()
+          if (room.hostPlayerId === data.playerId) promoteHostOnDisconnect(room)
+          socket.leave(playerRoom(room.code, data.playerId))
+        }
+        data.code = undefined
+        data.role = undefined
+        data.playerId = undefined
+        broadcastGame(io, room)
+        return ack?.({ ok: true })
       }
+
+      // Lobby: the seat is removed entirely and the crown slides down.
+      const [gone] = room.players.splice(idx, 1)
+      playerTokens.delete(gone.token)
+      promoteHostOnLeave(room, gone.meta.id, idx)
+      broadcastLobby(io, room)
       ack?.({ ok: true })
     })
 

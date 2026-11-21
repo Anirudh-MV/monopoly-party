@@ -81,6 +81,24 @@ try {
   assert(dupRes && !dupRes.ok, 'duplicate name rejected')
   dup.disconnect()
 
+  // ── lobby leave: the seat is removed before the game starts ──
+  {
+    let l = null
+    host.on('lobby', (x) => {
+      l = x
+    })
+    const extra = connect()
+    const eres = await emitAck(extra, 'room:join', { code, name: 'Ravi' })
+    assert(eres.ok, 'fourth phone joined the lobby')
+    await sleep(100)
+    assert(l && l.players.length === 4, 'lobby shows 4 players')
+    const lres = await emitAck(extra, 'room:leave', {})
+    assert(lres.ok, 'lobby leave accepted')
+    await sleep(150)
+    assert(l && l.players.length === 3 && !l.players.some((p) => p.name === 'Ravi'), 'lobby back to 3 players')
+    extra.disconnect()
+  }
+
   // ── start ──
   let lastHostView = null
   host.on('view', (v) => {
@@ -102,7 +120,7 @@ try {
   assert(curPhone.view.allowed.includes('roll'), "current player's phone offers ROLL")
 
   // ── drive the game via allowed actions ──
-  async function playRounds(n, label) {
+  async function playRounds(n, label, minOk) {
     let okCount = 0
     for (let i = 0; i < n; i++) {
       const me = phones.find((p) => p.id === lastHostView.currentPlayerId)
@@ -123,7 +141,7 @@ try {
       await waitFor(() => me.view !== null, 4000, 'view refresh')
       await sleep(30)
     }
-    assert(okCount >= Math.min(3, n), `${label}: ${okCount} actions accepted`)
+    assert(okCount >= (minOk ?? Math.min(3, n)), `${label}: ${okCount} actions accepted`)
     return okCount
   }
 
@@ -214,6 +232,46 @@ try {
     await sleep(150)
     assert(lastHostView.turn === turnBefore, 'game resumed at the same turn after import')
     await playRounds(6, 'post-import gameplay')
+  }
+
+  // ── exit mid-game: leave for good, join a new lobby ──
+  // Runs after every section that needs all phones attached: the departed
+  // seat keeps rotating into the turn order, and its phone no longer
+  // receives views.
+  {
+    // never the current player, so the game keeps moving right after
+    const gone = phones.find((p) => p.id !== lastHostView.currentPlayerId)
+    const goneToken = gone.token
+    const before = lastHostView.players.length
+
+    const xres = await emitAck(gone.sock, 'room:leave', {})
+    assert(xres.ok, 'mid-game exit accepted')
+    await sleep(150)
+
+    // the seat stays at the table, but reads as offline
+    const seat = lastHostView.players.find((p) => p.id === gone.id)
+    assert(seat != null, 'their seat stays at the table')
+    assert(seat.connected === false, 'the TV sees them offline')
+    assert(lastHostView.players.length === before, 'player count unchanged — the game plays on')
+
+    // the rejoin token is destroyed — this phone can't wander back
+    const back = connect()
+    const bres = await emitAck(back, 'room:rejoin', { token: goneToken })
+    assert(bres && !bres.ok, 'the destroyed token cannot rejoin')
+    back.disconnect()
+
+    // everyone else keeps playing (turns that land on the empty seat are
+    // covered by the decision clock, so only the live turns count here)
+    await playRounds(6, 'post-exit gameplay', 2)
+
+    // and the exited phone can start over in a different room
+    const tv2 = connect()
+    const created2 = await emitAck(tv2, 'room:create')
+    const fresh = connect()
+    const jres = await emitAck(fresh, 'room:join', { code: created2.code, name: gone.name })
+    assert(jres.ok, 'the exited phone can join a new lobby')
+    fresh.disconnect()
+    tv2.disconnect()
   }
 
   // ── TV reconnect ──

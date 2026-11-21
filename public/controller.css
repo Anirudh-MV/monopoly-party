@@ -230,6 +230,27 @@ main { display: block; }
 }
 .reveal-title { font-size: 15px; font-weight: 800; letter-spacing: 0.25em; color: var(--dim); margin-bottom: 10px; }
 
+/* ── two-step exit confirmation ── */
+.confirm-overlay {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(10, 12, 20, 0.72);
+  display: flex; align-items: center; justify-content: center;
+  animation: fadeIn 0.25s ease-out;
+}
+.confirm-box {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 26px 22px;
+  width: min(88vw, 380px);
+  text-align: center;
+  box-shadow: var(--shadow);
+}
+.confirm-title { font-size: 18px; font-weight: 800; margin-bottom: 8px; }
+.confirm-body { font-size: 14px; color: var(--dim); line-height: 1.55; margin-bottom: 16px; }
+.confirm-step { margin-top: 14px; }
+.topbar .exitbtn { color: #e15b5b; }
+
 /* chest */
 .chestwrap { position: relative; width: 130px; height: 92px; margin: 4px auto 14px; perspective: 500px; }
 .chestbase {

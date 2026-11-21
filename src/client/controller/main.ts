@@ -122,6 +122,66 @@ function showReveal(card: Card): void {
   setTimeout(dismiss, isChest ? 3200 : 4200)
 }
 
+// ── two-step exit confirmation ──
+// Leaving is the one destructive thing a phone can do to itself: mid-game
+// the seat stays at the table but the rejoin token dies — this phone can
+// never come back to that room. So it takes TWO separate confirmations,
+// with different wording each step so neither can be muscle-memoryed.
+function showExitConfirm(step: 1 | 2): void {
+  document.querySelector('.confirm-overlay')?.remove()
+  const inGame = view != null
+  const overlay = document.createElement('div')
+  overlay.className = 'confirm-overlay'
+  overlay.dataset.step = String(step)
+  overlay.innerHTML = `
+    <div class="confirm-box">
+      <div class="confirm-title">${step === 1 ? 'Leave this game?' : 'Last chance'}</div>
+      <p class="confirm-body">${
+        step === 1
+          ? inGame
+            ? 'You\u2019ll go back to the join screen and can enter a different room code. Your seat stays at the table, and this phone won\u2019t be able to rejoin this room.'
+            : 'You\u2019ll go back to the join screen and can enter a different room code.'
+          : inGame
+            ? 'Really leave? This phone can never rejoin the game you\u2019re in.'
+            : 'Really leave the room? This is the final confirmation.'
+      }</p>
+      <div class="row">
+        <button data-act="exitCancel">${step === 1 ? 'Keep playing' : 'Stay'}</button>
+        <button class="danger" data-act="exitContinue">${step === 1 ? 'Continue' : 'Yes, leave'}</button>
+      </div>
+      <p class="hint confirm-step">Confirmation ${step} of 2</p>
+    </div>`
+  overlay.addEventListener('click', (ev) => {
+    const btn = (ev.target as HTMLElement).closest('[data-act]') as HTMLElement | null
+    if (!btn) {
+      // tapped the backdrop — that always means "keep playing"
+      if (ev.target === overlay) overlay.remove()
+      return
+    }
+    if (btn.dataset.act === 'exitCancel') overlay.remove()
+    else if (btn.dataset.act === 'exitContinue') {
+      if (overlay.dataset.step === '1') showExitConfirm(2)
+      else performExit()
+    }
+  })
+  document.body.appendChild(overlay)
+}
+
+function performExit(): void {
+  document.querySelector('.confirm-overlay')?.remove()
+  socket.emit('room:leave', {}, () => {
+    localStorage.removeItem('mp-token')
+    localStorage.removeItem('mp-playerid')
+    myToken = null
+    myPlayerId = null
+    lobby = null
+    view = null
+    composer = null
+    lastCardSeq = -1
+    render()
+  })
+}
+
 // ── Connection lifecycle ──
 
 const preCode = (new URLSearchParams(location.search).get('code') ?? '').toUpperCase()
@@ -230,15 +290,9 @@ $app.addEventListener('click', (ev) => {
       break
     }
     case 'leave': {
-      socket.emit('room:leave', {}, () => {
-        localStorage.removeItem('mp-token')
-        localStorage.removeItem('mp-playerid')
-        myToken = null
-        myPlayerId = null
-        lobby = null
-        view = null
-        render()
-      })
+      // Both exits (lobby "Leave room" and the in-game "Exit") start the
+      // same two-step confirmation — see showExitConfirm.
+      showExitConfirm(1)
       break
     }
     case 'roll': send({ type: 'roll' }); break
@@ -605,6 +659,7 @@ function renderGame(v: PlayerView): void {
       <span class="money">$${I.cash}</span>
       <span class="meta">worth $${worth}${I.jailCards > 0 ? ` · jail card ×${I.jailCards}` : ''}${I.jail ? ' · in jail' : ''}</span>
       <button class="themebtn" data-act="theme">${theme === 'light' ? 'Dark' : 'Light'}</button>
+      <button class="themebtn exitbtn" data-act="leave">Exit</button>
     </header>
     ${banner}
     ${landedStrip}
