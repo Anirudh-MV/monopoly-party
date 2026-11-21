@@ -63,7 +63,9 @@ function log(s: GameState, text: string, kind: LogEntry['kind'] = 'info'): void 
 // open the books and see exactly where everyone's money went.
 function logMoney(s: GameState, pid: string, delta: number, memo: string): void {
   if (delta === 0) return
-  const e: MoneyEvent = { seq: s.ledger.length, turn: s.turn, playerId: pid, delta, memo }
+  const p = R.byId(s, pid)
+  const balance = p ? p.cash : 0 // callers log AFTER mutating, so this is post-transaction
+  const e: MoneyEvent = { seq: s.ledger.length, turn: s.turn, playerId: pid, delta, memo, balance }
   s.ledger.push(e)
   if (s.ledger.length > 600) s.ledger.splice(0, s.ledger.length - 600)
 }
@@ -494,14 +496,14 @@ function declareBankruptcy(s: GameState, p: PlayerState): Result {
       }
     }
   }
+  const estate = p.cash
   if (cred) {
-    cred.cash += p.cash
-    if (p.cash > 0) {
-      logMoney(s, cred.id, p.cash, `Estate from ${p.name} (bankruptcy)`)
-      logMoney(s, p.id, -p.cash, `Bankruptcy: estate to ${cred.name}`)
-    }
+    cred.cash += estate
+    if (estate > 0) logMoney(s, cred.id, estate, `Estate from ${p.name} (bankruptcy)`)
   }
   p.cash = 0
+  // logged after the wipe so the recorded balance is the final $0
+  if (cred && estate > 0) logMoney(s, p.id, -estate, `Bankruptcy: estate to ${cred.name}`)
 
   for (const i of R.ownedSpaces(s, p.id)) {
     const st = s.props[i]

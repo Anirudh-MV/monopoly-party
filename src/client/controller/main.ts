@@ -590,22 +590,27 @@ function renderPortfolio(v: PlayerView, pid: string): string {
   return `<div class="trades"><h3>YOUR PROPERTIES (${owned.length})</h3>${rows}</div>`
 }
 
-// The full-information money ledger: pick any player, read their books.
+// The full-information money ledger: "All" merges every player's books.
+const ALL = '__all__'
+
 function renderLedger(v: PlayerView, meId: string): string {
   const sel = ledgerTab ?? meId
-  const entries = v.ledger.filter((e) => e.playerId === sel).slice(-25).reverse()
-  const chips = v.players
-    .map(
+  const all = sel === ALL
+  const entries = (all ? v.ledger : v.ledger.filter((e) => e.playerId === sel)).slice(-30).reverse()
+  const chips = [
+    `<button class="chip ${all ? 'sel' : ''}" data-act="ledgerTab" data-args='{"id":"${ALL}"}'>All</button>`,
+    ...v.players.map(
       (p) =>
         `<button class="chip ${p.id === sel ? 'sel' : ''}" style="${p.id === sel ? `border-color:${p.color}` : ''}" data-act="ledgerTab" data-args='{"id":"${p.id}"}' ${p.bankrupt ? 'disabled' : ''}>${p.token} ${esc(p.name)}</button>`,
-    )
-    .join('')
+    ),
+  ].join('')
   const rows = entries.length
     ? entries
-        .map(
-          (e) =>
-            `<li><span class="amt ${e.delta > 0 ? 'plus' : 'minus'}">${e.delta > 0 ? '+' : '−'}$${Math.abs(e.delta)}</span><span class="memo">${esc(e.memo)}</span><span class="lturn">turn ${e.turn}</span></li>`,
-        )
+        .map((e) => {
+          const who = v.players.find((p) => p.id === e.playerId)
+          const bal = e.balance != null ? `<span class="bal">$${e.balance}</span>` : ''
+          return `<li><span class="who" style="color:${who?.color ?? 'inherit'}">${who?.token ?? ''}</span><span class="amt ${e.delta > 0 ? 'plus' : 'minus'}">${e.delta > 0 ? '+' : '−'}$${Math.abs(e.delta)}</span>${bal}<span class="memo">${esc(e.memo)}</span><span class="lturn">turn ${e.turn}</span></li>`
+        })
         .join('')
     : '<li><span class="memo hint">No transactions yet.</span></li>'
   return `<div class="ledger">

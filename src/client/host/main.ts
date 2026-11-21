@@ -227,7 +227,12 @@ function renderGame(v: HostView): void {
 
   // fresh card draw? play the reveal for the next few seconds
   const freshReveal = v.cardDrawSeq > lastCardSeq && !!v.pendingCard
-  if (freshReveal) revealUntil = Date.now() + 3200
+  if (freshReveal) {
+    revealUntil = Date.now() + 3200
+    // the reveal branch only yields if something re-renders after the window
+    // — and between player actions nothing else will, so schedule it
+    setTimeout(() => render(), 3300)
+  }
   lastCardSeq = v.cardDrawSeq
 
   // hold the piece's hops until the dice settle — or until a card reveal
@@ -469,7 +474,8 @@ function updateCenter(v: HostView): void {
             <div class="c-deck">${isChest ? 'COMMUNITY CHEST' : 'CHANCE'}</div>
             <div class="c-text">${esc(v.pendingCard.text)}</div>
           </div>
-        </div>`
+        </div>
+        ${landedCard(v)}`
       return
     }
     // reveal finished: fall through to the turn display below

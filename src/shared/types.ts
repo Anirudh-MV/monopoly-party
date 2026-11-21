@@ -93,6 +93,7 @@ export interface MoneyEvent {
   playerId: string
   delta: number // + collected / − paid
   memo: string
+  balance: number // the player's cash right after this movement
 }
 
 export interface GameState {

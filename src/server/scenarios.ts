@@ -467,14 +467,22 @@ scenario('transaction ledger records every cash movement', 4, (h) => {
   const p1Ledger = h.s.ledger.filter((e) => e.playerId === h.id(1))
   h.eq(p0Ledger.length, 2, 'Asha: GO money + rent')
   h.eq(p0Ledger[0].memo, 'Passed GO', 'GO reward is itemised')
+  h.eq(p0Ledger[0].balance, 1700, 'balance recorded after GO: $1,700')
   h.eq(p0Ledger[1].delta, -2, 'rent recorded as a payment')
+  h.eq(p0Ledger[1].balance, 1698, 'balance after rent: $1,698')
   h.eq(p0Ledger[1].memo, 'Rent: Mediterranean Ave', 'rent memo names the space')
   h.eq(p1Ledger.length, 1, 'Ben: rent received')
   h.eq(p1Ledger[0].delta, 2, 'and it is the same $2')
+  h.eq(p1Ledger[0].balance, 1502, 'creditor balance recorded too')
   h.eq(p1Ledger[0].memo, 'Received from Asha: Rent: Mediterranean Ave', 'creditor memo names the payer')
 
   h.ok(h.act(0, { type: 'mortgage', space: 3 }), 'mortgage Baltic')
   h.eq(h.s.ledger.filter((e) => e.playerId === h.id(0) && e.memo === 'Mortgaged Baltic Ave').length, 1, 'mortgage recorded')
+  h.eq(
+    h.s.ledger.find((e) => e.playerId === h.id(0) && e.memo === 'Mortgaged Baltic Ave')?.balance,
+    1728,
+    'balance after the mortgage: $1,728',
+  )
 })
 
 scenario('bankrupt players are skipped in turn order', 4, (h) => {
