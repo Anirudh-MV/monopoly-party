@@ -194,6 +194,16 @@ button:hover { filter: brightness(1.06); }
 .crown { color: var(--money-bright); }
 .off { color: var(--bad); font-style: normal; font-size: 0.75em; }
 
+/* jail badges + the arrest prompt */
+.jailbadge {
+  font-size: 0.65em; font-weight: 700; color: var(--bad);
+  border: 1px solid #d98080; border-radius: 999px; padding: 0 0.6vh;
+  white-space: nowrap;
+}
+[data-theme='dark'] .jailbadge { color: #fca5a5; }
+.cardprompt.jailprompt { border-color: var(--bad); }
+.cardprompt.jailprompt .cp-title { color: var(--bad); }
+
 /* landed spotlight, inside the queue column */
 .qlanded { margin-top: 1.2vh; border-top: 1px solid var(--line); padding-top: 1vh; }
 .ql-head { color: var(--dim); font-size: 2.2vh; font-weight: 700; letter-spacing: 0.22em; margin-bottom: 0.4vh; }

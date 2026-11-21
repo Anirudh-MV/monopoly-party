@@ -225,7 +225,7 @@ scenario('buy requires cash; decline is the fallback', 4, (h) => {
   h.eq(allowedActions(h.s, h.id(0)).includes('declineBuy'), true, 'auction is offered')
 })
 
-scenario('three doubles in a row → straight to jail', 4, (h) => {
+scenario('three doubles in a row → the arrest is announced, then executed', 4, (h) => {
   h.roll(0, [[3, 3]]) // → 6, unowned
   h.ok(h.act(0, { type: 'buy' }), 'buy Oriental')
   h.eq(h.s.phase, 'ROLL', 'doubles: roll again')
@@ -233,10 +233,34 @@ scenario('three doubles in a row → straight to jail', 4, (h) => {
   h.ok(h.act(0, { type: 'declineBuy' }), 'decline Electric Co')
   for (const i of [0, 1, 2, 3]) h.ok(h.act(i, { type: 'passBid' }), `p${i} passes auction`)
   h.eq(h.s.phase, 'ROLL', 'second doubles: roll again')
-  h.roll(0, [[3, 3]]) // third doubles
-  h.eq(h.p(0).jail, true, 'jailed for speeding')
+  h.roll(0, [[3, 3]]) // third doubles → arrest announced
+  h.eq(h.s.pendingJail != null && h.s.pendingJail.reason, 'doubles', 'the sentence is announced, not executed')
+  h.eq(h.p(0).jail, false, 'not in jail yet — the phone button decides')
+  h.eq(h.p(0).pos, 12, 'piece waits on its last landing spot until the tap')
+  h.bad(h.act(1, { type: 'goToJail' }), 'only the arrested player can tap')
+  h.bad(h.act(0, { type: 'endTurn' }), 'cannot end turn before the arrest')
+  h.eq(allowedActions(h.s, h.id(0)).includes('goToJail'), true, 'the arrested phone shows the Go to Jail button')
+  h.ok(h.act(0, { type: 'goToJail' }), 'tap Go to Jail')
+  h.eq(h.p(0).jail, true, 'jailed')
   h.eq(h.p(0).pos, 10, 'in jail')
-  h.eq(h.s.phase, 'ACTION', 'turn ends after the bust')
+  h.eq(h.p(0).jailReason, 'rolled three doubles in a row', 'the reason is on record')
+  h.eq(h.s.pendingJail, null, 'sentence executed')
+  h.eq(h.s.phase, 'ACTION', 'turn ends after the arrest')
+})
+
+scenario('chance: "Go directly to Jail" — reveal first, then the arrest', 4, (h) => {
+  h.s.chanceDeck = ['ch10']
+  h.now(0)
+  h.p(0).pos = 34
+  h.roll(0, [[1, 1]]) // → 36 Chance
+  h.ok(h.act(0, { type: 'drawCard' }), 'spin the wheel')
+  h.eq(h.s.pendingCard != null && h.s.pendingCard.deck, 'chance', 'the reveal is in flight')
+  h.eq(h.s.pendingJail != null && h.s.pendingJail.reason, 'card', 'the card announces the arrest')
+  h.eq(h.p(0).pos, 34 + 2, 'piece waits while the reveal plays') // still on the chance tile (36)
+  h.ok(h.act(0, { type: 'goToJail' }), 'tap Go to Jail after the reveal')
+  h.eq(h.p(0).jail, true, 'jailed')
+  h.eq(h.p(0).jailReason, 'the card says: Go directly to Jail', 'the card reason is on record')
+  h.eq(h.p(0).cash, 1500, 'no GO money for card arrests')
 })
 
 scenario('jail: pay fine, use card, doubles escape, three failures', 4, (h) => {
@@ -285,13 +309,18 @@ scenario('jail: pay fine, use card, doubles escape, three failures', 4, (h) => {
   h.eq(h.s.phase, 'ACTION', 'turn continues')
 })
 
-scenario('go to jail space: no GO money', 4, (h) => {
+scenario('go to jail space: announced, then executed, no GO money', 4, (h) => {
   h.now(0)
   h.p(0).pos = 27
   h.roll(0, [[2, 1]]) // → 30
+  h.eq(h.s.pendingJail != null && h.s.pendingJail.reason, 'space', 'landing announces the arrest')
+  h.eq(h.p(0).pos, 30, 'piece waits on the Go To Jail tile until the tap')
+  h.eq(h.p(0).cash, 1500, 'no GO money on the way to the arrest')
+  h.ok(h.act(0, { type: 'goToJail' }), 'tap Go to Jail')
   h.eq(h.p(0).pos, 10, 'jailed')
   h.eq(h.p(0).jail, true, 'in jail')
-  h.eq(h.p(0).cash, 1500, 'no GO money on the way to jail')
+  h.eq(h.p(0).jailReason, 'landed on Go To Jail', 'the reason is on record')
+  h.eq(h.p(0).cash, 1500, 'still no GO money')
 })
 
 scenario('chance: nearest railroad charges double rent', 4, (h) => {
@@ -568,6 +597,7 @@ scenario('allowed actions gate everything (tamper-proof reducer)', 4, (h) => {
   h.bad(h.act(1, { type: 'mortgage', space: 999 }), 'no such space')
   h.bad(h.act(1, { type: 'payDebt' }), 'no debt')
   h.bad(h.act(1, { type: 'bankrupt' }), 'not in debt')
+  h.bad(h.act(1, { type: 'goToJail' }), 'no arrest pending')
   h.bad(h.act(1, { type: 'respondTrade', tradeId: 'nope', accept: true }), 'no such offer')
   h.bad(h.act(1, { type: 'bid', amount: 5 }), 'no auction running')
   h.eq(allowedActions(h.s, h.id(1)).includes('roll'), false, 'only the current player rolls')

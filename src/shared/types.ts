@@ -44,6 +44,8 @@ export interface PlayerState {
   jail: boolean
   jailRolls: number
   jailCards: number
+  /** Why this player is in jail ("landed on Go To Jail" etc.), for displays. */
+  jailReason: string | null
   bankrupt: boolean
   connected: boolean
 }
@@ -110,6 +112,8 @@ export interface GameState {
   // "spins the wheel" from their phone, which then performs the actual draw.
   pendingCardDraw: { player: string; deck: 'chance' | 'chest'; space: number } | null
   cardDrawSeq: number // bumped on every reveal so screens can animate it
+  // The announced-but-not-yet-executed jail sentence (two-step arrest).
+  pendingJail: PendingJail | null
   pendingPurchase: number | null
   pendingTax: { player: string; space: number } | null
   pendingMove: number | null // steps to finish after a debt is resolved (jail fine case)
@@ -147,6 +151,7 @@ export interface RulesState {
   pendingPurchase: number | null
   pendingTax: { player: string; space: number } | null
   pendingCardDraw: { player: string; deck: 'chance' | 'chest'; space: number } | null
+  pendingJail: PendingJail | null
   debt: DebtState | null
   auction: AuctionState | null
   trades: TradeOffer[]
@@ -157,6 +162,7 @@ export interface RulesState {
 export type Action =
   | { type: 'roll' }
   | { type: 'drawCard' }
+  | { type: 'goToJail' }
   | { type: 'buy' }
   | { type: 'declineBuy' }
   | { type: 'bid'; amount: number }
@@ -197,6 +203,7 @@ export interface HostView {
   pendingCard: Card | null
   pendingCardDraw: { player: string; deck: 'chance' | 'chest'; space: number } | null
   cardDrawSeq: number
+  pendingJail: PendingJail | null
   pendingPurchase: number | null
   pendingTax: { player: string; space: number } | null
   debt: DebtState | null
@@ -213,6 +220,24 @@ export interface PlayerView extends HostView {
   you: string
   allowed: ActionType[]
   isHost: boolean
+}
+
+// ── The two-step arrest ──
+// Landing on Go To Jail, drawing "Go directly to Jail", or rolling three
+// doubles announces the sentence first; the arrested player taps "Go to
+// Jail" on their phone (30s deadline) so the whole table sees it coming.
+
+export type JailReason = 'space' | 'card' | 'doubles'
+
+export const JAIL_REASONS: Record<JailReason, string> = {
+  space: 'landed on Go To Jail',
+  card: 'the card says: Go directly to Jail',
+  doubles: 'rolled three doubles in a row',
+}
+
+export interface PendingJail {
+  player: string
+  reason: JailReason
 }
 
 // ── Lobby (pre-game) ──

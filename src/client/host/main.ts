@@ -285,12 +285,13 @@ function updateTopbar(v: HostView): void {
     return
   }
   const captions: string[] = []
+  if (v.pendingJail) captions.push(`${v.players.find((p) => p.id === v.pendingJail?.player)?.name ?? ''} is being arrested`)
   if (v.pendingPurchase != null) captions.push(`Buy or auction ${BOARD[v.pendingPurchase].name}?`)
   if (v.pendingTax) captions.push('Choosing how to pay Income Tax…')
   if (v.trades.length > 0) captions.push(`${v.trades.length} trade offer${v.trades.length > 1 ? 's' : ''} on the table`)
-  if (v.phase === 'ROLL') captions.push('Roll on your phone')
+  if (v.phase === 'ROLL') captions.push(cur && cur.jail ? 'Roll from jail on your phone' : 'Roll on your phone')
   el.innerHTML = `
-    ${cur ? `<div class="tb-turn">${cur.token} <b>${esc(cur.name)}</b>'s turn</div>` : ''}
+    ${cur ? `<div class="tb-turn">${cur.token} <b>${esc(cur.name)}</b>'s turn${cur.jail ? ' · in jail' : ''}</div>` : ''}
     <div class="tb-caps">${captions.map((c) => `<span class="tb-cap">${c}</span>`).join('')}</div>`
 }
 
@@ -342,11 +343,12 @@ function updateQueue(v: HostView): void {
     return
   }
   const crown = (p: PlayerState): string => (p.id === v.hostId ? ' <span class="crown">Host</span>' : '')
+  const jailBadge = (p: PlayerState): string => (p.jail ? ' <span class="jailbadge">in jail</span>' : '')
   el.innerHTML = `
     <div class="qhead">ROOM ${esc(v.code)} · TURN ${v.turn}</div>
     <div class="qnow" style="--c:${now.color}">
       <span class="qt">${now.token}</span>
-      <span class="qn">${esc(now.name)}${crown(now)}</span>
+      <span class="qn">${esc(now.name)}${crown(now)}${jailBadge(now)}</span>
       <span class="qc">$${now.cash}</span>
     </div>
     ${rest
@@ -354,7 +356,7 @@ function updateQueue(v: HostView): void {
         (p) => `
     <div class="qitem" style="--c:${p.color}">
       <span class="qt">${p.token}</span>
-      <span class="qn">${esc(p.name)}${crown(p)}${!p.connected ? '<em class="off">off</em>' : ''}</span>
+      <span class="qn">${esc(p.name)}${crown(p)}${jailBadge(p)}${!p.connected ? '<em class="off">off</em>' : ''}</span>
       <span class="qc">$${p.cash}</span>
     </div>`,
       )
@@ -505,6 +507,25 @@ function updateCenter(v: HostView): void {
           : '<div class="wheelwrap waiting"><div class="wheeldisc"></div><div class="wheelhub"></div><div class="wheelpointer"></div></div>'}</div>
         <div class="cp-title">${esc(drawer?.name ?? '')} landed on ${isChest ? 'Community Chest' : 'Chance'}</div>
         <div class="cp-sub">${isChest ? 'Open the chest' : 'Spin the wheel'} on ${esc(drawer?.name ?? '')}'s phone</div>
+      </div>`
+    return
+  }
+
+  // an arrest has been announced — the whole table sees who and why while
+  // the arrested player's phone shows the Go to Jail button (30s clock).
+  // (If the jail came from a card, the wheel reveal finishes first.)
+  if (v.pendingJail && !(v.pendingCard && Date.now() < revealUntil)) {
+    const arrested = v.players.find((p) => p.id === v.pendingJail?.player)
+    const reason = v.pendingJail.reason === 'space'
+      ? 'landed on Go To Jail'
+      : v.pendingJail.reason === 'card'
+        ? 'the card says: Go directly to Jail'
+        : 'rolled three doubles in a row'
+    el.innerHTML = `
+      <div class="cardprompt jailprompt">
+        <div class="cp-title">${arrested?.token ?? ''} ${esc(arrested?.name ?? '')} is under arrest</div>
+        <div class="cp-sub">${esc(arrested?.name ?? '')} ${reason}</div>
+        <div class="cp-sub">Tap "Go to Jail" on ${esc(arrested?.name ?? '')}'s phone</div>
       </div>`
     return
   }

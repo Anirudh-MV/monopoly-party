@@ -175,7 +175,9 @@ export function allowedActions(s: RulesState, pid: string): ActionType[] {
   }
 
   if (s.phase === 'ACTION' && s.currentPlayerId === pid) {
-    if (s.pendingCardDraw) {
+    if (s.pendingJail) {
+      out.add('goToJail')
+    } else if (s.pendingCardDraw) {
       out.add('drawCard')
     } else if (s.pendingPurchase != null) {
       const sp = BOARD[s.pendingPurchase]

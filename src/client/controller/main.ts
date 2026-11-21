@@ -241,6 +241,7 @@ $app.addEventListener('click', (ev) => {
     }
     case 'roll': send({ type: 'roll' }); break
     case 'drawCard': send({ type: 'drawCard' }); break
+    case 'goToJail': send({ type: 'goToJail' }); break
     case 'buy': send({ type: 'buy' }); break
     case 'declineBuy': send({ type: 'declineBuy' }); break
     case 'endTurn': send({ type: 'endTurn' }); break
@@ -330,7 +331,7 @@ $app.addEventListener('input', (ev) => {
 })
 
 function meOf(v: PlayerView | null) {
-  return v?.players.find((p) => p.id === v.you) ?? { id: '', name: '', color: '', token: '', cash: 0, pos: 0, jail: false, jailRolls: 0, jailCards: 0, bankrupt: false, connected: false }
+  return v?.players.find((p) => p.id === v.you) ?? { id: '', name: '', color: '', token: '', cash: 0, pos: 0, jail: false, jailRolls: 0, jailCards: 0, jailReason: null, bankrupt: false, connected: false }
 }
 function partnerPlayer(v: PlayerView | null, pid: string) {
   return v?.players.find((p) => p.id === pid)
@@ -502,8 +503,22 @@ function renderGame(v: PlayerView): void {
     </div>`
   } else if (v.pendingCardDraw) {
     banner = `<div class="banner info">${cur ? esc(cur.name) : 'The active player'} landed on ${v.pendingCardDraw.deck === 'chest' ? 'Community Chest' : 'Chance'} — waiting for the reveal…</div>`
+  } else if (v.pendingJail && v.pendingJail.player === I.id) {
+    const reason = v.pendingJail.reason === 'space'
+      ? 'you landed on Go To Jail'
+      : v.pendingJail.reason === 'card'
+        ? 'the card says: Go directly to Jail'
+        : 'you rolled three doubles in a row'
+    banner = `<div class="banner debt">You're under arrest — ${reason}</div>`
+    body += `<div class="card actions">
+      <button class="big danger" data-act="goToJail">Go to Jail</button>
+      <p class="hint">The sentence starts when you tap — the table is watching.</p>
+    </div>`
+  } else if (v.pendingJail) {
+    const arrested = v.players.find((p) => p.id === v.pendingJail?.player)
+    banner = `<div class="banner info">${arrested?.token ?? ''} ${esc(arrested?.name ?? '')} is under arrest — waiting for them to go to jail…</div>`
   } else if (v.phase === 'ROLL' && I.id === v.currentPlayerId) {
-    banner = `<div class="banner good">Your turn${I.jail ? ' — you\u2019re in jail!' : ''}</div>`
+    banner = `<div class="banner good">Your turn${I.jail ? ` — you're in jail (${I.jailReason ?? 'sentenced earlier'})` : ''}</div>`
     body += `<div class="card actions">
       <button class="big primary" data-act="roll">Roll the dice</button>
       ${I.jail ? `
@@ -569,7 +584,7 @@ function renderGame(v: PlayerView): void {
     <header class="topbar" style="--c:${I.color}">
       <span class="me">${I.token} ${esc(I.name)}</span>
       <span class="money">$${I.cash}</span>
-      <span class="meta">worth $${worth}${I.jailCards > 0 ? ` · jail card ×${I.jailCards}` : ''}</span>
+      <span class="meta">worth $${worth}${I.jailCards > 0 ? ` · jail card ×${I.jailCards}` : ''}${I.jail ? ' · in jail' : ''}</span>
       <button class="themebtn" data-act="theme">${theme === 'light' ? 'Dark' : 'Light'}</button>
     </header>
     ${banner}

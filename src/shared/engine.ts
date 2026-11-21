@@ -21,12 +21,14 @@ import type {
   Card,
   CardEffect,
   GameState,
+  JailReason,
   LogEntry,
   MoneyEvent,
   PlayerState,
   PropertyState,
   TradeSide,
 } from './types.js'
+import { JAIL_REASONS, type PendingJail } from './types.js'
 
 export type Result = { ok: true } | { ok: false; error: string }
 const OK: Result = { ok: true }
@@ -80,6 +82,7 @@ export function createGame(players: PlayerMeta[], rng: () => number = Math.rando
       jail: false,
       jailRolls: 0,
       jailCards: 0,
+      jailReason: null,
       bankrupt: false,
       connected: true,
     })),
@@ -111,6 +114,7 @@ export function createGame(players: PlayerMeta[], rng: () => number = Math.rando
     deadlineFor: null,
     pendingCardDraw: null,
     cardDrawSeq: 0,
+    pendingJail: null,
     log: [],
     turn: 1,
     winner: null,
@@ -156,7 +160,7 @@ function advancePhase(s: GameState): void {
     s.phase = 'DEBT'
     return
   }
-  if (s.pendingPurchase != null || s.pendingTax != null || s.pendingCardDraw != null) {
+  if (s.pendingPurchase != null || s.pendingTax != null || s.pendingCardDraw != null || s.pendingJail != null) {
     s.phase = 'ACTION'
     return
   }
@@ -175,6 +179,7 @@ function nextPlayer(s: GameState): void {
   s.doubles = 0
   s.pendingCard = null
   s.pendingCardDraw = null
+  s.pendingJail = null
   s.pendingMove = null
   const order = s.players
   const k = order.findIndex((q) => q.id === s.currentPlayerId)
@@ -230,12 +235,29 @@ function advance(s: GameState, steps: number, rng: () => number): void {
   advancePhase(s)
 }
 
-function sendToJail(s: GameState, p: PlayerState): void {
+// ── The two-step arrest ──
+// Triggers (space / card / triple doubles) only ANNOUNCE the sentence;
+// the 'goToJail' action executes it — from the arrested player's phone,
+// on a 30-second deadline, so the whole table sees it coming.
+
+function announceJail(s: GameState, p: PlayerState, reason: JailReason): void {
+  s.pendingJail = { player: p.id, reason }
+  log(s, `${p.name} is under arrest — ${JAIL_REASONS[reason]}`, 'bad')
+}
+
+function sendToJail(s: GameState, p: PlayerState, reason: JailReason): void {
   p.pos = JAIL_POS
   p.jail = true
   p.jailRolls = 0
+  p.jailReason = JAIL_REASONS[reason]
   s.lastMove = null // a jail ride is a snap, not a stroll
-  log(s, `${p.name} was thrown in jail!`, 'bad')
+  s.pendingJail = null
+  log(s, `${p.name} was taken to jail (${JAIL_REASONS[reason]})`, 'bad')
+}
+
+function releaseFromJail(s: GameState, p: PlayerState): void {
+  p.jail = false
+  p.jailReason = null
 }
 
 function land(s: GameState, p: PlayerState, opts: { railMult?: number; utilMult?: number }, rng: () => number): void {
@@ -249,7 +271,7 @@ function land(s: GameState, p: PlayerState, opts: { railMult?: number; utilMult?
     case 'jail': // just visiting
       break
     case 'gotojail':
-      sendToJail(s, p)
+      announceJail(s, p, 'space')
       break
     case 'chance':
       s.pendingCardDraw = { player: p.id, deck: 'chance', space: i }
@@ -414,7 +436,7 @@ function applyCard(s: GameState, p: PlayerState, card: Card, rng: () => number):
       break
     }
     case 'gotojail': {
-      sendToJail(s, p)
+      announceJail(s, p, 'card')
       break
     }
     case 'repairs': {
@@ -597,14 +619,14 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
 
       if (p.jail) {
         if (d1 === d2) {
-          p.jail = false
+          releaseFromJail(s, p)
           p.jailRolls = 0
           log(s, `${p.name} rolled doubles and busted out of jail!`, 'good')
           advance(s, d1 + d2, rng) // doubles from jail do NOT grant another roll
         } else {
           p.jailRolls++
           if (p.jailRolls >= MAX_JAIL_ATTEMPTS) {
-            p.jail = false
+            releaseFromJail(s, p)
             p.jailRolls = 0
             log(s, `${p.name} failed 3 times — must pay the $${JAIL_FINE} fine`, 'bad')
             charge(s, p, JAIL_FINE, null, 'Jail release fine')
@@ -625,9 +647,9 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       if (d1 === d2) {
         s.doubles++
         if (s.doubles >= MAX_JAIL_ATTEMPTS) {
-          log(s, `Three doubles in a row — straight to jail!`, 'bad')
-          sendToJail(s, p)
-          s.phase = 'ACTION'
+          log(s, `Three doubles in a row — the police are on their way!`, 'bad')
+          announceJail(s, p, 'doubles')
+          advancePhase(s) // pendingJail holds the turn for the 30s arrest
           return OK
         }
       }
@@ -683,10 +705,18 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
 
     case 'endTurn': {
       if (s.phase !== 'ACTION' || s.currentPlayerId !== by) return fail('You can only end your own turn')
-      if (s.pendingPurchase != null || s.pendingTax != null || s.pendingCardDraw != null || s.debt) {
+      if (s.pendingPurchase != null || s.pendingTax != null || s.pendingCardDraw != null || s.pendingJail != null || s.debt) {
         return fail('Resolve the pending action first')
       }
       nextPlayer(s)
+      return OK
+    }
+
+    case 'goToJail': {
+      const j = s.pendingJail
+      if (!j || j.player !== by) return fail('No arrest waiting for you')
+      sendToJail(s, p, j.reason)
+      advancePhase(s)
       return OK
     }
 
@@ -758,7 +788,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       if (!p.jail || s.phase !== 'ROLL' || s.currentPlayerId !== by) return fail('Not your jail sentence')
       p.cash -= JAIL_FINE
       logMoney(s, by, -JAIL_FINE, 'Paid jail release fine')
-      p.jail = false
+      releaseFromJail(s, p)
       log(s, `${p.name} pays $${JAIL_FINE} and walks out of jail`, 'money')
       return OK
     }
@@ -766,7 +796,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
     case 'useJailCard': {
       if (!p.jail || p.jailCards <= 0) return fail('No jail card to use')
       p.jailCards--
-      p.jail = false
+      releaseFromJail(s, p)
       returnJailCardsToDecks(s, 1)
       log(s, `${p.name} uses a Get Out of Jail Free card 🎟`, 'good')
       return OK

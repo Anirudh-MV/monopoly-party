@@ -22,6 +22,7 @@ export function hostView(s: GameState, code: string, hostId: string | null, turn
     pendingCard: s.pendingCard,
     pendingCardDraw: s.pendingCardDraw,
     cardDrawSeq: s.cardDrawSeq,
+    pendingJail: s.pendingJail,
     pendingPurchase: s.pendingPurchase,
     pendingTax: s.pendingTax,
     debt: s.debt,

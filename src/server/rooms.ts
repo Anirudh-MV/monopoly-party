@@ -197,6 +197,7 @@ export function remedyActionsFor(s: GameState): Array<[string, Action]> {
     return [[s.debt.debtor, p && p.cash >= amount ? { type: 'payDebt' } : { type: 'bankrupt' }]]
   }
   if (s.phase === 'ACTION') {
+    if (s.pendingJail) return [[s.pendingJail.player, { type: 'goToJail' }]]
     if (s.pendingCardDraw) return [[cur, { type: 'drawCard' }]]
     if (s.pendingPurchase != null) return [[cur, { type: 'declineBuy' }]]
     if (s.pendingTax) return [[cur, { type: 'payTax', choice: 'flat' }]]
@@ -226,6 +227,7 @@ function currentDecision(s: GameState): Decision | null {
     return { key: `roll:${s.turn}:${s.currentPlayerId}:${d}:${s.doubles}`, playerId: s.currentPlayerId }
   }
   if (s.phase === 'ACTION') {
+    if (s.pendingJail) return { key: `jail:${s.turn}:${s.pendingJail.player}`, playerId: s.pendingJail.player }
     if (s.pendingCardDraw) return { key: `draw:${s.turn}:${s.pendingCardDraw.deck}:${s.pendingCardDraw.space}`, playerId: s.currentPlayerId }
     if (s.pendingPurchase != null) return { key: `buy:${s.turn}:${s.pendingPurchase}`, playerId: s.currentPlayerId }
     if (s.pendingTax) return { key: `tax:${s.turn}`, playerId: s.currentPlayerId }
@@ -241,6 +243,7 @@ function autoActionsFor(room: Room, d: Decision): Array<[string, Action]> {
   const s = room.state
   if (!s || !d.playerId) return []
   if (d.key.startsWith('roll:')) return [[d.playerId, { type: 'roll' }]]
+  if (d.key.startsWith('jail:')) return [[d.playerId, { type: 'goToJail' }]]
   if (d.key.startsWith('draw:')) return [[d.playerId, { type: 'drawCard' }]]
   if (d.key.startsWith('buy:')) return [[d.playerId, { type: 'declineBuy' }]]
   if (d.key.startsWith('tax:')) {
@@ -283,7 +286,10 @@ function scheduleDeadline(room: Room): void {
   if (room.timerKey === decision.key) return // already ticking for this decision
   if (room.timer) clearTimeout(room.timer)
   room.timerKey = decision.key
-  s.deadline = Date.now() + room.turnTimeoutMs
+  // Arrests run on a fixed 30-second clock even when the general decision
+  // timer is disabled by the host.
+  const duration = decision.key.startsWith('jail:') ? 30_000 : room.turnTimeoutMs
+  s.deadline = Date.now() + duration
   s.deadlineFor = decision.playerId
   room.timer = setTimeout(() => {
     room.timer = null
@@ -293,8 +299,7 @@ function scheduleDeadline(room: Room): void {
     if (!st || key !== decision.key) return // decision already resolved
     if (decision.playerId != null) {
       applyServerAction(room, autoActionsFor(room, decision))
-    } else {
-      // Auction silence: pass everyone who could still bid — the hammer falls.
+    } else {      // Auction silence: pass everyone who could still bid — the hammer falls.
       const au = st.auction
       if (!au) return
       for (const q of alivePlayers(st)) {
@@ -304,7 +309,7 @@ function scheduleDeadline(room: Room): void {
         }
       }
     }
-  }, room.turnTimeoutMs)
+  }, duration)
 }
 
 // Timer-side commit path: same clone-apply-commit rules as player actions,
