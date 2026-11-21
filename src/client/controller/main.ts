@@ -63,6 +63,15 @@ let lastCardSeq = -1
 // ledger tab (defaults to "me")
 let ledgerTab: string | null = null
 
+function stripColorPhone(sp: Space): string {
+  if (isStreet(sp)) return GROUP_COLORS[sp.group]
+  if (sp.kind === 'rail') return '#4b5563'
+  if (sp.kind === 'utility') return '#6b7280'
+  if (sp.kind === 'chance') return '#c2410c'
+  if (sp.kind === 'chest') return '#0e7490'
+  return '#9aa1ad'
+}
+
 function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string)
 }
@@ -399,6 +408,21 @@ function renderGame(v: PlayerView): void {
     drawStrip = `<div class="drawstrip">${I.id === v.currentPlayerId ? 'You drew' : `${cur ? esc(cur.name) : 'Someone'} drew`}: ${esc(v.pendingCard.text)}</div>`
   }
 
+  // What the active player just landed on, in its group color — visible on
+  // every phone so the table shares one mental model of the board.
+  let landedStrip = ''
+  if (v.lastLanded && v.lastLanded.playerId === v.currentPlayerId) {
+    const i = v.lastLanded.space
+    const sp = BOARD[i]
+    const col = stripColorPhone(sp)
+    const drawer = v.players.find((p) => p.id === v.currentPlayerId)
+    const who = I.id === v.currentPlayerId ? 'You' : `${drawer?.token ?? ''} ${esc(drawer?.name ?? '')}`
+    landedStrip = `<div class="landedstrip" style="--g:${col}">
+      <span class="ls-swatch"></span>
+      <span class="ls-text">${who} landed on <b>${esc(sp.name)}</b>${'price' in sp ? ` · $${sp.price}` : ''}${isStreet(sp) ? ` <span class="ls-group">${sp.group.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()}</span>` : ''}</span>
+    </div>`
+  }
+
   // Deadline chip: the 300s decision clock is hidden until its final
   // 30 seconds — then it's impossible to ignore.
   let deadlineChip = ''
@@ -531,6 +555,7 @@ function renderGame(v: PlayerView): void {
       <button class="themebtn" data-act="theme">${theme === 'light' ? 'Dark' : 'Light'}</button>
     </header>
     ${banner}
+    ${landedStrip}
     ${drawStrip}
     ${deadlineChip}
     <main>${body}</main>

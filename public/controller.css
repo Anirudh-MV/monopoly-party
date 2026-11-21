@@ -118,6 +118,18 @@ button.disabled, button:disabled { opacity: 0.4; }
   color: var(--dim); font-size: 13px; line-height: 1.4;
 }
 
+/* landed strip — group color front and center */
+.landedstrip {
+  display: flex; align-items: center; gap: 10px;
+  margin: 8px 0 0; padding: 10px 12px; border-radius: 12px;
+  background: color-mix(in srgb, var(--g) 14%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--g) 50%, var(--line));
+  font-size: 14px; font-weight: 600;
+}
+.landedstrip .ls-swatch { width: 14px; height: 28px; border-radius: 4px; background: var(--g); flex: none; }
+.landedstrip .ls-text { line-height: 1.35; }
+.landedstrip .ls-group { display: block; color: var(--dim); font-size: 12px; font-weight: 500; text-transform: capitalize; }
+
 /* decision countdown — only visible in the final 30 seconds */
 .deadline {
   margin: 10px 0 4px;
