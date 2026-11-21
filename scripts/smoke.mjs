@@ -129,6 +129,7 @@ try {
       const action =
         acts.includes('roll') ? { type: 'roll' }
         : acts.includes('drawCard') ? { type: 'drawCard' }
+        : acts.includes('payDebt') ? { type: 'payDebt' } // rent is paid by hand now
         : acts.includes('buy') ? { type: 'buy' }
         : acts.includes('declineBuy') ? { type: 'declineBuy' }
         : acts.includes('payTax') ? { type: 'payTax', choice: 'flat' }

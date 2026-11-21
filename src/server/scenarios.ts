@@ -116,11 +116,14 @@ scenario('rent: base, then color-set doubling on a doubles chain', 4, (h) => {
   h.now(1)
   h.p(1).pos = 39
   h.roll(1, [[1, 1]]) // → Mediterranean (wrap past GO)
+  h.eq(h.s.phase, 'DEBT', 'rent arrives as a pending debt, not a silent deduction')
+  h.ok(h.act(1, { type: 'payDebt' }), 'the landing player pays it by hand')
   h.eq(h.p(1).cash, 1698, 'paid $2 base rent after +200 GO money')
   h.eq(h.p(0).cash, 1502, 'owner collected')
   // doubles → same player rolls again from pos 1
   h.give(0, [3]) // now owns the full brown group
   h.roll(1, [[1, 1]]) // → Baltic: doubled rent $8
+  h.ok(h.act(1, { type: 'payDebt' }), 'pays the doubled rent too')
   h.eq(h.p(1).cash, 1690, 'color-set doubles the base rent')
   h.eq(h.p(0).cash, 1510, 'owner collected $8')
 })
@@ -346,6 +349,8 @@ scenario('chance: nearest railroad charges double rent', 4, (h) => {
   h.ok(h.act(0, { type: 'drawCard' }), 'spin the wheel')
   h.eq(h.s.cardDrawSeq, 1, 'reveal counted for animations')
   h.eq(h.p(0).pos, 15, 'advanced to the railroad')
+  h.eq(h.s.phase, 'DEBT', 'the railroad rent is a pending debt')
+  h.ok(h.act(0, { type: 'payDebt' }), 'double rent paid by hand')
   h.eq(h.p(0).cash, 1450, 'paid 2× the single-rail rent ($50)')
   h.eq(h.p(1).cash, 1550, 'owner collected')
   h.eq(h.s.phase, 'ROLL', 'doubles on the movement roll: Asha rolls again')
@@ -361,6 +366,7 @@ scenario('chance: nearest utility charges 10× a fresh roll', 4, (h) => {
   h.ok(h.act(0, { type: 'drawCard' }, [[5, 2]]), 'spin') // the rigged pair feeds the fresh roll
   h.eq(h.p(0).pos, 28, 'advanced to Water Works')
   h.eq(h.s.lastMove != null && h.s.lastMove.path, [23, 24, 25, 26, 27, 28], 'the stroll to the utility is recorded tile-by-tile for the TV')
+  h.ok(h.act(0, { type: 'payDebt' }), 'utility rent paid by hand')
   h.eq(h.p(0).cash, 1430, 'paid 10 × 7 = $70')
 })
 
@@ -502,6 +508,7 @@ scenario('transaction ledger records every cash movement', 4, (h) => {
   h.now(0)
   h.p(0).pos = 38
   h.roll(0, [[1, 2]]) // sum 3 → wraps GO → lands on 1, owned by Ben
+  h.ok(h.act(0, { type: 'payDebt' }), 'pays the rent by hand')
   const p0Ledger = h.s.ledger.filter((e) => e.playerId === h.id(0))
   const p1Ledger = h.s.ledger.filter((e) => e.playerId === h.id(1))
   h.eq(p0Ledger.length, 2, 'Asha: GO money + rent')

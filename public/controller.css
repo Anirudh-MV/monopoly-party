@@ -55,6 +55,20 @@ label { display: block; color: var(--dim); font-size: 13px; margin: 12px 0 4px; 
   display: flex; align-items: center; justify-content: center;
 }
 .tok.sel { background: color-mix(in srgb, var(--accent) 18%, var(--panel)); border-color: var(--accent); transform: scale(1.06); }
+.tok.taken { opacity: 0.3; text-decoration: line-through; pointer-events: none; }
+
+/* two-step join: summary line + the 3D avatar pedestal */
+.join-summary {
+  font-size: 14px; color: var(--dim); margin-bottom: 12px;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.join-summary b { color: var(--ink, #1c2333); }
+.join-summary .tiny { min-height: 30px; font-size: 12px; padding: 2px 8px; margin-left: auto; }
+#avatarStage {
+  height: 210px; margin: 12px 0 4px;
+  border-radius: 16px; border: 1px dashed var(--line);
+  background: radial-gradient(circle at 50% 30%, color-mix(in srgb, var(--accent) 8%, var(--panel)), var(--panel));
+}
 input {
   width: 100%; font: inherit; color: var(--ink);
   background: var(--panel2); border: 1px solid var(--line); border-radius: 12px;
@@ -250,6 +264,18 @@ main { display: block; }
 .confirm-body { font-size: 14px; color: var(--dim); line-height: 1.55; margin-bottom: 16px; }
 .confirm-step { margin-top: 14px; }
 .topbar .exitbtn { color: #e15b5b; }
+
+/* ── pocket board ── */
+.board-overlay {
+  position: fixed; inset: 0; z-index: 80;
+  background: #0b0e1a;
+}
+.board-close {
+  position: fixed; top: 14px; right: 14px; z-index: 2;
+  padding: 10px 16px; border-radius: 12px;
+  background: #1c2333; color: #fff; border: 1px solid #3b4358;
+  font-size: 14px; font-weight: 700;
+}
 
 /* ── the dice roll moment ── */
 .roll-overlay {

@@ -7,6 +7,7 @@
 
 import * as THREE from 'three'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
+import { createAvatar } from '../tokens3d.js'
 import type { HostView } from '../../shared/types.js'
 
 const TILE = 2
@@ -49,16 +50,9 @@ const SEAT_OFFSETS: Array<[number, number]> = [
   [0, -0.65], [0, 0.65], [-0.65, 0], [0.65, 0],
 ]
 
-const TOKEN_GEOS: THREE.BufferGeometry[] = [
-  new THREE.ConeGeometry(0.3, 0.6, 24),
-  new THREE.BoxGeometry(0.62, 0.32, 0.3),
-  new THREE.SphereGeometry(0.3, 20, 16),
-  new THREE.CylinderGeometry(0.18, 0.32, 0.5, 16),
-  new THREE.BoxGeometry(0.28, 0.5, 0.28),
-  new THREE.TorusGeometry(0.24, 0.11, 12, 24),
-  new THREE.IcosahedronGeometry(0.32, 0),
-  new THREE.CylinderGeometry(0.3, 0.3, 0.24, 20),
-]
+// Avatar groups sit at their feet on the board surface (the slab top);
+// hops bounce above that line.
+const TOKEN_Y = 0.12
 
 function labelTexture(sp: (typeof BOARD)[number], tileLabel: boolean, dark: boolean): THREE.Texture {
   const ink = dark ? '#e8efff' : '#1c2333'
@@ -135,7 +129,7 @@ export class Board3D {
   private activeTileIndex: number | null = null // the tile whose label faces the camera
   private houseGroups: THREE.Group[] = []
   private lastHouses: number[] = []
-  private tokens: THREE.Mesh[] = []
+  private tokens: THREE.Object3D[] = []
   private tokenPos: THREE.Vector3[] = []
   private prevPos: number[] = []
   private hops: Hop[] = []
@@ -168,6 +162,9 @@ export class Board3D {
   private groundMat: THREE.MeshStandardMaterial | null = null
   private ambLight: THREE.AmbientLight | null = null
   private dirLight: THREE.DirectionalLight | null = null
+  // touch pointers for pinch-zoom (phones have no wheel)
+  private pointers = new Map<number, { x: number; y: number }>()
+  private pinchStart: { dist: number; zoom: number } | null = null
 
   constructor(container: HTMLElement) {
     this.renderer = new THREE.WebGLRenderer({ antialias: true })
@@ -213,15 +210,38 @@ export class Board3D {
 
   private onPointerDown = (ev: PointerEvent): void => {
     if (ev.button !== 0) return
+    this.pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY })
     this.dragging = true
     this.returning = false
     this.wheelDeadline = 0
     this.dragX = ev.clientX
     this.dragY = ev.clientY
     this.renderer.domElement.style.cursor = 'grabbing'
+    this.startPinch()
   }
 
   private onPointerMove = (ev: PointerEvent): void => {
+    if (!this.pointers.has(ev.pointerId)) {
+      if (!this.dragging) return
+      const dx = ev.clientX - this.dragX
+      const dy = ev.clientY - this.dragY
+      this.dragX = ev.clientX
+      this.dragY = ev.clientY
+      this.userYaw -= dx * 0.005
+      this.userPitch = THREE.MathUtils.clamp(this.userPitch + dy * 0.004, -1.15, 1.15)
+      return
+    }
+    this.pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY })
+    // two fingers: pinch to zoom (phones have no wheel)
+    if (this.pointers.size >= 2 && this.pinchStart) {
+      const [a, b] = [...this.pointers.values()]
+      const dist = Math.hypot(a.x - b.x, a.y - b.y)
+      if (this.pinchStart.dist > 0) {
+        this.userZoom = THREE.MathUtils.clamp(this.pinchStart.zoom * (dist / this.pinchStart.dist), 0.45, 2.6)
+        this.wheelDeadline = performance.now() + 2000
+      }
+      return
+    }
     if (!this.dragging) return
     const dx = ev.clientX - this.dragX
     const dy = ev.clientY - this.dragY
@@ -231,11 +251,21 @@ export class Board3D {
     this.userPitch = THREE.MathUtils.clamp(this.userPitch + dy * 0.004, -1.15, 1.15)
   }
 
-  private onPointerUp = (): void => {
-    if (!this.dragging) return
-    this.dragging = false
-    this.returning = true // ease back to the default view
-    this.renderer.domElement.style.cursor = 'grab'
+  private onPointerUp = (ev: PointerEvent): void => {
+    this.pointers.delete(ev.pointerId)
+    if (this.pointers.size < 2) this.pinchStart = null
+    if (this.pointers.size === 0) {
+      if (!this.dragging) return
+      this.dragging = false
+      this.returning = true // ease back to the default view
+      this.renderer.domElement.style.cursor = 'grab'
+    }
+  }
+
+  private startPinch(): void {
+    if (this.pointers.size < 2) return
+    const [a, b] = [...this.pointers.values()]
+    this.pinchStart = { dist: Math.hypot(a.x - b.x, a.y - b.y), zoom: this.userZoom }
   }
 
   private onWheel = (ev: WheelEvent): void => {
@@ -344,14 +374,14 @@ export class Board3D {
     }
   }
 
-  private ensureToken(idx: number, color: string): THREE.Mesh {
+  private ensureToken(idx: number, color: string): THREE.Object3D {
     if (this.tokens[idx]) return this.tokens[idx]
-    const mat = new THREE.MeshStandardMaterial({ color: new THREE.Color(color), roughness: 0.35, metalness: 0.35, emissive: new THREE.Color(color), emissiveIntensity: 0.18 })
-    const mesh = new THREE.Mesh(TOKEN_GEOS[idx % TOKEN_GEOS.length], mat)
-    this.scene.add(mesh)
-    this.tokens[idx] = mesh
-    this.tokenPos[idx] = mesh.position.clone()
-    return mesh
+    // One distinct avatar per emoji (see tokens3d.ts) — feet on the tile.
+    const obj = createAvatar(idx, color)
+    this.scene.add(obj)
+    this.tokens[idx] = obj
+    this.tokenPos[idx] = obj.position.clone()
+    return obj
   }
 
   private setHouses(i: number, count: number, region: string): void {
@@ -489,13 +519,13 @@ export class Board3D {
           // jail sends, god teleports, imports: snap to the destination
           const t = tileCenter(p.pos)
           const seat = SEAT_OFFSETS[idx % SEAT_OFFSETS.length]
-          mesh.position.set(t.x + seat[0], 0.42, t.z + seat[1])
+          mesh.position.set(t.x + seat[0], TOKEN_Y, t.z + seat[1])
         }
         this.prevPos[idx] = p.pos
       } else if (!this.hops.some((h) => h.playerIdx === idx)) {
         const t = tileCenter(p.pos)
         const seat = SEAT_OFFSETS[idx % SEAT_OFFSETS.length]
-        mesh.position.set(t.x + seat[0], 0.42, t.z + seat[1])
+        mesh.position.set(t.x + seat[0], TOKEN_Y, t.z + seat[1])
       }
     }
     for (let idx = v.players.length; idx < this.tokens.length; idx++) {
@@ -580,7 +610,7 @@ export class Board3D {
       if (done >= hop.path.length) {
         const last = tileCenter(hop.path[hop.path.length - 1])
         const seat = SEAT_OFFSETS[hop.playerIdx % SEAT_OFFSETS.length]
-        mesh.position.set(last.x + seat[0], 0.42, last.z + seat[1])
+        mesh.position.set(last.x + seat[0], TOKEN_Y, last.z + seat[1])
         this.hops = this.hops.filter((h) => h !== hop)
         continue
       }
@@ -590,7 +620,7 @@ export class Board3D {
       const seat = SEAT_OFFSETS[hop.playerIdx % SEAT_OFFSETS.length]
       const x = THREE.MathUtils.lerp(from.x, to.x, frac) + seat[0]
       const z = THREE.MathUtils.lerp(from.z, to.z, frac) + seat[1]
-      const y = 0.42 + Math.sin(frac * Math.PI) * 0.9
+      const y = TOKEN_Y + Math.sin(frac * Math.PI) * 0.9
       mesh.position.set(x, y, z)
     }
 

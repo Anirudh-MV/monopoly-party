@@ -71,6 +71,8 @@ export interface DebtState {
   debtor: string
   amount: number
   creditor: string | null // null = bank
+  /** What this debt is for ("Rent: Boardwalk") — ledger memos, displays. */
+  memo?: string
 }
 
 export interface TradeSide {

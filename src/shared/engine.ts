@@ -20,6 +20,7 @@ import type {
   Action,
   Card,
   CardEffect,
+  DebtState,
   GameState,
   JailReason,
   LogEntry,
@@ -314,8 +315,18 @@ function handleProperty(s: GameState, p: PlayerState, i: number, opts: { railMul
   const rent = R.rentFor(s, i, diceSum, opts)
   if (rent <= 0) return
   const owner = R.byId(s, st.owner)
-  log(s, `${p.name} pays $${rent} rent to ${owner?.name ?? 'the owner'}`, 'money')
-  charge(s, p, rent, st.owner, `Rent: ${sp.name}`)
+  log(s, `${p.name} owes $${rent} rent to ${owner?.name ?? 'the owner'}`, 'money')
+  // Rent is paid by hand, never silently deducted: even when affordable it
+  // becomes a pending debt with a Pay button on the landing player's phone —
+  // the feeling of actually spending the money. When they can't afford it,
+  // the existing raise-funds / bankruptcy path takes over from here, and the
+  // decision clock auto-pays on expiry so a stalled phone can't stall the table.
+  const d: DebtState = { debtor: p.id, amount: rent, creditor: st.owner, memo: `Rent: ${sp.name}` }
+  if (s.debt) s.debtQueue.push(d)
+  else {
+    s.debt = d
+    s.phase = 'DEBT'
+  }
 }
 
 // ── Cards ──
@@ -835,17 +846,18 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       const d = s.debt
       if (!d || d.debtor !== by) return fail('No debt to pay')
       if (p.cash < d.amount) return fail('Not enough cash yet — mortgage or sell below')
+      const memo = d.memo ?? 'Debt settlement'
       p.cash -= d.amount
-      logMoney(s, by, -d.amount, 'Debt settlement')
+      logMoney(s, by, -d.amount, memo)
       if (d.creditor) {
         const c = R.byId(s, d.creditor)
         if (c) {
           c.cash += d.amount
-          logMoney(s, c.id, d.amount, `Debt collected from ${p.name}`)
+          logMoney(s, c.id, d.amount, `Received from ${p.name}: ${memo}`)
         }
       }
       s.debt = null
-      log(s, `${p.name} settles the debt of $${d.amount}`, 'good')
+      log(s, `${p.name} pays the $${d.amount} they owed`, 'good')
       resumeAfterDebt(s, rng)
       return OK
     }

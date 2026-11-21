@@ -8,6 +8,8 @@
 import { io } from 'socket.io-client'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
 import { TOKENS, stripEmoji } from '../../shared/tokens.js'
+import { AvatarPreview } from '../tokens3d.js'
+import { Board3D } from '../host/board3d.js'
 import {
   canBuildOn,
   canMortgageOn,
@@ -68,6 +70,21 @@ let ledgerTab: string | null = null
 
 // the piece picked on the join screen (defaults to the first in the list)
 let joinPiece = TOKENS[0]
+
+// Join flow, two steps: name first, then the piece. The piece step shows a
+// live 3D preview of the avatar the emoji is tied to — what you pick here
+// is exactly what walks the TV board.
+let joinStage: 'name' | 'piece' = 'name'
+let joinCode = ''
+let joinName = ''
+const joinTaken = new Set<string>() // pieces the server refused as taken
+let avatarPreview: AvatarPreview | null = null
+const PREVIEW_COLOR = '#f59e0b'
+
+function disposeAvatarPreview(): void {
+  avatarPreview?.dispose()
+  avatarPreview = null
+}
 
 function stripColorPhone(sp: Space): string {
   if (isStreet(sp)) return GROUP_COLORS[sp.group]
@@ -314,6 +331,34 @@ function animateMoney(from: number, to: number): void {
   }
 }
 
+// ── pocket board ──
+// The full 3D board on the phone: drag to orbit, pinch to zoom, close to
+// return. It tracks the live game — every view syncs it while it's open.
+let phoneBoard: Board3D | null = null
+
+function showBoard(): void {
+  if (!view) return
+  closeBoard()
+  const overlay = document.createElement('div')
+  overlay.className = 'board-overlay'
+  const close = document.createElement('button')
+  close.className = 'board-close'
+  close.textContent = '✕ Close board'
+  overlay.appendChild(close)
+  document.body.appendChild(overlay)
+  phoneBoard = new Board3D(overlay)
+  phoneBoard.setTheme(theme)
+  phoneBoard.sync(view)
+  close.addEventListener('click', closeBoard)
+}
+
+function closeBoard(): void {
+  phoneBoard?.dispose()
+  phoneBoard = null
+  document.querySelector('.board-overlay')?.remove()
+  if (view || lobby) render()
+}
+
 // ── the GO salary moment ──
 // Crossing GO credits instantly server-side; the phone still makes a moment
 // of it — a Collect $200 prompt stands between the roll and the end-turn
@@ -398,6 +443,8 @@ socket.on('view', (v: PlayerView) => {
   maybeShowRoll(v)
   maybeShowGoPrompt(v)
   firstViewSeen = true
+  // a roaming board stays live with the game
+  phoneBoard?.sync(v)
 })
 
 // ── Actions ──
@@ -421,26 +468,50 @@ $app.addEventListener('click', (ev) => {
       document.documentElement.dataset.theme = theme
       render()
       break
-    case 'join': {
+    case 'joinNext': {
       const code = (document.getElementById('code') as HTMLInputElement).value.trim().toUpperCase()
       const name = stripEmoji((document.getElementById('name') as HTMLInputElement).value)
-      if (!code || !name) return toast('Room code and a name, please!')
-      socket.emit('room:join', { code, name, piece: joinPiece }, (res: JoinAck) => {
-        if (!res.ok) return toast(res.error ?? 'Could not join')
+      if (!/^[A-Z]{4}$/.test(code)) return toast('Enter the 4-letter room code')
+      if (!name) return toast('Enter your name first')
+      joinCode = code
+      joinName = name
+      joinStage = 'piece'
+      renderJoin()
+      break
+    }
+    case 'joinBack': {
+      joinStage = 'name'
+      renderJoin()
+      break
+    }
+    case 'join': {
+      socket.emit('room:join', { code: joinCode, name: joinName, piece: joinPiece }, (res: JoinAck) => {
+        if (!res.ok) {
+          // a taken piece gets crossed out in the grid, not just a toast
+          const m = /(\S+) is already taken/.exec(res.error ?? '')
+          if (m) {
+            joinTaken.add(m[1])
+            renderJoin()
+            toast(`${m[1]} is taken — pick another piece`)
+            return
+          }
+          return toast(res.error ?? 'Could not join')
+        }
         localStorage.setItem('mp-token', res.token ?? '')
         myToken = res.token ?? null
         myPlayerId = res.playerId ?? null
         localStorage.setItem('mp-playerid', myPlayerId ?? '')
-        myName = name
+        myName = joinName
       })
       break
     }
     case 'pickPiece': {
-      // toggle imperatively — a full re-render would wipe the name input
+      // toggle imperatively — a full re-render would restart the preview
       joinPiece = el.dataset.piece ?? joinPiece
       document.querySelectorAll('.tok').forEach((b) => {
         b.classList.toggle('sel', (b as HTMLElement).dataset.piece === joinPiece)
       })
+      avatarPreview?.show(TOKENS.indexOf(joinPiece), PREVIEW_COLOR)
       break
     }
     case 'startGame': {
@@ -459,6 +530,10 @@ $app.addEventListener('click', (ev) => {
       // Both exits (lobby "Leave room" and the in-game "Exit") start the
       // same two-step confirmation — see showExitConfirm.
       showExitConfirm(1)
+      break
+    }
+    case 'showBoard': {
+      showBoard()
       break
     }
     case 'roll': send({ type: 'roll' }); break
@@ -585,6 +660,7 @@ function partnerPlayer(v: PlayerView | null, pid: string) {
 // ── Render ──
 
 function render(): void {
+  if (view || lobby || rejoinPending) disposeAvatarPreview()
   if (view) {
     renderGame(view)
     return
@@ -607,22 +683,45 @@ function render(): void {
 }
 
 function renderJoin(): void {
+  disposeAvatarPreview()
+  if (joinStage === 'name') {
+    $app.innerHTML = `
+      <div class="join">
+        <h1>MONOPOLY PARTY</h1>
+        <div class="card">
+          <label>Room code</label>
+          <input id="code" maxlength="4" autocomplete="off" autocapitalize="characters" placeholder="ABCD" value="${esc(preCode || joinCode)}" />
+          <label>Your name <span class="hint-inline">(no emojis)</span></label>
+          <input id="name" maxlength="16" autocomplete="off" placeholder="e.g. Maya" value="${esc(joinName)}" />
+          <button class="big primary" data-act="joinNext">Next — pick your piece</button>
+          <p class="hint">Get the code from the TV screen</p>
+        </div>
+      </div>`
+    return
+  }
+  // piece stage: each emoji is tied to its own 3D avatar, previewed live
   $app.innerHTML = `
     <div class="join">
       <h1>MONOPOLY PARTY</h1>
       <div class="card">
-        <label>Room code</label>
-        <input id="code" maxlength="4" autocomplete="off" autocapitalize="characters" placeholder="ABCD" value="${esc(preCode)}" />
-        <label>Your name <span class="hint-inline">(no emojis)</span></label>
-        <input id="name" maxlength="16" autocomplete="off" placeholder="e.g. Maya" />
-        <label>Pick your piece</label>
+        <div class="join-summary">Room <b>${esc(joinCode)}</b> · playing as <b>${esc(joinName)}</b> <button class="tiny" data-act="joinBack">Change</button></div>
+        <label>Choose your piece</label>
         <div class="tokgrid">
-          ${TOKENS.map((t) => `<button type="button" class="tok${t === joinPiece ? ' sel' : ''}" data-piece="${t}" data-act="pickPiece">${t}</button>`).join('')}
+          ${TOKENS.map(
+            (t) =>
+              `<button type="button" class="tok${t === joinPiece ? ' sel' : ''}${joinTaken.has(t) ? ' taken' : ''}" data-piece="${t}" data-act="pickPiece"${joinTaken.has(t) ? ' disabled' : ''}>${t}</button>`,
+          ).join('')}
         </div>
-        <button class="big primary" data-act="join">Join the game</button>
-        <p class="hint">Get the code from the TV screen</p>
+        <div id="avatarStage"></div>
+        <button class="big primary" data-act="join">Join as ${esc(joinName)}</button>
+        <p class="hint">Every piece has its own 3D avatar — that's what walks the board.</p>
       </div>
     </div>`
+  const stage = document.getElementById('avatarStage')
+  if (stage) {
+    avatarPreview = new AvatarPreview(stage)
+    avatarPreview.show(TOKENS.indexOf(joinPiece), PREVIEW_COLOR)
+  }
 }
 
 function renderLobby(l: LobbyInfo): void {
@@ -727,14 +826,25 @@ function renderGame(v: PlayerView): void {
     banner = `<div class="banner ${winner?.id === I.id ? 'good' : ''}">${winner ? `${esc(winner.name)} wins!` : 'Game over'}</div>`
   } else if (v.phase === 'DEBT' && v.debt && v.debt.debtor === I.id) {
     const creditor = v.debt.creditor ? v.players.find((p) => p.id === v.debt?.creditor) : null
-    banner = `<div class="banner debt">You owe $${v.debt.amount} to ${creditor ? esc(creditor.name) : 'the bank'}</div>`
-    body += `
-      <div class="card urgent">
-        <h3>Raise the money</h3>
-        <p>Sell houses or mortgage properties below${acts.has('payDebt') ? ', then tap Pay.' : '.'}</p>
-        ${acts.has('payDebt') ? `<button class="big good" data-act="payDebt">Pay $${v.debt.amount}</button>` : ''}
-        <button class="big danger" data-act="bankrupt">Declare bankruptcy</button>
-      </div>`
+    const canPay = acts.has('payDebt')
+    const rentForSpace = v.debt.memo?.startsWith('Rent: ') ? v.debt.memo.slice(6) : null
+    banner = `<div class="banner debt">You owe <b>$${v.debt.amount}</b> to ${creditor ? `${creditor.token} ${esc(creditor.name)}` : 'the bank'}${rentForSpace ? ` — rent for <b>${esc(rentForSpace)}</b>` : ''}</div>`
+    if (canPay) {
+      // rent they can afford: a deliberate, felt-in-the-hand payment
+      body += `
+        <div class="card urgent">
+          <h3>Time to pay up</h3>
+          <p class="hint">The money leaves your wallet when you tap.</p>
+          <button class="big good" data-act="payDebt">Pay $${v.debt.amount}</button>
+        </div>`
+    } else {
+      body += `
+        <div class="card urgent">
+          <h3>Raise the money</h3>
+          <p>Sell houses or mortgage properties below, then tap Pay.</p>
+          <button class="big danger" data-act="bankrupt">Declare bankruptcy</button>
+        </div>`
+    }
   } else if (v.phase === 'DEBT' && v.debt) {
     const debtor = v.players.find((p) => p.id === v.debt?.debtor)
     banner = `<div class="banner info">${esc(debtor?.name ?? '')} is raising funds to pay a debt…</div>`
@@ -858,6 +968,7 @@ function renderGame(v: PlayerView): void {
       <span class="money" id="moneyChip">$${I.cash}</span>
       <span class="meta">worth $${worth}${I.jailCards > 0 ? ` · jail card ×${I.jailCards}` : ''}${I.jail ? ' · in jail' : ''}</span>
       <button class="themebtn" data-act="theme">${theme === 'light' ? 'Dark' : 'Light'}</button>
+      <button class="themebtn" data-act="showBoard">Board</button>
       <button class="themebtn exitbtn" data-act="leave">Exit</button>
     </header>
     ${banner}
