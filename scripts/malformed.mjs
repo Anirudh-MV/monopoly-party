@@ -206,6 +206,11 @@ try {
     { cmd: 'setTimer', ms: 1e12 },
     { cmd: 'replayTurn', playerId: { nested: BIG } },
     { cmd: 'endGame', winner: 7 },
+    { cmd: 'kick' },
+    { cmd: 'kick', playerId: 42 },
+    { cmd: 'kick', playerId: { evil: BIG } },
+    { cmd: 'kick', playerId: BIG },
+    { cmd: 'kick', playerId: 'ghost' }, // well-formed but nobody's seat
     { cmd: 'import' }, // no json
     { cmd: 'import', json: 'not-an-object' },
     { cmd: 'import', json: { players: 'nope' } },
@@ -248,6 +253,12 @@ try {
     ['room:setColor', null],
     ['room:setColor', { color: 'hotpink' }],
     ['room:setColor', { color: { evil: BIG } }],
+    ['room:rename', null],
+    ['room:rename', { name: 42 }],
+    ['room:rename', { name: '' }],
+    ['room:rename', { name: '🎲🎲🎲' }],
+    ['room:rename', { name: BIG }],
+    ['room:rename', { name: { evil: BIG } }],
   ]
   for (const [ev, payload] of roomCases) {
     const res = await emitAck(tv, ev, payload)
@@ -278,6 +289,67 @@ try {
     assert(alive(), 'server alive after the refusal')
   }
   assert(alive(), 'server alive after the create storm')
+
+  // ── rename battery: name validation needs a real lobby seat ──
+  // (the roomCases above were sent from the TV socket, which is nobody's
+  // seat — they die on that guard before the payload is even read)
+  {
+    const tvr = connect()
+    const cr = await emitAck(tvr, 'room:create')
+    assert(cr.ok, 'rename battery room created')
+    const amy = connect()
+    const ar = await emitAck(amy, 'room:join', { code: cr.code, name: 'Amy' })
+    const ben = connect()
+    const brr = await emitAck(ben, 'room:join', { code: cr.code, name: 'Ben' })
+    assert(ar.ok && brr.ok, 'two lobby seats staged')
+    let lr = null
+    tvr.on('lobby', (x) => {
+      lr = x
+    })
+
+    const r1 = await emitAck(amy, 'room:rename', null)
+    assert(!r1.ok && r1.error === 'Enter your name (letters and numbers)', 'rename null payload rejected')
+    assert(alive(), 'server alive after rename null')
+    const r2 = await emitAck(amy, 'room:rename', { name: 42 })
+    assert(!r2.ok, 'rename non-string name rejected')
+    assert(alive(), 'server alive after rename non-string')
+    const r3 = await emitAck(amy, 'room:rename', { name: '' })
+    assert(!r3.ok, 'rename empty name rejected')
+    const r4 = await emitAck(amy, 'room:rename', { name: '🎲🎲🎲' })
+    assert(!r4.ok && r4.error === 'Enter your name (letters and numbers)', 'rename emoji-only name rejected (empty after strip)')
+    assert(alive(), 'server alive after rename emoji-only')
+
+    // a huge name is silently sliced to 16 chars, exactly like join
+    const r5 = await emitAck(amy, 'room:rename', { name: 'x'.repeat(30) })
+    assert(r5.ok, 'rename 30+ chars accepted (sliced like join)')
+    await sleep(150)
+    assert(lr && lr.players.find((p) => p.id === ar.playerId)?.name === 'x'.repeat(16), 'the long name was sliced to 16')
+
+    const r6 = await emitAck(amy, 'room:rename', { name: 'Amelia2' })
+    assert(r6.ok, 'rename to a fresh name accepted')
+    await sleep(150)
+    assert(lr && lr.players.find((p) => p.id === ar.playerId)?.name === 'Amelia2', 'TV lobby broadcast shows the new name')
+    const r7 = await emitAck(ben, 'room:rename', { name: 'amelia2' })
+    assert(!r7.ok && r7.error === 'Someone already took that name', 'case-insensitive duplicate refused')
+    // renaming to your own current name is a no-op, not a duplicate
+    const r8 = await emitAck(amy, 'room:rename', { name: 'Amelia2' })
+    assert(r8.ok, 'renaming to your own name is a no-op')
+    // a host socket has no seat — the guard fires before the payload
+    const r9 = await emitAck(tvr, 'room:rename', { name: 'The TV' })
+    assert(!r9.ok && r9.error === 'Not your seat', 'a host socket cannot rename')
+
+    // mid-game: the names lock
+    const skk = await emitAck(tvr, 'game:start', {})
+    assert(skk.ok, 'rename battery game started')
+    await sleep(150)
+    const r10 = await emitAck(amy, 'room:rename', { name: 'AmyAgain' })
+    assert(!r10.ok && r10.error === 'The game already started', 'mid-game rename refused')
+    assert(alive(), 'server alive after the mid-game rename refusal')
+
+    amy.disconnect()
+    ben.disconnect()
+    tvr.disconnect()
+  }
 
   // ── prototype pollution attempt through a snapshot import ──
   const poison = await emitAck(tv, 'god:command', {
@@ -363,13 +435,49 @@ try {
     tvg.close()
   }
 
+  // ── god kick: TV-only, guarded, idempotent-refusing ──
+  {
+    // a phone must never reach the god console
+    const pres = await emitAck(players[0].sock, 'god:command', { cmd: 'kick', playerId: players[1].id })
+    assert(pres && !pres.ok, 'god kick from a phone is rejected')
+
+    // the create storm moved the first TV onto junk rooms — reattach one
+    const tvk = connect()
+    let kv = null
+    tvk.on('view', (v) => {
+      kv = v
+    })
+    const hj = await emitAck(tvk, 'room:hostJoin', { code, hostToken: created.hostToken })
+    assert(hj.ok, 'a TV reattached to the original room')
+
+    // the kick lands mid-game: the phone is told, the TV records the forfeit
+    let leoKicked = false
+    players[1].sock.on('kicked', () => {
+      leoKicked = true
+    })
+    const kres = await emitAck(tvk, 'god:command', { cmd: 'kick', playerId: players[1].id })
+    assert(kres.ok, 'god kicked a player mid-game')
+    await sleep(200)
+    assert(leoKicked, 'the kicked phone was told')
+    assert(kv && kv.players.find((p) => p.id === players[1].id)?.bankrupt === true, 'the TV shows them bankrupt')
+    assert(alive(), 'server alive after the kick')
+
+    // kicking a bankrupt player is refused
+    const kres2 = await emitAck(tvk, 'god:command', { cmd: 'kick', playerId: players[1].id })
+    assert(kres2 && !kres2.ok, 'kicking a bankrupt player is refused')
+    assert(alive(), 'server alive after the refusal')
+    tvk.close()
+  }
+
   // ── the game must still be fully playable ──
   // The TV socket moved to fresh rooms during the create storm; the original
-  // game room is still live on the phone sockets — check through them.
+  // game room is still live on the phone sockets — check through them. The
+  // god-kicked seat is gone from the living table, so it is excluded.
   await sleep(300)
-  const phoneView = players.find((p) => p.view && p.view.phase)
+  const standing = players.filter((p) => p.id !== players[1].id)
+  const phoneView = standing.find((p) => p.view && p.view.phase)
   assert(phoneView != null, 'phones still receive views from the original game')
-  const active = players.find((p) => p.view && (p.view.allowed || []).length > 0)
+  const active = standing.find((p) => p.view && (p.view.allowed || []).length > 0)
   assert(active != null, 'a phone still has legal moves after the barrage')
   if (active) {
     const first = active.view.allowed.find((a) =>

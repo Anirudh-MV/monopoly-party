@@ -163,18 +163,30 @@ export function allowedActions(s: RulesState, pid: string): ActionType[] {
       if (p.cash > a.bid) out.add('bid')
       out.add('passBid')
     }
+    // Harmless trade bookkeeping survives the freeze: declining an offer or
+    // withdrawing your own removes a row from a list — it can't disturb the
+    // auction. (Accepting is a different story — the engine case gates it.)
+    if (s.trades.some((t: TradeOffer) => t.to === pid)) out.add('respondTrade')
+    if (s.trades.some((t: TradeOffer) => t.from === pid)) out.add('cancelTrade')
     return [...out]
   }
 
   if (s.phase === 'DEBT') {
     const d = s.debt
-    if (!d || d.debtor !== pid) return []
-    if (p.cash >= d.amount) out.add('payDebt')
-    out.add('bankrupt')
-    for (const i of ownedSpaces(s, pid)) {
-      if (canSellHouseOn(s, pid, i)) out.add('sellHouse')
-      if (canMortgageOn(s, pid, i)) out.add('mortgage')
+    if (!d) return []
+    if (d.debtor === pid) {
+      if (p.cash >= d.amount) out.add('payDebt')
+      out.add('bankrupt')
+      for (const i of ownedSpaces(s, pid)) {
+        if (canSellHouseOn(s, pid, i)) out.add('sellHouse')
+        if (canMortgageOn(s, pid, i)) out.add('mortgage')
+      }
     }
+    // Same freeze rule as auctions: everyone may still decline/withdraw
+    // trade offers — only the debtor is raising funds, the rest of the
+    // table shouldn't lose their ability to clear their own offer lists.
+    if (s.trades.some((t: TradeOffer) => t.to === pid)) out.add('respondTrade')
+    if (s.trades.some((t: TradeOffer) => t.from === pid)) out.add('cancelTrade')
     return [...out]
   }
 

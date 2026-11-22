@@ -512,7 +512,33 @@ function checkAuctionClose(s: GameState): void {
 
 // ── Bankruptcy ──
 
-function declareBankruptcy(s: GameState, p: PlayerState): Result {
+// The game ends the moment one player (or nobody) is left unbankrupted.
+// Shared by bankruptcy and forfeit; `lastStanding` picks the walk-off
+// victory wording.
+function checkGameOver(s: GameState, lastStanding = false): boolean {
+  const alive = R.alivePlayers(s)
+  if (alive.length > 1) return false
+  s.phase = 'GAME_OVER'
+  s.winner = alive[0]?.id ?? null
+  s.auction = null
+  s.auctionQueue = []
+  s.debtQueue = []
+  s.pendingPurchase = null
+  s.pendingTax = null
+  s.pendingMove = null
+  log(
+    s,
+    alive[0]
+      ? lastStanding
+        ? `🏆 ${alive[0].name} WINS — last one standing!`
+        : `🏆 ${alive[0].name} WINS THE GAME!`
+      : 'Everyone went bankrupt.',
+    'good',
+  )
+  return true
+}
+
+export function declareBankruptcy(s: GameState, p: PlayerState, lastStanding = false): Result {
   const d = s.debt
   if (!d || d.debtor !== p.id) return fail('No debt to declare bankruptcy over')
   if (s.phase !== 'DEBT') return fail('Not in debt resolution')
@@ -581,35 +607,118 @@ function declareBankruptcy(s: GameState, p: PlayerState): Result {
   // The bankrupt player's remaining queued obligations die with them
   // (e.g. a "pay each player" card that queued several debts). Their
   // estate already went to the triggering creditor.
-  s.debtQueue = s.debtQueue.filter((d2) => d2.debtor !== p.id)
+  // Queued obligations die with them — and any debt they were about to
+  // COLLECT pays the bank instead: cash must never land on a dead seat.
+  s.debtQueue = s.debtQueue
+    .filter((d2) => d2.debtor !== p.id)
+    .map((d2) => (d2.creditor === p.id ? { ...d2, creditor: null } : d2))
   s.trades = s.trades.filter((t) => t.from !== p.id && t.to !== p.id)
 
-  // …and so does the rest of their interrupted turn. Without this, a
-  // bankruptcy on the 3rd failed jail roll left `pendingMove` behind: the
+  // …and so does the rest of their interrupted turn — but ONLY theirs:
+  // pendings belonging to a different current player (a live buy decision,
+  // an announced arrest) must survive. Without the pendingMove clear, a
+  // bankruptcy on the 3rd failed jail roll left it behind: the
   // next debt resolution finished the DEAD player's stroll — possibly
   // collecting GO — and landed them on an offer nobody could act on,
   // freezing the game.
-  s.pendingMove = null
-  s.pendingPurchase = null
-  s.pendingTax = null
-  s.pendingCardDraw = null
-  s.pendingCard = null
-  s.pendingJail = null
-
-  const alive = R.alivePlayers(s)
-  if (alive.length <= 1) {
-    s.phase = 'GAME_OVER'
-    s.winner = alive[0]?.id ?? null
-    s.auction = null
-    s.auctionQueue = []
-    s.debtQueue = []
+  const isCur = s.currentPlayerId === p.id
+  if (isCur) {
+    s.pendingMove = null
     s.pendingPurchase = null
     s.pendingTax = null
+    s.pendingCard = null
+    s.pendingCardDraw = null
+  }
+  if (s.pendingJail != null && s.pendingJail.player === p.id) s.pendingJail = null
+
+  if (checkGameOver(s, lastStanding)) return OK
+  resumeAfterDebt(s, Math.random)
+  return OK
+}
+
+// ── Forfeit: the one estate rule ──
+// A voluntary mid-game walk-out is an immediate bankrupt-to-bank forfeit.
+// No creditor is waiting, so nothing changes hands: buildings liquidate
+// back to the bank, deeds queue for auction unmortgaged, jail cards go
+// back to their decks — and the game carries on, detecting the win
+// automatically if nobody else is left. (A leaver with a pending
+// PLAYER-debt is routed here by the rooms layer through declareBankruptcy
+// instead, so the lender gets paid per the tested rules.)
+export function forfeitEstate(s: GameState, pid: string, headline?: string): Result {
+  const p = R.byId(s, pid)
+  if (!p || p.bankrupt) return fail('Nothing to forfeit')
+
+  for (const i of R.ownedSpaces(s, pid)) {
+    const sp = BOARD[i]
+    const st = s.props[i]
+    // buildings go back to the bank at half price; with no creditor, the
+    // proceeds die with the estate. The hammer sells an unmortgaged deed.
+    if (isStreet(sp)) st.houses = 0
+    st.owner = null
+    st.mortgaged = false
+    s.auctionQueue.push(i)
+  }
+
+  if (p.jailCards > 0) {
+    returnJailCardsToDecks(s, p.jailCards, p.jailCardDecks ?? [])
+    p.jailCards = 0
+    p.jailCardDecks = []
+  }
+  s.trades = s.trades.filter((t) => t.from !== pid && t.to !== pid)
+
+  p.bankrupt = true
+  p.cash = 0
+  if (headline) log(s, headline, 'bad')
+
+  // Their interrupted turn and queued obligations die with them — but ONLY
+  // theirs. Pendings owned by the CURRENT player (someone else's live buy
+  // decision, an announced arrest) must survive the walk-out: a colluding
+  // exit must never bail the active player out of jail or a tax bill.
+  const isCurrent = s.currentPlayerId === pid
+  if (isCurrent) {
     s.pendingMove = null
-    log(s, alive[0] ? `🏆 ${alive[0].name} WINS THE GAME!` : 'Everyone went bankrupt.', 'good')
+    s.pendingPurchase = null
+    s.pendingTax = null
+    s.pendingCard = null
+    s.pendingCardDraw = null
+  }
+  if (s.pendingJail != null && s.pendingJail.player === pid) s.pendingJail = null
+  const hadOwnDebt = s.debt != null && s.debt.debtor === pid
+  if (hadOwnDebt) s.debt = null // a bank debt dies with the estate
+  // Debts the leaver was about to COLLECT pay the bank instead — cash must
+  // never land on a dead seat.
+  if (s.debt && s.debt.creditor === pid) s.debt = { ...s.debt, creditor: null }
+  s.debtQueue = s.debtQueue
+    .filter((d) => d.debtor !== pid)
+    .map((d) => (d.creditor === pid ? { ...d, creditor: null } : d))
+
+  if (checkGameOver(s, true)) return OK
+
+  if (hadOwnDebt) {
+    // Debt machinery was mid-flight for the leaver — hand the flow to the
+    // standard resume: queued debts first, then the liquidation auctions.
+    resumeAfterDebt(s, Math.random)
     return OK
   }
-  resumeAfterDebt(s, Math.random)
+  const au = s.auction
+  if (au) {
+    // The leaver was bidding on someone else's auction: drop their bid so
+    // the hammer can still fall — a fully-passed auction closes to the bank.
+    if (au.bidder === pid) {
+      au.bidder = null
+      checkAuctionClose(s)
+    }
+    return OK
+  }
+  if (s.debt == null && s.auctionQueue.length > 0) {
+    // Liquidation auctions start right away — the TV announces the hammer
+    // while the walk-out is still the room's hottest news. Any pending
+    // decision of the current player survives: advancePhase restores it
+    // after the last auction closes.
+    startAuction(s, s.auctionQueue.shift()!)
+    return OK
+  }
+  if (s.currentPlayerId === pid) nextPlayer(s)
   return OK
 }
 
@@ -886,7 +995,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
     }
 
     case 'respondTrade': {
-      if (s.phase !== 'ROLL' && s.phase !== 'ACTION') return fail('No trades right now')
+      if (s.phase === 'LOBBY' || s.phase === 'GAME_OVER') return fail('No trades right now')
       const idx = s.trades.findIndex((t) => t.id === a.tradeId && t.to === by)
       if (idx < 0) return fail('No such offer')
       const offer = s.trades[idx]
@@ -895,10 +1004,18 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
         s.trades.splice(idx, 1)
         return fail('Offer is stale')
       }
+      // Declining is harmless in any live phase — removing an offer can't
+      // disturb an auction or a debt resolution, so it stays legal through
+      // the freezes (the allowed list ships it; see rules.ts).
       if (!a.accept) {
         s.trades.splice(idx, 1)
         log(s, `${p.name} declines the trade`, 'bad')
         return OK
+      }
+      // Accepting MOVES money and deeds — that waits for the table to be
+      // live again. The offer stays on the table for after the freeze.
+      if (s.phase !== 'ROLL' && s.phase !== 'ACTION') {
+        return fail('Trades pause until the auction/debt settles')
       }
       const verr = validateTradeSide(s, from, offer.give) ?? validateTradeSide(s, p, offer.receive)
       if (verr) {

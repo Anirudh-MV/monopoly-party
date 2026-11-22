@@ -164,6 +164,10 @@ export function validGodCommand(raw: unknown): GodCommand | null {
       if (winner === null && raw.winner !== undefined && raw.winner !== null) return null
       return { cmd: 'endGame', winner }
     }
+    case 'kick': {
+      const playerId = asStr(raw.playerId, MAX_ID)
+      return playerId === null ? null : { cmd: 'kick', playerId }
+    }
     case 'export':
       return { cmd: 'export' }
     case 'import':

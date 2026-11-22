@@ -9,7 +9,7 @@ import { io } from 'socket.io-client'
 import QRCode from 'qrcode'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
 import { rentFor, rentPreview } from '../../shared/rules.js'
-import type { HostView, LobbyInfo, PlayerState, Space } from '../../shared/types.js'
+import type { ColorGroup, HostView, LobbyInfo, PlayerState, Space } from '../../shared/types.js'
 import { Board3D } from './board3d.js'
 import { announce, bruh, doublesStreak, heeHee, setVoiceEnabled, unlockAudio, voiceEnabled } from './voice.js'
 
@@ -111,6 +111,8 @@ let revealUntil = 0
 let godOpen = false
 let godPropSpace: number | null = null
 let godStatus = ''
+// two-tap kick confirm: the first tap arms the row, the second sends
+let godKickPending: string | null = null
 
 function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string)
@@ -399,6 +401,7 @@ function renderGame(v: HostView): void {
     $app.innerHTML = `
       <div class="game">
         <div class="overlay queue" id="queue"></div>
+        <div class="overlay standings" id="standings"></div>
         <div class="overlay topbar" id="topbar"></div>
         <div class="overlay ticker" id="ticker"></div>
         <div class="dicebox" id="dicebox"></div>
@@ -440,6 +443,7 @@ function renderGame(v: HostView): void {
   updateTopbar(v)
   updateTicker(v)
   updateCenter(v)
+  updateStandings(v)
   if (godOpen) updateGodPanel(v)
 }
 
@@ -555,6 +559,51 @@ function updateQueue(v: HostView): void {
       )
       .join('')}
     ${landedCompact(v)}`
+}
+
+// Left-flank ownership standings: per player (turn order, bankrupt last),
+// one dot per street colour group — filled with the group colour when
+// they hold ANY deed there — plus rail/bulb markers and the house count.
+// Pure HTML/CSS projection of the view; no server involvement.
+const STREET_GROUPS = Object.keys(GROUP_COLORS) as ColorGroup[]
+
+function standingsOrder(v: HostView): PlayerState[] {
+  return [...turnQueue(v), ...v.players.filter((p) => p.bankrupt)]
+}
+
+function updateStandings(v: HostView): void {
+  const el = document.getElementById('standings')
+  if (!el) return
+  const rows = standingsOrder(v)
+    .map((p) => {
+      const mine = Object.entries(v.props)
+        .map(([iStr, st]) => ({ i: Number(iStr), st }))
+        .filter(({ st }) => st.owner === p.id)
+      const inGroup = (g: ColorGroup): boolean =>
+        mine.some(({ i }) => {
+          const sp = BOARD[i]
+          return isStreet(sp) && sp.group === g
+        })
+      const dots = STREET_GROUPS.map(
+        (g) => `<span class="sdot${inGroup(g) ? ' on' : ''}" style="--gc:${GROUP_COLORS[g]}"></span>`,
+      ).join('')
+      const marks =
+        (mine.some(({ i }) => BOARD[i].kind === 'rail') ? '<span class="smark">🚂</span>' : '') +
+        (mine.some(({ i }) => BOARD[i].kind === 'utility') ? '<span class="smark">💡</span>' : '') +
+        (() => {
+          const houses = mine.reduce((n, { st }) => n + st.houses, 0)
+          return houses > 0 ? `<span class="smark">🏠×${houses}</span>` : ''
+        })()
+      return `<div class="srow${p.bankrupt ? ' dead' : ''}" style="--c:${p.color}">
+        <span class="sdots">${dots}</span>
+        <span class="st">${p.token}</span>
+        <span class="sn">${esc(p.name)}</span>
+        ${marks ? `<span class="smarks">${marks}</span>` : ''}
+        <span class="sc">$${p.cash}</span>
+      </div>`
+    })
+    .join('')
+  el.innerHTML = `<div class="shead">HOLDINGS</div>${rows}`
 }
 
 function updateTicker(v: HostView): void {
@@ -804,6 +853,7 @@ function updateGodPanel(v: HostView): void {
         <button class="tiny" data-god='{"cmd":"setCash","playerId":"${p.id}","amount":${p.cash + 100}}'>+$100</button>
         <button class="tiny" data-god='{"cmd":"setCash","playerId":"${p.id}","amount":${p.cash + 500}}'>+$500</button>
         <button class="tiny" data-god='{"cmd":"promptCash","playerId":"${p.id}"}'>Set...</button>
+        ${v.phase !== 'GAME_OVER' && !p.bankrupt ? `<button class="tiny kickbtn"${godKickPending === p.id ? ' data-armed="true"' : ''} data-god='{"cmd":"kick","playerId":"${p.id}"}'>${godKickPending === p.id ? 'Really kick?' : 'Kick'}</button>` : ''}
       </div>
       <div class="gp-chips">
         <button class="tiny" data-god='{"cmd":"setPos","playerId":"${p.id}","pos":${(p.pos + 39) % 40}}'>&#9664;</button>
@@ -941,6 +991,20 @@ $app.addEventListener('click', (ev) => {
   if (args.cmd === 'propToggle') {
     godPropSpace = godPropSpace === Number(args.space) ? null : Number(args.space)
     render()
+    return
+  }
+  if (args.cmd === 'kick') {
+    const pid = String(args.playerId ?? '')
+    // Two-tap confirm, mirroring the phone's pattern: the first tap arms
+    // the row ("Really kick?"), the second sends. Once the kick lands the
+    // row re-renders bankrupt and the button is gone.
+    if (godKickPending !== pid) {
+      godKickPending = pid
+      render()
+      return
+    }
+    godKickPending = null
+    sendGod({ cmd: 'kick', playerId: pid })
     return
   }
   sendGod(args)

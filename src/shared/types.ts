@@ -287,5 +287,6 @@ export type GodCommand =
   | { cmd: 'forceDraw'; deck: 'chance' | 'chest' }
   | { cmd: 'setTimer'; ms: number }
   | { cmd: 'endGame'; winner?: string | null }
+  | { cmd: 'kick'; playerId: string }
   | { cmd: 'export' }
   | { cmd: 'import'; json: unknown }

@@ -11,7 +11,7 @@ import { mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
 import * as fsp from 'node:fs/promises'
 import path from 'node:path'
 import type { Server as IOServer, Socket } from 'socket.io'
-import { applyAction, createGame, type PlayerMeta } from '../shared/engine.js'
+import { applyAction, createGame, declareBankruptcy, forfeitEstate, type PlayerMeta, type Result } from '../shared/engine.js'
 import { ALL_CARDS } from '../shared/cards.js'
 import { hostView, playerView } from '../shared/views.js'
 import { allowedActions, alivePlayers, netWorth } from '../shared/rules.js'
@@ -315,6 +315,27 @@ export function remedyActionsFor(s: GameState): Array<[string, Action]> {
   }
   if (s.phase === 'ROLL') return [[cur, { type: 'roll' }]]
   return []
+}
+
+// ── The one estate rule ──
+// What happens to a seat's holdings when its human walks out mid-game
+// (voluntary exit) or the host removes them (god kick): an immediate
+// bankrupt forfeit. A pending PLAYER-debt routes through
+// declareBankruptcy instead — the lender inherits the estate per the
+// existing, tested rules. The headline logs BEFORE routing so both
+// branches leave a trace of the leaving itself. Pure (engine-only) —
+// exported for the scenario suite; the caller commits via
+// clone-apply-commit.
+export function forfeitSeat(s: GameState, pid: string, headline: string): Result {
+  const p = s.players.find((q) => q.id === pid)
+  if (!p) return { ok: false, error: 'Not in this game' }
+  if (p.bankrupt) return { ok: false, error: 'Already bankrupt' }
+  s.log.push({ text: headline, kind: 'bad' })
+  if (s.phase === 'DEBT' && s.debt && s.debt.debtor === pid && s.debt.creditor != null) {
+    // a walk-off win still reads like one, even when the lender gets paid
+    return declareBankruptcy(s, p, true)
+  }
+  return forfeitEstate(s, pid)
 }
 
 function broadcast(room: Room, io: IOServer): void {
@@ -1113,9 +1134,21 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       if (!isCurrentConnection(room, data, socket.id)) return ack?.({ ok: false })
       const entry = room.players[idx]
       if (room.state) {
-        // Mid-game exit: the seat stays at the table — the game plays on and
-        // the decision clock covers their turns — but this phone is out for
-        // good: its rejoin token is destroyed, so it can never wander back.
+        // Mid-game exit = forfeit (the one estate rule): the estate goes
+        // under the hammer and the game plays on without them — detecting
+        // the win automatically if nobody else is left. Clone-apply-commit
+        // like every other state change; a refused mutation (already
+        // bankrupt) commits nothing. A finished game has nothing left to
+        // protect — the recorded winner stands.
+        if (room.state.phase !== 'GAME_OVER') {
+          const s = room.state
+          const name = s.players.find((q) => q.id === data.playerId)?.name ?? entry.meta.name
+          const next = structuredClone(s)
+          const res = forfeitSeat(next, data.playerId, `${name} left the party — their properties go under the hammer`)
+          if (res.ok) room.state = next
+        }
+        // this phone is out for good: its rejoin token is destroyed, so it
+        // can never wander back.
         if (entry) {
           playerTokens.delete(entry.token)
           entry.socketId = null
@@ -1175,6 +1208,29 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
         return ack?.({ ok: false, error: `${color} is already taken — pick another colour` })
       }
       entry.meta.color = color
+      broadcastLobby(io, room)
+      ack?.({ ok: true })
+    })
+
+    // Rename YOURSELF while still in the lobby. There is no target-id
+    // field — self is implied, so renaming someone else is structurally
+    // impossible. Name validation is identical to room:join's checks.
+    on('room:rename', (raw: unknown, ack?: (res: unknown) => void) => {
+      const room = data.code ? rooms.get(data.code) : undefined
+      if (!room || !isCurrentConnection(room, data, socket.id)) return ack?.({ ok: false, error: 'Not your seat' })
+      if (room.state) return ack?.({ ok: false, error: 'The game already started' })
+      const idx = room.players.findIndex((e) => e.meta.id === data.playerId)
+      const entry = idx >= 0 ? room.players[idx] : undefined
+      if (!entry) return ack?.({ ok: false, error: 'Not your seat' })
+      // Names never carry emojis — strip server-side, never trust the client.
+      const rawName = (raw as { name?: unknown } | null | undefined)?.name
+      const name = stripEmoji(typeof rawName === 'string' ? rawName : '').slice(0, 16)
+      if (name.length < 1) return ack?.({ ok: false, error: 'Enter your name (letters and numbers)' })
+      if (entry.meta.name === name) return ack?.({ ok: true }) // already called that
+      if (room.players.some((e, i) => i !== idx && e.meta.name.toLowerCase() === name.toLowerCase())) {
+        return ack?.({ ok: false, error: 'Someone already took that name' })
+      }
+      entry.meta.name = name
       broadcastLobby(io, room)
       ack?.({ ok: true })
     })
@@ -1497,6 +1553,43 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
             n.auction = null
             n.auctionQueue = []
           })
+          return ack?.({ ok: true })
+        }
+
+        case 'kick': {
+          if (!s) return ack?.({ ok: false, error: 'No game running' })
+          if (s.phase === 'GAME_OVER') return ack?.({ ok: false, error: 'The game is already over' })
+          const target = s.players.find((q) => q.id === payload.playerId)
+          if (!target) return ack?.({ ok: false, error: 'Not in this game' })
+          if (target.bankrupt) return ack?.({ ok: false, error: 'They are already out' })
+          // Same estate rule as a voluntary exit: player-debt → the lender
+          // inherits via declareBankruptcy; anything else → bank forfeit
+          // with the deeds under the hammer. forfeitSeat logs the headline.
+          const next = structuredClone(s)
+          const res = forfeitSeat(next, payload.playerId, `The host removed ${target.name} — their properties go under the hammer`)
+          if (!res.ok) return ack?.({ ok: false, error: res.error })
+          room.state = next
+          // Evict the phone exactly like the lobby kick: identity dies
+          // with the seat, the rejoin token is destroyed.
+          const entry = room.players.find((e) => e.meta.id === payload.playerId)
+          if (entry) {
+            playerTokens.delete(entry.token)
+            const kicked = entry.socketId != null ? io.sockets.sockets.get(entry.socketId) : undefined
+            if (kicked) {
+              const td = kicked.data as SocketData
+              if (td.code === room.code && td.playerId === payload.playerId) {
+                td.code = undefined
+                td.role = undefined
+                td.playerId = undefined
+              }
+              kicked.leave(playerRoom(room.code, payload.playerId))
+              kicked.emit('kicked')
+            }
+            entry.socketId = null
+            entry.disconnectedAt = Date.now()
+            if (room.hostPlayerId === payload.playerId) promoteHostOnDisconnect(room)
+          }
+          broadcastGame(io, room)
           return ack?.({ ok: true })
         }
 

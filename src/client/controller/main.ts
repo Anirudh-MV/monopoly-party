@@ -146,9 +146,10 @@ function showReveal(card: Card): void {
 
 // ── two-step exit confirmation ──
 // Leaving is the one destructive thing a phone can do to itself: mid-game
-// the seat stays at the table but the rejoin token dies — this phone can
-// never come back to that room. So it takes TWO separate confirmations,
-// with different wording each step so neither can be muscle-memoryed.
+// it's an immediate forfeit — the estate goes under the hammer, the game
+// plays on, and this phone can never rejoin. So it takes TWO separate
+// confirmations, with different wording each step so neither can be
+// muscle-memoryed.
 function showExitConfirm(step: 1 | 2): void {
   document.querySelector('.confirm-overlay')?.remove()
   const inGame = view != null
@@ -161,10 +162,10 @@ function showExitConfirm(step: 1 | 2): void {
       <p class="confirm-body">${
         step === 1
           ? inGame
-            ? 'You\u2019ll go back to the join screen and can enter a different room code. Your seat stays at the table, and this phone won\u2019t be able to rejoin this room.'
+            ? 'You\u2019ll go back to the join screen and can enter a different room code. Your estate will be auctioned off and the game goes on without you.'
             : 'You\u2019ll go back to the join screen and can enter a different room code.'
           : inGame
-            ? 'Really leave? This phone can never rejoin the game you\u2019re in.'
+            ? 'Really leave? This phone can never rejoin the game you\u2019re in. Your cash and properties go to the bank — the table auctions them off.'
             : 'Really leave the room? This is the final confirmation.'
       }</p>
       <div class="row">
@@ -191,6 +192,7 @@ function showExitConfirm(step: 1 | 2): void {
 
 function performExit(): void {
   document.querySelector('.confirm-overlay')?.remove()
+  if (!ensureConnected()) return
   socket.emit('room:leave', {}, () => {
     localStorage.removeItem('mp-token')
     localStorage.removeItem('mp-playerid')
@@ -229,6 +231,61 @@ function showActionConfirm(title: string, body: string, confirmLabel: string, on
     if (btn.dataset.act === 'aConfirm') onConfirm()
   })
   document.body.appendChild(overlay)
+}
+
+// ── lobby rename editor ──
+// Your own name, lobby only: a small sheet with one prefilled input. A
+// refused save (name taken, mid-game, …) keeps the sheet open with the
+// server's error visible — nothing is marked, you just try again.
+function showRenameEditor(current: string): void {
+  document.querySelector('.confirm-overlay')?.remove()
+  const overlay = document.createElement('div')
+  overlay.className = 'confirm-overlay'
+  overlay.innerHTML = `
+    <div class="confirm-box">
+      <div class="confirm-title">Your name</div>
+      <input id="renameInput" maxlength="16" autocomplete="off" placeholder="e.g. Maya" value="${esc(current)}" />
+      <p class="hint" id="renameErr" style="min-height:1.1em; margin-top:8px"></p>
+      <div class="row">
+        <button data-act="renameCancel">Cancel</button>
+        <button class="primary" data-act="renameSave">Save name</button>
+      </div>
+    </div>`
+  const fail = (msg: string): void => {
+    toast(msg)
+    const err = overlay.querySelector('#renameErr') as HTMLElement | null
+    if (err) err.textContent = msg
+  }
+  overlay.addEventListener('click', (ev) => {
+    if (ev.target === overlay) {
+      overlay.remove()
+      return
+    }
+    const btn = (ev.target as HTMLElement).closest('[data-act]') as HTMLElement | null
+    if (!btn) return
+    if (btn.dataset.act === 'renameCancel') {
+      overlay.remove()
+      return
+    }
+    if (btn.dataset.act === 'renameSave') {
+      const input = overlay.querySelector('#renameInput') as HTMLInputElement | null
+      const name = stripEmoji(input?.value ?? '')
+      if (!name) return fail('Enter your name (letters and numbers)')
+      if (!ensureConnected()) return
+      socket.emit('room:rename', { name }, (res: { ok: boolean; error?: string }) => {
+        if (res.ok) {
+          overlay.remove()
+          myName = name
+          return
+        }
+        fail(res.error ?? 'Could not rename')
+      })
+    }
+  })
+  document.body.appendChild(overlay)
+  const input = overlay.querySelector('#renameInput') as HTMLInputElement | null
+  input?.focus()
+  input?.select()
 }
 
 // ── the dice roll moment ──
@@ -343,8 +400,14 @@ function animateMoney(from: number, to: number): void {
 // Close returns to the controller. It stays live with the game while open.
 let phoneBoard: Board3D | null = null
 
+// One-time discovery: playtesters never found the topbar Board button, so
+// the first game view gets a full-width promo above the action cards.
+// Opening the board (promo or topbar) retires it forever, per browser.
+const BOARD_PROMO_FLAG = 'mp-board-promo'
+
 function showBoard(): void {
   if (!view) return
+  localStorage.setItem(BOARD_PROMO_FLAG, '1')
   closeBoard()
   const overlay = document.createElement('div')
   overlay.className = 'board-overlay'
@@ -537,8 +600,11 @@ socket.on('lobby', (l: LobbyInfo) => {
   render()
 })
 
-// The party host removed this seat — back to the join screen, politely.
+// The host removed this seat — back to the join screen, politely. Mid-game
+// removals are estate forfeits (a different message); lobby kicks are just
+// seat removals.
 socket.on('kicked', () => {
+  const midGame = view != null
   localStorage.removeItem('mp-token')
   localStorage.removeItem('mp-playerid')
   myToken = null
@@ -548,7 +614,7 @@ socket.on('kicked', () => {
   composer = null
   lobbySel = null
   render()
-  toast('The host removed you from the room')
+  toast(midGame ? 'The host removed you from the game' : 'The host removed you from the room')
 })
 
 socket.on('view', (v: PlayerView) => {
@@ -574,7 +640,16 @@ socket.on('view', (v: PlayerView) => {
 
 // ── Actions ──
 
+// A dead socket silently queues emits forever — every player-initiated
+// send must say so instead of swallowing the tap.
+function ensureConnected(): boolean {
+  if (socket.connected) return true
+  toast('Reconnecting — hang on a sec')
+  return false
+}
+
 function send(a: Action): void {
+  if (!ensureConnected()) return
   socket.emit('game:action', a, (res: { ok: boolean; error?: string }) => {
     if (!res.ok) toast(res.error ?? 'Not allowed right now')
   })
@@ -610,6 +685,7 @@ $app.addEventListener('click', (ev) => {
       break
     }
     case 'join': {
+      if (!ensureConnected()) return
       socket.emit('room:join', { code: joinCode, name: joinName, piece: joinPiece, color: joinColor }, (res: JoinAck) => {
         if (!res.ok) {
           // a taken model or colour gets crossed out in the grid, not just a toast
@@ -699,11 +775,19 @@ $app.addEventListener('click', (ev) => {
         `Remove <b>${target.token} ${esc(target.name)}</b> from the room — they can rejoin with the room code until the game starts.`,
         'Kick',
         () => {
+          if (!ensureConnected()) return
           socket.emit('room:kick', { playerId: target.id }, (res: { ok: boolean; error?: string }) => {
             if (!res.ok) toast(res.error ?? 'Could not kick')
           })
         },
       )
+      break
+    }
+    case 'editName': {
+      // your own lobby row's ✎ — prefilled with the seat's current name
+      const me = lobby?.players.find((p) => p.id === myPlayerId)
+      if (!lobby || !me) return
+      showRenameEditor(me.name)
       break
     }
     case 'startGame': {
@@ -933,7 +1017,9 @@ function renderLobby(l: LobbyInfo): void {
   const players = l.players
     .map((p) => {
       const kick = isHost && p.id !== myPlayerId ? `<button class="tiny kickbtn" data-act="kickPlayer" data-args='{"id":"${p.id}"}' title="Kick from the room">✕</button>` : ''
-      return `<li${p.id === l.hostId ? ' class="crowned"' : ''}><span class="dot" style="background:${p.color}"></span>${p.token} ${esc(p.name)}${p.id === l.hostId ? ' <span class="crown">Host</span>' : ''}${p.connected ? '' : '<em class="off"> (offline)</em>'}${kick}</li>`
+      // your own row: the only seat whose name you can edit
+      const pen = p.id === myPlayerId ? `<button class="tiny renamebtn" data-act="editName" title="Change your name">✎</button>` : ''
+      return `<li${p.id === l.hostId ? ' class="crowned"' : ''}><span class="dot" style="background:${p.color}"></span>${p.token} ${esc(p.name)}${p.id === l.hostId ? ' <span class="crown">Host</span>' : ''}${p.connected ? '' : '<em class="off"> (offline)</em>'}${pen}${kick}</li>`
     })
     .join('')
   const others = l.players.filter((p) => p.id !== myPlayerId)
@@ -996,6 +1082,12 @@ function renderGame(v: PlayerView): void {
 
   let banner = ''
   let body = ''
+
+  // First game view on this browser: one promo teaches that the whole 3D
+  // board is in your pocket. Above the action cards, retired on first open.
+  if (!localStorage.getItem(BOARD_PROMO_FLAG)) {
+    body += `<button class="big wide boardpromo" data-act="showBoard">🎲 See the whole board — pinch to zoom, drag to roam</button>`
+  }
 
   // What the active player drew — an info strip, NEVER a blocker: the action
   // cascade below must always render so the game can always advance.
@@ -1191,6 +1283,9 @@ function renderGame(v: PlayerView): void {
     body += `<button class="big wide" data-act="openTrade">Propose a trade</button>`
   }
 
+  // ── The table at a glance — every player's cash and deeds ──
+  body += renderTable(v)
+
   // ── Transaction history (yours and everyone else's) ──
   body += renderLedger(v, I.id)
 
@@ -1230,10 +1325,14 @@ function sideSummary(side: TradeSide): string {
 function tradeCard(v: PlayerView, t: TradeOffer, dir: 'incoming' | 'outgoing'): string {
   const from = v.players.find((p) => p.id === t.from)
   const to = v.players.find((p) => p.id === t.to)
+  // Accepting moves money and deeds, so it waits out auction/debt freezes
+  // (the engine enforces the same rule). Declining or withdrawing is
+  // always live — the engine takes it in any phase.
+  const frozen = v.phase === 'AUCTION' || v.phase === 'DEBT'
   return `<div class="card trade">
     <div><b>${from?.token} ${esc(from?.name ?? '')}</b> offers <b>${sideSummary(t.give)}</b><br/>in exchange for <b>${sideSummary(t.receive)}</b> <span class="hint">(${esc(to?.name ?? '')})</span></div>
     ${dir === 'incoming'
-      ? `<div class="row"><button class="good" data-act="acceptTrade" data-args='{"id":"${t.id}"}'>Accept</button><button class="danger" data-act="declineTrade" data-args='{"id":"${t.id}"}'>Decline</button></div>`
+      ? `<div class="row"><button class="good" data-act="acceptTrade" data-args='{"id":"${t.id}"}'${frozen ? ' disabled' : ''}>Accept</button><button class="danger" data-act="declineTrade" data-args='{"id":"${t.id}"}'>Decline</button></div>${frozen ? '<p class="hint">Trades pause until this settles</p>' : ''}`
       : `<div class="row"><button data-act="cancelTrade" data-args='{"id":"${t.id}"}'>Withdraw offer</button></div>`}
   </div>`
 }
@@ -1268,24 +1367,73 @@ function renderPortfolio(v: PlayerView, pid: string): string {
         earn = `earns ${rp.note}${rp.next != null ? ` → <b>${rp.next}× dice</b> with both` : ''}`
       }
       if (st.mortgaged) earn = 'mortgaged — no rent while asleep'
+      // The server's allowed list is THE gate: a button renders exactly when
+      // the engine would accept it. During freezes (auction/debt) the list
+      // omits management actions, so the buttons simply don't appear — the
+      // phase banner already explains what the table is waiting on.
       const btns: string[] = []
-      if (canBuildOn(v, pid, i)) btns.push(`<button class="tiny" data-act="buyHouse" data-args='{"space":${i}}'>House +$${isStreet(sp) ? sp.houseCost : ''}</button>`)
-      if (canSellHouseOn(v, pid, i)) btns.push(`<button class="tiny" data-act="sellHouse" data-args='{"space":${i}}'>Sell house +$${isStreet(sp) ? sp.houseCost / 2 : ''}</button>`)
-      if (canMortgageOn(v, pid, i)) btns.push(`<button class="tiny" data-act="mortgage" data-args='{"space":${i}}'>Mortgage +$${('price' in sp ? sp.price : 0) / 2}</button>`)
-      if (canUnmortgageOn(v, pid, i)) btns.push(`<button class="tiny" data-act="unmortgage" data-args='{"space":${i}}'>Unmortgage −$${unmortgageCost('price' in sp ? sp.price : 0)}</button>`)
-      const relevantPhase = v.phase === 'DEBT' ? ['mortgage', 'sellHouse'] : null
-      const show = btns.length > 0 && (!relevantPhase || btns.some((b) => relevantPhase.some((rt) => b.includes(`data-act="${rt}"`))))
+      const acts = new Set(v.allowed)
+      if (acts.has('buyHouse') && canBuildOn(v, pid, i)) btns.push(`<button class="tiny" data-act="buyHouse" data-args='{"space":${i}}'>House +$${isStreet(sp) ? sp.houseCost : ''}</button>`)
+      if (acts.has('sellHouse') && canSellHouseOn(v, pid, i)) btns.push(`<button class="tiny" data-act="sellHouse" data-args='{"space":${i}}'>Sell house +$${isStreet(sp) ? sp.houseCost / 2 : ''}</button>`)
+      if (acts.has('mortgage') && canMortgageOn(v, pid, i)) btns.push(`<button class="tiny" data-act="mortgage" data-args='{"space":${i}}'>Mortgage +$${('price' in sp ? sp.price : 0) / 2}</button>`)
+      if (acts.has('unmortgage') && canUnmortgageOn(v, pid, i)) btns.push(`<button class="tiny" data-act="unmortgage" data-args='{"space":${i}}'>Unmortgage −$${unmortgageCost('price' in sp ? sp.price : 0)}</button>`)
       return `<div class="prop">
         ${strip}
         <div class="pinfo">
           <div class="pname">${esc(sp.name)}${marks ? ` <span class="hint">${marks}</span>` : ''}</div>
           ${earn ? `<div class="pearn">${earn}</div>` : ''}
-          ${show ? `<div class="row">${btns.join('')}</div>` : ''}
+          ${btns.length > 0 ? `<div class="row">${btns.join('')}</div>` : ''}
         </div>
       </div>`
     })
     .join('')
   return `<div class="trades"><h3>YOUR PROPERTIES (${owned.length})</h3>${rows}</div>`
+}
+
+// The whole table in one quiet section: every player's cash and their
+// deeds as compact colour chips. Tapping a chip opens the property card;
+// tapping a row jumps your ledger to that player's books.
+function abbrName(sp: Space): string {
+  // fit ~8-10 chars: drop the long suffixes, then hard-truncate
+  let n = sp.name
+    .replace(' Railroad', ' RR')
+    .replace('Electric Company', 'Elec Co')
+    .replace(' Avenue', '')
+    .replace(' Place', '')
+    .replace(' Gardens', '')
+  return n.length > 10 ? `${n.slice(0, 9)}.` : n
+}
+
+function renderTable(v: PlayerView): string {
+  const ownable = Object.keys(v.props).length
+  const ownedTotal = Object.values(v.props).filter((st) => st.owner != null).length
+  // bankrupt players sink to the bottom, dimmed, chipless (their deeds
+  // have already been transferred)
+  const rows = [...v.players]
+    .sort((a, b) => (a.bankrupt === b.bankrupt ? 0 : a.bankrupt ? 1 : -1))
+    .map((p) => {
+      if (p.bankrupt) {
+        return `<div class="trow dead">
+          <div class="t-top"><span class="t-name" style="color:${p.color}">${p.token} 💀 ${esc(p.name)}</span><span class="t-cash">$${p.cash}</span></div>
+        </div>`
+      }
+      const chips = Object.entries(v.props)
+        .filter(([, st]) => st.owner === p.id)
+        .map(([iStr]) => Number(iStr))
+        .sort((a, b) => a - b) // board order = colour runs stay together
+        .map((i) => {
+          const sp = BOARD[i]
+          const col = isStreet(sp) ? GROUP_COLORS[sp.group] : '#9aa1ad'
+          return `<button class="deedchip" style="--g:${col}" data-act="propInfo" data-args='{"space":${i}}'><span class="dstrip"></span>${esc(abbrName(sp))}</button>`
+        })
+        .join('')
+      return `<div class="trow" data-act="ledgerTab" data-args='{"id":"${p.id}"}'>
+        <div class="t-top"><span class="t-name" style="color:${p.color}">${p.token} ${esc(p.name)}</span><span class="t-cash">$${p.cash}</span></div>
+        ${chips ? `<div class="t-deeds">${chips}</div>` : ''}
+      </div>`
+    })
+    .join('')
+  return `<div class="trades table-sec"><h3>TABLE${ownable ? ` · ${ownedTotal}/${ownable} deeds owned` : ''}</h3>${rows}</div>`
 }
 
 // The full-information money ledger: "All" merges every player's books.

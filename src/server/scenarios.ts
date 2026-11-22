@@ -4,7 +4,8 @@
 // plays rigged dice through the real reducer, and asserts exact outcomes.
 // Run: npm run scenarios
 
-import { applyAction, createGame, type PlayerMeta, type Result } from '../shared/engine.js'
+import { applyAction, createGame, forfeitEstate, type PlayerMeta, type Result } from '../shared/engine.js'
+import { forfeitSeat } from './rooms.js'
 import { allowedActions, rentFor, rentPreview } from '../shared/rules.js'
 import type { Action, GameState, PlayerState, PropertyState } from '../shared/types.js'
 
@@ -679,6 +680,179 @@ scenario('the bank repossesses bankrupt properties unmortgaged', 4, (h) => {
   h.ok(h.act(0, { type: 'bankrupt' }), 'bankrupt to the bank')
   h.eq(h.s.props[1].owner, null, 'property back with the bank')
   h.eq(h.s.props[1].mortgaged, false, 'repossessed clean — the auction sells a live deed')
+})
+
+scenario('trades: decline works mid-auction; accept pauses politely', 4, (h) => {
+  // a standing offer, made while the table was live
+  h.ok(
+    h.act(1, { type: 'proposeTrade', to: h.id(2), give: { cash: 10, spaces: [], jailCards: 0 }, receive: { cash: 0, spaces: [], jailCards: 0 } }),
+    'offer on the table before the freeze',
+  )
+  // freeze the table on an auction
+  h.now(0)
+  h.s.phase = 'ACTION'
+  h.s.pendingPurchase = 6
+  h.ok(h.act(0, { type: 'declineBuy' }), 'decline sends the property under the hammer')
+  h.eq(h.s.phase, 'AUCTION', 'auction running')
+  h.eq(allowedActions(h.s, h.id(2)).includes('respondTrade'), true, 'the offeree can still respond mid-auction')
+  h.eq(allowedActions(h.s, h.id(3)).includes('respondTrade'), false, 'bystanders with no offer get no button')
+  h.bad(
+    h.act(2, { type: 'respondTrade', tradeId: h.s.trades[0]!.id, accept: true }),
+    'accept politely refuses mid-auction',
+  )
+  h.eq(h.s.trades.length, 1, 'the refused accept kept the offer alive')
+  h.ok(
+    h.act(2, { type: 'respondTrade', tradeId: h.s.trades[0]!.id, accept: false }),
+    'decline succeeds mid-auction',
+  )
+  h.eq(h.s.trades.length, 0, 'offer removed')
+})
+
+scenario('trades: decline works during a debt freeze', 4, (h) => {
+  h.s.trades.push({ id: 't1', from: h.id(1), to: h.id(2), give: { cash: 5, spaces: [], jailCards: 0 }, receive: { cash: 0, spaces: [], jailCards: 0 } })
+  h.s.debt = { debtor: h.id(0), amount: 500, creditor: null }
+  h.s.phase = 'DEBT'
+  h.eq(allowedActions(h.s, h.id(2)).includes('respondTrade'), true, 'the offeree can respond during the freeze')
+  h.eq(allowedActions(h.s, h.id(0)).includes('respondTrade'), false, 'the debtor only gets their funding actions')
+  h.bad(h.act(2, { type: 'respondTrade', tradeId: 't1', accept: true }), 'accept politely refuses during the freeze')
+  h.eq(h.s.trades.length, 1, 'offer kept')
+  h.ok(h.act(2, { type: 'respondTrade', tradeId: 't1', accept: false }), 'decline succeeds during the freeze')
+  h.eq(h.s.trades.length, 0, 'offer removed')
+})
+
+scenario('trades: withdraw works mid-auction', 4, (h) => {
+  h.ok(
+    h.act(1, { type: 'proposeTrade', to: h.id(2), give: { cash: 10, spaces: [], jailCards: 0 }, receive: { cash: 0, spaces: [], jailCards: 0 } }),
+    'offer on the table before the freeze',
+  )
+  h.now(0)
+  h.s.phase = 'ACTION'
+  h.s.pendingPurchase = 6
+  h.ok(h.act(0, { type: 'declineBuy' }), 'decline starts the auction')
+  h.eq(h.s.phase, 'AUCTION', 'auction running')
+  h.eq(allowedActions(h.s, h.id(1)).includes('cancelTrade'), true, 'the offerer can withdraw mid-auction')
+  h.ok(h.act(1, { type: 'cancelTrade', tradeId: h.s.trades[0]!.id }), 'withdraw succeeds mid-auction')
+  h.eq(h.s.trades.length, 0, 'offer withdrawn')
+  h.eq(h.s.phase, 'AUCTION', 'the auction itself is untouched')
+})
+
+// ── Forfeit: the one estate rule ──
+
+scenario('forfeit mid-own-turn advances cleanly', 4, (h) => {
+  h.now(0) // Asha's turn, plain ROLL phase, no holdings
+  h.ok(forfeitEstate(h.s, h.id(0)), 'forfeit')
+  h.eq(h.p(0).bankrupt, true, 'out of the game')
+  h.eq(h.p(0).cash, 0, 'estate wiped')
+  h.eq(h.s.currentPlayerId, h.id(1), 'the turn passed to Ben')
+  h.eq(h.s.phase, 'ROLL', 'a live phase for the next player')
+  h.eq(allowedActions(h.s, h.id(1)).includes('roll'), true, 'the game keeps moving')
+  h.bad(h.act(0, { type: 'roll' }), 'the gone player cannot act')
+})
+
+scenario('forfeit puts their deeds under the hammer unmortgaged', 4, (h) => {
+  h.now(0)
+  h.give(0, [1, 6])
+  h.prop(1, { mortgaged: true })
+  h.prop(6, { houses: 3 })
+  h.ok(forfeitEstate(h.s, h.id(0), 'Asha left the party — their properties go under the hammer'), 'forfeit')
+  h.eq(h.s.props[1].owner, null, 'the bank holds the deed')
+  h.eq(h.s.props[1].mortgaged, false, 'repossessed clean — the auction sells a live deed')
+  h.eq(h.s.props[6].houses, 0, 'buildings liquidated to the bank')
+  const firstUnderHammer = h.s.auction != null ? h.s.auction.space : null
+  const secondQueued = h.s.auctionQueue[0] ?? null
+  h.eq(
+    (firstUnderHammer === 1 && secondQueued === 6) || (firstUnderHammer === 6 && secondQueued === 1),
+    true,
+    'one deed under the hammer right now, the other queued next',
+  )
+  h.eq(h.s.phase, 'AUCTION', 'the hammer falls immediately')
+  h.eq(h.s.log.some((e) => e.text.includes('left the party — their properties go under the hammer')), true, 'the walk-out is on the record')
+  // the two liquidation auctions settle (everyone passes → bank keeps both)
+  for (let k = 0; k < 2; k++) {
+    for (const i of [1, 2, 3]) h.ok(h.act(i, { type: 'passBid' }), `auction ${k + 1}: p${i} passes`)
+  }
+  h.eq(h.s.phase, 'ROLL', 'liquidations done — the turn advanced past the bankrupt seat')
+  h.eq(h.s.currentPlayerId, h.id(1), 'Ben is up')
+})
+
+scenario('forfeit voids their trades and returns their jail cards', 4, (h) => {
+  h.p(0).jailCards = 1
+  h.p(0).jailCardDecks = ['chance']
+  h.s.chanceDeck = h.s.chanceDeck.filter((id) => id !== 'ch8') // the card is out in a hand
+  h.s.trades.push({ id: 't1', from: h.id(0), to: h.id(1), give: { cash: 0, spaces: [], jailCards: 0 }, receive: { cash: 0, spaces: [], jailCards: 0 } })
+  h.s.trades.push({ id: 't2', from: h.id(1), to: h.id(2), give: { cash: 0, spaces: [], jailCards: 0 }, receive: { cash: 0, spaces: [], jailCards: 0 } })
+  h.ok(forfeitEstate(h.s, h.id(0)), 'forfeit')
+  h.eq(h.s.trades.length, 1, "only the leaver's offers died")
+  h.eq(h.s.trades[0]!.id, 't2', 'the bystander offer survives')
+  h.eq(h.p(0).jailCards, 0, 'cards out of their hand')
+  h.eq(h.s.chanceDeck.includes('ch8'), true, 'the chance jail card is back in its own deck')
+})
+
+scenario('forfeit with a pending player-debt pays the lender', 4, (h) => {
+  h.give(0, [1, 3, 6])
+  h.prop(3, { mortgaged: true })
+  h.cash(0, 30)
+  h.cash(1, 100)
+  h.p(0).jailCards = 1
+  h.p(0).jailCardDecks = ['chance']
+  h.s.debt = { debtor: h.id(0), amount: 500, creditor: h.id(1) }
+  h.s.phase = 'DEBT'
+  // the rooms layer routes this case through forfeitSeat → declareBankruptcy
+  h.ok(forfeitSeat(h.s, h.id(0), 'Asha left the party'), 'the estate settles through the routing the server uses')
+  h.eq(h.p(0).bankrupt, true, 'out of the game')
+  // 100 + 30 cash − 6 interest on the mortgaged Baltic
+  h.eq(h.p(1).cash, 124, 'the lender got the estate, paid 10% interest on the mortgage')
+  h.eq(h.s.props[1].owner, h.id(1), 'deeds transferred to the creditor')
+  h.eq(h.p(1).jailCards, 1, 'jail cards transferred')
+  h.eq(h.s.debt, null, 'the debt died with the estate')
+})
+
+scenario('forfeit leaving one alive ends the game automatically', 2, (h) => {
+  h.give(0, [1])
+  h.ok(forfeitEstate(h.s, h.id(0)), 'forfeit')
+  h.eq(h.s.phase, 'GAME_OVER', 'the game ended with no host intervention')
+  h.eq(h.s.winner, h.id(1), 'Ben wins')
+  h.eq(h.s.auctionQueue.length, 0, 'no auctions needed — the game is over')
+  h.eq(h.s.props[1].owner, null, 'the deed went back to the bank')
+  h.eq(h.s.log[h.s.log.length - 1]?.text, '🏆 Ben WINS — last one standing!', 'the walk-off victory is logged its own way')
+})
+
+scenario('forfeit never bails out the current player', 4, (h) => {
+  // A is mid buy-decision; B walks out — A's decision must survive
+  h.give(0, [1])
+  h.now(0, 'ACTION')
+  h.s.pendingPurchase = 1
+  h.ok(forfeitSeat(h.s, h.id(1), 'Ben left the party'), 'a bystander forfeits')
+  h.eq(h.s.pendingPurchase, 1, "Asha's live buy decision survives")
+  h.eq(allowedActions(h.s, h.id(0)).includes('buy'), true, 'Asha can still buy')
+
+  // A is under an announced arrest; C walks out — A must still go to jail
+  h.s.pendingPurchase = null
+  h.s.pendingJail = { player: h.id(0), reason: 'card' }
+  h.ok(forfeitSeat(h.s, h.id(2), 'Cho left the party'), 'another bystander forfeits')
+  h.eq(h.s.pendingJail != null && h.s.pendingJail.player, h.id(0), "Asha's arrest survives")
+  h.eq(allowedActions(h.s, h.id(0)).includes('goToJail'), true, 'Asha must still go to jail')
+})
+
+scenario('forfeit redirects debts the leaver was collecting', 4, (h) => {
+  // Asha owes Ben rent; Ben walks out — the debt pays the bank, not a corpse
+  h.s.debt = { debtor: h.id(0), amount: 25, creditor: h.id(1), memo: 'Rent: Test Ave' }
+  h.s.phase = 'DEBT'
+  h.cash(1, 200)
+  h.ok(forfeitSeat(h.s, h.id(1), 'Ben left the party'), 'the creditor forfeits')
+  h.eq(h.s.debt != null && h.s.debt.creditor, null, 'the debt now pays the bank')
+  h.ok(h.act(0, { type: 'payDebt' }), 'Asha pays')
+  h.eq(h.p(0).cash, 1475, 'Asha paid the 25 (1500 − 25)')
+  h.eq(h.p(1).cash, 0, 'no cash landed on the dead seat')
+})
+
+scenario('a disconnect is not a forfeit: the seat waits', 4, (h) => {
+  h.p(1).connected = false // the phone dropped — no room:leave ever arrived
+  h.eq(h.p(1).bankrupt, false, 'the seat is intact and rejoinable')
+  h.eq(h.s.phase, 'ROLL', 'the engine state is untouched')
+  h.eq(h.s.winner, null, 'no automatic winner')
+  h.ok(h.roll(0, [[1, 2]]), 'the game plays on without them')
+  h.eq(h.s.phase, 'ACTION', 'a fresh landing is live for the current player')
 })
 
 // ── summary ──

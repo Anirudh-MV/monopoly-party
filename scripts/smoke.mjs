@@ -151,6 +151,24 @@ try {
     zoe.disconnect()
   }
 
+  // ── rename: your own name, lobby only ──
+  {
+    let l = null
+    host.on('lobby', (x) => {
+      l = x
+    })
+    const rres = await emitAck(phones[0].sock, 'room:rename', { name: 'Maya2' })
+    assert(rres.ok, 'lobby rename accepted')
+    await sleep(150)
+    assert(l && l.players.find((p) => p.id === phones[0].id)?.name === 'Maya2', 'TV lobby broadcast shows the new name')
+    // someone else's case-variant of it is a duplicate
+    const dres = await emitAck(phones[2].sock, 'room:rename', { name: 'maya2' })
+    assert(dres && !dres.ok && dres.error === 'Someone already took that name', 'case-insensitive duplicate name refused')
+    // the TV is nobody's seat — a host socket cannot rename
+    const hres = await emitAck(host, 'room:rename', { name: 'TV' })
+    assert(hres && !hres.ok, 'a host socket cannot rename')
+  }
+
   // ── start ──
   let lastHostView = null
   host.on('view', (v) => {
@@ -170,6 +188,10 @@ try {
   assert(phones[0].view.you === phones[0].id, 'phone view is personalised')
   const curPhone = phones.find((p) => p.id === lastHostView.currentPlayerId)
   assert(curPhone.view.allowed.includes('roll'), "current player's phone offers ROLL")
+
+  // rename is a lobby-only power: the started game locks names
+  const lateRename = await emitAck(phones[0].sock, 'room:rename', { name: 'Maya3' })
+  assert(lateRename && !lateRename.ok && lateRename.error === 'The game already started', 'mid-game rename refused')
 
   // ── drive the game via allowed actions ──
   // Interactive rent (and auctions) pause the table on a pending decision;
@@ -367,30 +389,97 @@ try {
     await playRounds(6, 'post-import gameplay')
   }
 
-  // ── exit mid-game: leave for good, join a new lobby ──
-  // Runs after every section that needs all phones attached: the departed
-  // seat keeps rotating into the turn order, and its phone no longer
-  // receives views.
+  // ── god kick mid-game ──
+  // Fresh room: kicking shrinks the living table, and the main room still
+  // needs its full quorum for the exit section below.
   {
-    // never the current player, and never the debtor (their pending Pay
-    // owns the table) — chosen from a settled state so the game keeps
+    const tvk = connect()
+    const ck = await emitAck(tvk, 'room:create')
+    const kphones = []
+    for (const n of ['Kim', 'Liv', 'Moa']) {
+      const s = connect()
+      const res = await emitAck(s, 'room:join', { code: ck.code, name: n })
+      kphones.push({ sock: s, id: res.playerId, token: res.token, view: null })
+    }
+    let kv = null
+    tvk.on('view', (v) => {
+      kv = v
+    })
+    for (const p of kphones) p.sock.on('view', (v) => { p.view = v })
+    const sk = await emitAck(tvk, 'game:start', {})
+    assert(sk.ok, 'three-player game started for the kick test')
+    await waitFor(() => kv != null && kphones.every((p) => p.view != null), 8000, 'kick-room views')
+
+    // phones never reach the god console
+    const pres = await emitAck(kphones[0].sock, 'god:command', { cmd: 'kick', playerId: kphones[1].id })
+    assert(pres && !pres.ok, 'god kick from a phone is rejected')
+
+    let wasKicked = false
+    kphones[1].sock.on('kicked', () => {
+      wasKicked = true
+    })
+    const kres = await emitAck(tvk, 'god:command', { cmd: 'kick', playerId: kphones[1].id })
+    assert(kres.ok, 'god kicked a player mid-game')
+    await sleep(200)
+    assert(wasKicked, 'the kicked phone was told')
+    assert(kv && kv.players.find((p) => p.id === kphones[1].id)?.bankrupt === true, 'the TV shows them bankrupt')
+    assert(kv && kv.phase !== 'GAME_OVER', 'the game is not over — two players remain')
+    // the seat's rejoin token died with the eviction
+    const back = connect()
+    const bres = await emitAck(back, 'room:rejoin', { token: kphones[1].token })
+    assert(bres && !bres.ok, 'the kicked token cannot rejoin')
+    back.disconnect()
+    // the game continues without them
+    const cur = kphones.find((p) => p.id === kv.currentPlayerId)
+    const acts = (cur && cur.view && cur.view.allowed) || []
+    const action = acts.includes('roll') ? { type: 'roll' } : null
+    assert(action != null, 'the surviving table is still live')
+    if (action && cur) {
+      const rres = await emitAck(cur.sock, 'game:action', action)
+      assert(rres.ok, 'the game rolls on without the kicked seat')
+    }
+    for (const p of kphones) p.sock.disconnect()
+    tvk.disconnect()
+  }
+
+  // ── exit mid-game: forfeit — the estate goes under the hammer ──
+  // Runs after every section that needs all phones attached: walking out
+  // is an immediate bankrupt-to-bank forfeit. The game plays on without
+  // them, their deeds are auctioned, and this phone can never return.
+  {
+    // never the current player, never the debtor, never an already-kicked
+    // bankrupt seat — chosen from a settled state so the game keeps
     // moving right after
     await settleTable()
-    const gone = phones.find(
-      (p) => p.id !== lastHostView.currentPlayerId && p.id !== lastHostView.debt?.debtor,
-    )
+    const gone = phones.find((p) => {
+      const seat = lastHostView.players.find((q) => q.id === p.id)
+      return (
+        seat != null &&
+        !seat.bankrupt &&
+        p.id !== lastHostView.currentPlayerId &&
+        p.id !== lastHostView.debt?.debtor
+      )
+    })
     const goneToken = gone.token
-    const before = lastHostView.players.length
+
+    // guarantee the estate has something to auction: god hands them a deed
+    await emitAck(host, 'god:command', { cmd: 'setProperty', space: 6, owner: gone.id })
+    await sleep(150)
+    assert(lastHostView.props[6].owner === gone.id, 'the leaver owns a deed before walking out')
 
     const xres = await emitAck(gone.sock, 'room:leave', {})
     assert(xres.ok, 'mid-game exit accepted')
-    await sleep(150)
+    await sleep(200)
 
-    // the seat stays at the table, but reads as offline
+    // the seat stays in the array (that is how bankruptcy renders) but is
+    // flagged bankrupt on the TV view
     const seat = lastHostView.players.find((p) => p.id === gone.id)
-    assert(seat != null, 'their seat stays at the table')
+    assert(seat != null, 'their seat stays in the player list')
+    assert(seat.bankrupt === true, 'the TV shows them bankrupt')
     assert(seat.connected === false, 'the TV sees them offline')
-    assert(lastHostView.players.length === before, 'player count unchanged — the game plays on')
+
+    // the deed went under the hammer immediately
+    assert(lastHostView.auction != null, 'their deed is under the hammer')
 
     // the rejoin token is destroyed — this phone can't wander back
     const back = connect()
@@ -398,12 +487,12 @@ try {
     assert(bres && !bres.ok, 'the destroyed token cannot rejoin')
     back.disconnect()
 
-    // everyone else keeps playing until the rotation reaches the empty seat
-    // (from there the decision clock owns it)
+    // the auctions settle and everyone else keeps playing
     let okCount = 0
+    let auctionSettled = false
     for (let i = 0; i < 8; i++) {
       await settleTable()
-      if (lastHostView.currentPlayerId === gone.id) break
+      if (lastHostView.auction == null) auctionSettled = true
       const me = phones.find((p) => p.id === lastHostView.currentPlayerId)
       if (!me || !me.view) break
       const acts = me.view.allowed || []
@@ -423,7 +512,9 @@ try {
       if (res.ok) okCount++
       await sleep(60)
     }
+    assert(auctionSettled, 'the liquidation auctions settled')
     assert(okCount >= 1, `post-exit gameplay: ${okCount} actions accepted`)
+    assert(lastHostView.phase !== 'GAME_OVER', 'the game continues without them')
 
     // and the exited phone can start over in a different room
     const tv2 = connect()
@@ -441,6 +532,37 @@ try {
   const host2 = connect()
   const hres = await emitAck(host2, 'room:hostJoin', { code, hostToken: created.hostToken })
   assert(hres.ok, 'TV reconnected with its token')
+
+  // ── automatic win detection: a two-player walk-off ends the game ──
+  // A fresh room, no host intervention: one player leaves mid-game and the
+  // game must detect the win on its own.
+  {
+    const tv3 = connect()
+    const c3 = await emitAck(tv3, 'room:create')
+    const pa = connect()
+    const ra = await emitAck(pa, 'room:join', { code: c3.code, name: 'Ana' })
+    const pb = connect()
+    const rb = await emitAck(pb, 'room:join', { code: c3.code, name: 'Bo' })
+    assert(ra.ok && rb.ok, 'two phones joined the fresh room')
+    let v3 = null
+    tv3.on('view', (v) => {
+      v3 = v
+    })
+    const s3 = await emitAck(tv3, 'game:start', {})
+    assert(s3.ok, 'two-player game started')
+    await waitFor(() => v3 != null && v3.phase !== 'LOBBY', 8000, 'fresh game views')
+
+    // Ana walks out mid-game — forfeit, last one standing
+    const xres = await emitAck(pa, 'room:leave', {})
+    assert(xres.ok, 'the walk-out was accepted')
+    await waitFor(() => v3 && v3.phase === 'GAME_OVER', 8000, 'automatic win detection')
+    assert(v3 && v3.winner === rb.playerId, 'Bo wins automatically — no host intervention')
+    assert(v3 && v3.players.find((p) => p.id === ra.playerId)?.bankrupt === true, 'Ana is bankrupt on the record')
+
+    pa.disconnect()
+    pb.disconnect()
+    tv3.disconnect()
+  }
 } catch (err) {
   failed++
   console.error(`  \u2717 smoke crashed: ${err && err.message ? err.message : err}`)
