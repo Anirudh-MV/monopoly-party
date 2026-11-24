@@ -205,16 +205,27 @@ export function createAvatar(idx: number, color: string): THREE.Group {
 }
 
 // One-time offscreen render of each avatar — the picker grids show these
-// instead of emoji, so what you tap is exactly what walks the board.
-const thumbs = new Map<number, string>()
+// instead of emoji, so what you tap is exactly what walks the board. The
+// cache is per (model, colour): pickers use the gold default; in-game the
+// thumbnail renders in the player's chosen colour, replacing the emoji
+// beside every player's name.
+//
+// One shared offscreen renderer for all thumbnails: creating WebGL
+// contexts per uncached call caused 20-60ms churn inside renderGame's
+// innerHTML build (a one-time hitch on weak TV browsers, and rapid
+// context create/destroy competes with the live Board3D context).
+const thumbs = new Map<string, string>()
+let thumbRig: {
+  renderer: THREE.WebGLRenderer
+  scene: THREE.Scene
+  camera: THREE.PerspectiveCamera
+} | null = null
 
-export function avatarThumbnail(idx: number): string {
-  const cached = thumbs.get(idx)
-  if (cached) return cached
-  const size = 128
+function thumbRenderer(): { renderer: THREE.WebGLRenderer; scene: THREE.Scene; camera: THREE.PerspectiveCamera } {
+  if (thumbRig) return thumbRig
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true })
   renderer.setPixelRatio(1)
-  renderer.setSize(size, size)
+  renderer.setSize(128, 128)
   const scene = new THREE.Scene()
   scene.add(new THREE.AmbientLight(0xffffff, 0.85))
   const dir = new THREE.DirectionalLight(0xffffff, 1.0)
@@ -223,11 +234,22 @@ export function avatarThumbnail(idx: number): string {
   const camera = new THREE.PerspectiveCamera(36, 1, 0.1, 50)
   camera.position.set(1.15, 1.05, 1.6)
   camera.lookAt(0, 0.28, 0)
-  scene.add(createAvatar(idx, '#f59e0b'))
+  thumbRig = { renderer, scene, camera }
+  return thumbRig
+}
+
+export function avatarThumbnail(idx: number, color = '#f59e0b'): string {
+  const key = `${idx}|${color}`
+  const cached = thumbs.get(key)
+  if (cached) return cached
+  const { renderer, scene, camera } = thumbRenderer()
+  // one figurine at a time; removed after the shot so the rig is reusable
+  const fig = createAvatar(idx, color)
+  scene.add(fig)
   renderer.render(scene, camera)
   const url = renderer.domElement.toDataURL()
-  renderer.dispose()
-  thumbs.set(idx, url)
+  scene.remove(fig)
+  thumbs.set(key, url)
   return url
 }
 

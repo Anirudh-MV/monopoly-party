@@ -559,3 +559,11 @@ button:hover { filter: brightness(1.06); }
   background: var(--money-bright); color: #1c2333; border: none;
   border-radius: 1vh; padding: 0 1.4vh; cursor: pointer;
 }
+
+/* ── avatar thumbnails — em-based so each panel's vh font size scales them ── */
+.avathumb {
+  height: 1.2em; width: 1.2em;
+  object-fit: contain;
+  vertical-align: -0.28em;
+  user-select: none; pointer-events: none;
+}

@@ -90,3 +90,6 @@
   }
   .phone { min-width: 250px; flex-shrink: 0; }
 }
+
+/* sim: player tokens stay emoji — this is a diagnostic harness, and its
+   board cells use emoji as the 2D piece representation (council ruling) */
