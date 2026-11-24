@@ -100,7 +100,7 @@ h1, h2, h3 { margin-bottom: 8px; }
 .good { color: var(--good); }
 .hint { color: var(--dim); font-size: 13px; line-height: 1.45; }
 .playerlist { list-style: none; font-size: 16px; display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
-.playerlist li { display: flex; align-items: center; gap: 8px; }
+.playerlist li { display: flex; align-items: center; gap: 8px; min-height: 34px; }
 .playerlist .dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
 .playerlist .kickbtn { margin-left: auto; min-height: 30px; font-size: 13px; padding: 2px 10px; color: var(--bad); border-color: #d98080; }
 .playerlist .renamebtn { margin-left: auto; min-height: 30px; font-size: 13px; padding: 2px 10px; color: var(--accent); }
@@ -137,7 +137,8 @@ button.disabled, button:disabled { opacity: 0.4; }
 .topbar .me { font-weight: 800; font-size: 17px; white-space: nowrap; max-width: 45%; overflow: hidden; text-overflow: ellipsis; }
 .topbar .money { font-size: 26px; font-weight: 800; color: var(--money-bright); margin-left: auto; white-space: nowrap; }
 .topbar .meta { color: var(--dim); font-size: 13px; order: 3; flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.topbar .themebtn { order: 4; min-height: 36px; font-size: 13px; padding: 4px 10px; border-radius: 10px; white-space: nowrap; flex-shrink: 0; }
+/* the ☰ that replaced the old theme/Board/Exit topbar buttons */
+.topbar .menubtn { order: 4; min-height: 44px; min-width: 44px; font-size: 20px; padding: 4px 12px; border-radius: 10px; white-space: nowrap; flex-shrink: 0; line-height: 1; }
 
 /* banners */
 .banner { margin: 10px 0 4px; padding: 12px 14px; border-radius: 12px; font-size: 16px; font-weight: 600; }
@@ -225,9 +226,10 @@ button.boardpromo {
   padding: 10px; margin: 8px 0; cursor: pointer;
 }
 .table-sec .trow.dead { opacity: 0.5; cursor: default; }
-.table-sec .t-top { display: flex; align-items: baseline; gap: 8px; }
+.table-sec .t-top { display: flex; align-items: baseline; gap: 8px; min-height: 30px; }
 .table-sec .t-name { font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .table-sec .t-cash { font-weight: 800; color: var(--money-bright); white-space: nowrap; }
+.table-sec .t-go { color: var(--dim); font-size: 14px; flex: none; }
 .table-sec .t-deeds { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
 .deedchip {
   display: inline-flex; align-items: center; gap: 4px;
@@ -242,7 +244,7 @@ button.boardpromo {
 .ledger-list { list-style: none; margin-top: 8px; }
 .ledger-list li {
   display: flex; gap: 8px; align-items: baseline;
-  padding: 8px 4px; border-bottom: 1px solid var(--line); font-size: 14px;
+  padding: 8px 4px; border-bottom: 1px solid var(--line); font-size: 14px; min-height: 28px;
 }
 .ledger-list .who { font-size: 15px; min-width: 20px; }
 .ledger-list .amt { font-weight: 800; min-width: 58px; text-align: right; }
@@ -305,7 +307,21 @@ button.boardpromo {
 .confirm-title { font-size: 18px; font-weight: 800; margin-bottom: 8px; }
 .confirm-body { font-size: 14px; color: var(--dim); line-height: 1.55; margin-bottom: 16px; }
 .confirm-step { margin-top: 14px; }
-.topbar .exitbtn { color: #e15b5b; }
+
+/* ── the hamburger sheet (z 20 — same layer as every other sheet) ── */
+.menu-sheet { padding-top: 10px; }
+.menu-item {
+  display: block; width: 100%; text-align: left;
+  min-height: 44px; padding: 8px 12px; margin: 2px 0;
+  background: none; border: none; border-radius: 12px; color: var(--ink);
+}
+.menu-item:active { background: var(--panel2); }
+.menu-item .mi-label { display: block; font-size: 16px; font-weight: 700; }
+.menu-item .mi-hint { display: block; font-size: 12px; font-weight: 500; color: var(--dim); margin-top: 1px; }
+.menu-sep { height: 1px; background: var(--line); margin: 8px 6px; }
+/* the red the old topbar Exit carried */
+.menu-item.danger { color: #e15b5b; }
+.menu-item.danger .mi-label { color: inherit; }
 
 /* ── pocket board ── */
 .board-overlay {
@@ -325,7 +341,9 @@ button.boardpromo {
 }
 .board-tool.on { background: #2f3a56; border-color: #6c8cff; color: #cdd7ff; }
 
-/* ── property info card (board tap / trade tap) ── */
+/* ── property info card (board tap / table chip / trade strip) ──
+   The overlay frame (z 90, above the board) now just carries the shared
+   title-deed card — no bespoke prose rows any more. */
 .propinfo-overlay {
   position: fixed; inset: 0; z-index: 90;
   background: rgba(10, 12, 20, 0.55);
@@ -335,16 +353,77 @@ button.boardpromo {
 .propinfo-card {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-top: 4px solid var(--g, var(--line));
   border-radius: 16px;
-  padding: 18px 20px;
+  padding: 0;
   width: min(88vw, 340px);
   box-shadow: var(--shadow);
+  overflow: hidden;
 }
-.propinfo-title { font-size: 18px; font-weight: 800; display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
-.propinfo-title .ls-swatch { width: 14px; height: 14px; border-radius: 4px; background: var(--g, var(--line)); flex-shrink: 0; }
-.propinfo-row { font-size: 15px; color: var(--dim); margin: 6px 0; }
-.propinfo-row b { color: var(--ink, #1c2333); }
+.propinfo-card .deed-card { border: 0; border-radius: 0; }
+.propinfo-card > .row { padding: 0 12px 12px; margin-top: 0; }
+
+/* ── the title deed card — ONE renderer for the grid, the board tap, the
+   table chips and the trade strips. Pure display; never a button. ── */
+.deed-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.dc-head {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  background: var(--g, #9aa1ad); color: #fff;
+  padding: 8px 10px;
+  font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em;
+}
+.dc-head.dark { color: #1c2333; } /* pale groups (yellow) take dark ink */
+.dc-badge {
+  font-size: 9px; font-weight: 800; letter-spacing: 0.06em;
+  background: rgba(0, 0, 0, 0.35); color: #fff;
+  padding: 2px 6px; border-radius: 6px; white-space: nowrap;
+}
+.dc-head.dark .dc-badge { background: rgba(28, 35, 51, 0.15); color: #1c2333; }
+.dc-hint { color: var(--dim); font-size: 11px; padding: 6px 10px 0; }
+.dc-ladder { display: flex; flex-direction: column; gap: 2px; padding: 6px 10px 8px; }
+.dc-row {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.dc-row .dc-l { color: var(--dim); flex: 1; min-width: 0; }
+.dc-row .dc-v { font-weight: 700; white-space: nowrap; }
+.dc-row.now .dc-l, .dc-row.now .dc-v { color: var(--ink); font-weight: 800; }
+.dc-now { color: var(--good); font-size: 10px; font-weight: 800; white-space: nowrap; }
+.dc-foot {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 10px; border-top: 1px solid var(--line);
+  background: var(--panel2); font-size: 12px;
+}
+.dc-foot b { max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dc-bank { color: var(--dim); }
+.dc-price { margin-left: auto; font-weight: 800; color: var(--money-bright); white-space: nowrap; }
+.dc-actions { padding: 8px 10px; border-top: 1px dashed var(--line); margin-top: 0; }
+.dc-actions button { flex: 1 1 auto; }
+
+/* ── the View-properties screen (z 20, same sheet layer as the menu) ── */
+.deeds-sheet { max-height: 94vh; width: min(100%, 560px); max-width: 560px; }
+.deeds-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.deeds-head h3 { flex: 1; margin: 0; color: var(--dim); letter-spacing: 0.12em; font-size: 14px; }
+.deeds-x {
+  min-height: 44px; min-width: 44px; width: 44px; padding: 0;
+  font-size: 16px; border-radius: 12px;
+  background: var(--panel2); color: var(--dim);
+}
+.chip .dstrip {
+  display: inline-block; width: 10px; height: 14px; border-radius: 3px;
+  background: var(--g, #9aa1ad); vertical-align: -2px; margin-right: 4px;
+}
+.deed-h {
+  color: var(--dim); font-size: 12px; font-weight: 800;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  margin: 14px 0 6px;
+}
+.deedgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); gap: 8px; }
+.deeds-empty { margin: 16px 0 4px; }
 
 /* trade cards: colour strips + tappable property names */
 .tradestrip {
@@ -365,6 +444,8 @@ button.boardpromo {
   animation: fadeIn 0.2s ease-out;
 }
 .roll-box { text-align: center; }
+/* the roller's own phone gets the accent frame (asymmetry ruling) */
+.roll-box.mine { border: 2px solid var(--money-bright); border-radius: 18px; padding: 18px 24px; }
 .roll-who { font-size: 22px; font-weight: 800; color: #fff; margin-bottom: 18px; letter-spacing: 0.02em; }
 .dice-row { display: flex; gap: 14px; justify-content: center; }
 .die {
@@ -484,10 +565,21 @@ button.boardpromo {
   border-radius: 10px; padding: 0 16px; cursor: pointer;
 }
 
-/* ── the player's 3D avatar beside their name (rendered by tokens3d.ts, cached) ── */
+/* ── the player's 3D avatar beside their name (rendered by tokens3d.ts, cached) ──
+   Base size + per-context bumps (playtest ruling: the avatars were too
+   small to read at a glance). Row baselines below keep the text on a
+   comfortable line — the names keep their ellipsis behaviour. */
 .avathumb {
-  height: 1.25em; width: 1.25em;
+  height: 1.55em; width: 1.55em;
   object-fit: contain;
-  vertical-align: -0.3em;
+  vertical-align: -0.38em;
   user-select: none; -webkit-touch-callout: none; pointer-events: none;
 }
+.topbar .me .avathumb { height: 1.6em; width: 1.6em; vertical-align: -0.4em; }
+.banner .avathumb { height: 1.5em; width: 1.5em; }
+.table-sec .t-name .avathumb { height: 1.6em; width: 1.6em; }
+.ledger .who .avathumb { height: 1.5em; width: 1.5em; }
+.chip .avathumb { height: 1.7em; width: 1.7em; }
+.playerlist .avathumb { height: 1.9em; width: 1.9em; vertical-align: -0.45em; }
+.dc-foot .avathumb { height: 1.5em; width: 1.5em; vertical-align: -0.3em; }
+.roll-who .avathumb { height: 1.35em; width: 1.35em; }

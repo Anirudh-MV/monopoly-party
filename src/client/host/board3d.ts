@@ -182,6 +182,10 @@ export class Board3D {
   // and stops easing back after every gesture — the view stays exactly
   // where the player leaves it until they tap Reset or Follow.
   private roam = false
+  // Single-finger gesture in the roam view: 'orbit' (rotate) or 'pan'
+  // (lateral, map-style). Two-finger pinch always zooms in either mode.
+  // The TV never sets this — its drag stays orbit.
+  private gestureMode: 'orbit' | 'pan' = 'orbit'
 
   constructor(container: HTMLElement) {
     this.renderer = new THREE.WebGLRenderer({ antialias: true })
@@ -247,8 +251,7 @@ export class Board3D {
       const dy = ev.clientY - this.dragY
       this.dragX = ev.clientX
       this.dragY = ev.clientY
-      this.userYaw -= dx * 0.005
-      this.userPitch = THREE.MathUtils.clamp(this.userPitch + dy * 0.004, -1.15, 1.15)
+      this.singleMove(dx, dy)
       return
     }
     this.pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY })
@@ -262,6 +265,16 @@ export class Board3D {
     const dy = ev.clientY - this.dragY
     this.dragX = ev.clientX
     this.dragY = ev.clientY
+    this.singleMove(dx, dy)
+  }
+
+  // One-finger drag: orbit by default; the pocket board may switch the
+  // verb to lateral pan (map-style) — the pinch zoom stays untouched.
+  private singleMove(dx: number, dy: number): void {
+    if (this.gestureMode === 'pan') {
+      this.panBy((dx * 1.5) / window.innerWidth, (dy * 1.5) / window.innerHeight)
+      return
+    }
     this.userYaw -= dx * 0.005
     this.userPitch = THREE.MathUtils.clamp(this.userPitch + dy * 0.004, -1.15, 1.15)
   }
@@ -269,7 +282,7 @@ export class Board3D {
   private onPointerUp = (ev: PointerEvent): void => {
     const wasTap =
       this.pointers.size === 1 &&
-      Math.hypot(ev.clientX - this.downX, ev.clientY - this.downY) < 8 &&
+      Math.hypot(ev.clientX - this.downX, ev.clientY - this.downY) < 10 &&
       performance.now() - this.downTime < 400
     this.pointers.delete(ev.pointerId)
     if (this.pointers.size < 2) this.pinchStart = null
@@ -496,6 +509,14 @@ export class Board3D {
   setRoam(on: boolean): void {
     this.roam = on
     if (on) this.resetRoamView()
+  }
+
+  setGestureMode(m: 'orbit' | 'pan'): void {
+    this.gestureMode = m
+  }
+
+  getGestureMode(): 'orbit' | 'pan' {
+    return this.gestureMode
   }
 
   // The overview the player can always return to with one tap.

@@ -6,7 +6,7 @@
 // and the reveal animates here and on the TV.
 
 import { io } from 'socket.io-client'
-import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
+import { BOARD, GROUP_COLORS, groupIndices, isStreet } from '../../shared/board.js'
 import { TOKENS, stripEmoji } from '../../shared/tokens.js'
 import { COLORS } from '../../shared/colors.js'
 import { AvatarPreview, avatarThumbnail } from '../tokens3d.js'
@@ -23,7 +23,7 @@ import {
   rentPreview,
   unmortgageCost,
 } from '../../shared/rules.js'
-import type { Action, Card, LobbyInfo, PlayerView, Space, TradeOffer, TradeSide } from '../../shared/types.js'
+import type { Action, Card, ColorGroup, LobbyInfo, PlayerView, Space, TradeOffer, TradeSide } from '../../shared/types.js'
 
 interface JoinAck {
   ok: boolean
@@ -64,6 +64,19 @@ interface Composer {
   recvJail: number
 }
 let composer: Composer | null = null
+
+// Hamburger menu + View-properties screen are module-level UI state, re-emitted
+// inside $app on every render (composer precedent) so they survive view pushes.
+let menuOpen = false
+let deedsOpen = false
+// Deed grid filters: owner is 'ALL' | 'UNOWNED' | a playerId; kind is 'ALL' |
+// a color-group key | 'rail' | 'utility'. Both single-select, AND-combined.
+let deedFilters = { owner: 'ALL' as string, kind: 'ALL' as string }
+const GROUP_ORDER: ColorGroup[] = ['brown', 'lightblue', 'pink', 'orange', 'red', 'yellow', 'green', 'blue']
+const GROUP_LABEL: Record<ColorGroup, string> = {
+  brown: 'Brown', lightblue: 'Light blue', pink: 'Pink', orange: 'Orange',
+  red: 'Red', yellow: 'Yellow', green: 'Green', blue: 'Blue',
+}
 
 // animation bookkeeping
 let lastCardSeq = -1
@@ -212,8 +225,23 @@ function performExit(): void {
     view = null
     composer = null
     lastCardSeq = -1
+    resetScreenStates()
     render()
   })
+}
+
+// Seat gone (leave, kick, room closed): every screen-local state must go
+// back to cold. A rejoin's first view is then a fresh baseline — the old
+// roll machine must not replay the previous seat's last roll, and a dead
+// sheet must not greet the join screen.
+function resetScreenStates(): void {
+  menuOpen = false
+  deedsOpen = false
+  deedFilters = { owner: 'ALL', kind: 'ALL' }
+  rollSeen = false
+  rollKey = ''
+  rollPrevHadDice = false
+  rollPrevPhase = ''
 }
 
 // ── one-step action confirmation ──
@@ -302,19 +330,32 @@ function showRenameEditor(current: string): void {
 // Every phone at the table plays the roll together, in sync with the TV's
 // suspense beat: the dice tumble for the TV's 1150ms hold, settle on the
 // real values, and only then does the landing underneath get revealed.
-let lastRollKey = ''
-let firstRollSeen = false
+//
+// The roll state machine (council ruling, replaces the old lastRollKey
+// dedupe): dice are a NEW roll only when they first appear (the previous
+// view had none) or when the previous view sat in the ROLL phase (a doubles
+// re-roll). Anything else that mutates the view's dice — the fresh utility
+// roll behind a drawn card, a re-pushed view during a freeze — never
+// replays the animation. The very first view of any kind is only a
+// baseline: joining/reloading mid-turn must not replay a rolled roll.
+let rollKey = ''
+let rollPrevHadDice = false
+let rollPrevPhase: PlayerView['phase'] | '' = ''
+let rollSeen = false
+
+const rollKeyOf = (v: PlayerView): string =>
+  v.dice ? `${v.turn}:${v.currentPlayerId}:${v.dice.join(',')}` : ''
 
 function maybeShowRoll(v: PlayerView): void {
-  if (!v.dice) return
-  const key = `${v.turn}:${v.currentPlayerId}:${v.dice.join()}`
-  if (key === lastRollKey) return
-  lastRollKey = key
-  if (!firstRollSeen) {
-    firstRollSeen = true
-    return // reconnect mid-turn: don't replay a roll that already happened
+  const key = rollKeyOf(v)
+  if (!rollSeen) {
+    rollSeen = true // first view of any kind = baseline; never animate it
+  } else if (key && key !== rollKey && (!rollPrevHadDice || rollPrevPhase === 'ROLL')) {
+    showRollOverlay(v) // a NEW roll: first appearance of dice, or a re-roll from the ROLL phase
   }
-  showRollOverlay(v)
+  rollKey = key
+  rollPrevHadDice = v.dice != null
+  rollPrevPhase = v.phase
 }
 
 function pipsFor(n: number): string {
@@ -340,7 +381,7 @@ function showRollOverlay(v: PlayerView): void {
   const overlay = document.createElement('div')
   overlay.className = 'roll-overlay'
   overlay.innerHTML = `
-    <div class="roll-box">
+    <div class="roll-box${mine ? ' mine' : ''}">
       <div class="roll-who">${mine ? 'You roll!' : `${avathumb(roller)}${esc(roller?.name ?? 'Someone')} rolls`}</div>
       <div class="dice-row">
         <div class="die tumbling"></div>
@@ -410,20 +451,27 @@ function animateMoney(from: number, to: number): void {
 // Close returns to the controller. It stays live with the game while open.
 let phoneBoard: Board3D | null = null
 
-// One-time discovery: playtesters never found the topbar Board button, so
+// One-time discovery: playtesters never found the Board button, so
 // the first game view gets a full-width promo above the action cards.
-// Opening the board (promo or topbar) retires it forever, per browser.
+// Opening the board (promo or menu) retires it forever, per browser.
 const BOARD_PROMO_FLAG = 'mp-board-promo'
+// Persisted single-finger gesture verb for the pocket board: 'pan' (map-style
+// lateral drag, the default) or 'orbit'. Stored per browser.
+const GESTURE_FLAG = 'mp-board-gesture'
+type GestureMode = 'pan' | 'orbit'
+const gestureLabel = (m: GestureMode): string => (m === 'pan' ? '✋ Pan' : '🔄 Orbit')
 
 function showBoard(): void {
   if (!view) return
   localStorage.setItem(BOARD_PROMO_FLAG, '1')
   closeBoard()
+  const mode: GestureMode = localStorage.getItem(GESTURE_FLAG) === 'orbit' ? 'orbit' : 'pan'
   const overlay = document.createElement('div')
   overlay.className = 'board-overlay'
   overlay.innerHTML = `
     <div class="board-tools">
       <button class="board-tool" data-act="boardReset">⟲ Reset view</button>
+      <button class="board-tool${mode === 'pan' ? ' on' : ''}" data-act="boardMode">${gestureLabel(mode)}</button>
       <button class="board-tool" data-act="boardFollow">▶ Follow game</button>
       <button class="board-tool board-closebtn" data-act="boardClose">✕ Close</button>
     </div>`
@@ -431,6 +479,7 @@ function showBoard(): void {
   phoneBoard = new Board3D(overlay)
   phoneBoard.setTheme(theme)
   phoneBoard.setRoam(true) // free roaming — the camera is the player's
+  phoneBoard.setGestureMode(mode) // the stored pan/orbit preference
   phoneBoard.sync(view)
   // tap any tile for its details: price, rent, owner
   phoneBoard.onTileTap = (space) => showPropInfo(space)
@@ -447,6 +496,13 @@ function showBoard(): void {
         follow.classList.remove('on')
         follow.textContent = '▶ Follow game'
       }
+    } else if (btn.dataset.act === 'boardMode') {
+      // imperative update — a full render() here would re-init WebGL
+      const next: GestureMode = phoneBoard?.getGestureMode() === 'pan' ? 'orbit' : 'pan'
+      phoneBoard?.setGestureMode(next)
+      localStorage.setItem(GESTURE_FLAG, next)
+      btn.classList.toggle('on', next === 'pan')
+      btn.textContent = gestureLabel(next)
     } else if (btn.dataset.act === 'boardFollow') {
       const on = btn.classList.toggle('on')
       // following = TV-style tracking (with its snap-back); off = roaming
@@ -463,40 +519,116 @@ function closeBoard(): void {
   if (view || lobby) render()
 }
 
-// ── property info card ──
-// Shared by the pocket board (tap a tile) and the trade cards (tap a
-// property name): original price, the rent it commands right now, and who
-// owns it.
-function showPropInfo(space: number): void {
-  const v = view
-  if (!v) return
-  const sp = BOARD[space]
+// ── the title deed ──
+// ONE deed renderer, reused by the View-properties grid, the pocket-board
+// tap, the table deed chips and the trade strips: the full rent ladder,
+// what it earns right now (● now), mortgage math, and the owner. Cards are
+// pure display — never a button. Management buttons ride along only in the
+// grid (actions:true) and only from manageButtons, the same acts.has +
+// can* gate renderPortfolio uses, so the two can never drift.
+function deedCardHTML(v: PlayerView, space: number, opts: { actions: boolean }): string {
+  const sp: Space = BOARD[space]
   const st = v.props[space]
   const owner = st && st.owner ? v.players.find((p) => p.id === st.owner) : null
   const hasPrice = 'price' in sp
   const rp = hasPrice ? rentPreview(v, space) : null
   const strip = stripColorPhone(sp)
-  let rentLine = ''
-  if (rp) {
-    if (sp.kind === 'utility') rentLine = `earns <b>${rp.note}</b>${rp.next != null ? ` → <b>${rp.next}× dice</b> with both` : ''}`
-    else if (sp.kind === 'rail') rentLine = `earns <b>$${rp.current}</b> (${rp.note})${rp.next != null ? ` → <b>$${rp.next}</b> with another railroad` : ''}`
-    else if (isStreet(sp))
-      rentLine = rp.next != null
-        ? `earns <b>$${rp.current}</b> → <b>$${rp.next}</b> with ${rp.next === sp.rents[5] ? 'a hotel' : 'a house'}${rp.note ? ` · ${rp.note}` : ''}`
-        : `earns <b>$${rp.current}</b>${rp.note ? ` · ${rp.note}` : ''}`
-    else rentLine = `earns <b>$${rp.current}</b>`
+  const row = (label: string, val: string, now: boolean): string =>
+    `<div class="dc-row${now ? ' now' : ''}"><span class="dc-l">${label}</span><span class="dc-v">${val}</span>${now ? '<span class="dc-now">● now</span>' : ''}</div>`
+
+  let badges = ''
+  if (st?.mortgaged) badges += '<span class="dc-badge">MORTGAGED</span>'
+  if (isStreet(sp) && st && st.houses === 5 && rp) badges += `<span class="dc-badge">HOTEL · rent $${rp.current}</span>`
+  // kept from the old propinfo card: the mortgage hint sits under the badge
+  const hint = st?.mortgaged ? '<div class="dc-hint">mortgaged — earns nothing while asleep</div>' : ''
+
+  // A mortgaged deed earns nothing — the ● now markers must stay dark even
+  // though rentPreview ignores the mortgage flag (council re-review, defa52b
+  // round). The doubled-rent parenthetical is not a live claim, so it keeps
+  // plain `owner`.
+  const liveOwner = owner && !st?.mortgaged
+  // ── rent ladder ──
+  let ladder = ''
+  if (isStreet(sp) && st && rp) {
+    // hotel row is skipped from the ladder — the badge above carries it
+    const tiers = [
+      { label: '1 house', val: sp.rents[1] },
+      { label: '2 houses', val: sp.rents[2] },
+      { label: '3 houses', val: sp.rents[3] },
+      { label: '4 houses', val: sp.rents[4] },
+    ]
+    let rentVal = `$${sp.rents[0]}`
+    if (owner && st.houses === 0 && rp.note === 'full set — doubled') {
+      // mirror rentPreview's semantics: the Rent row carries the doubled
+      // value in parens, marked ● now
+      rentVal = `$${sp.rents[0]} ($${sp.rents[0] * 2})`
+    }
+    const nowIdx = liveOwner && st.houses < 5 ? st.houses : -1 // 0 = the Rent row
+    ladder =
+      row('Rent', rentVal, nowIdx === 0) +
+      tiers.map((t, k) => row(t.label, `$${t.val}`, k + 1 === nowIdx)).join('')
+    ladder += row('Mortgage value', `$${sp.price / 2}`, false)
+    ladder += row('House cost', `$${sp.houseCost} each`, false)
+  } else if (sp.kind === 'rail' && rp) {
+    // ● now on the owner's railroad count, read off rentPreview's note
+    const m = /(\d+)/.exec(rp.note)
+    const count = liveOwner && m ? Number(m[1]) : -1
+    ladder = [25, 50, 100, 200].map((val, k) => row(`${k + 1} railroad${k ? 's' : ''}`, `$${val}`, k + 1 === count)).join('')
+    ladder += row('Mortgage value', `$${'price' in sp ? sp.price / 2 : 100}`, false)
+    ladder += row('No houses', '', false)
+  } else if (sp.kind === 'utility' && rp) {
+    // ● now on the live dice multiplier (rentPreview's current is 4 or 10)
+    const live = liveOwner ? rp.current : -1
+    ladder = row('With 1 utility', '4× dice', live === 4) + row('With both', '10× dice', live === 10)
+    ladder += row('Mortgage value', `$${'price' in sp ? sp.price / 2 : 75}`, false)
+    ladder += row('No houses', '', false)
   }
-  if (st?.mortgaged) rentLine = 'mortgaged — earns nothing while asleep'
-  const houses = st && st.houses > 0 ? (st.houses === 5 ? ' · hotel' : ` · ${st.houses} house${st.houses > 1 ? 's' : ''}`) : ''
+
+  const foot = hasPrice
+    ? `<div class="dc-foot">${owner ? `${avathumb(owner)}<b style="color:${owner.color}">${esc(owner.name)}</b>` : '<span class="dc-bank">Bank · unowned</span>'}<span class="dc-price">Price $${'price' in sp ? sp.price : 0}</span></div>`
+    : '<div class="dc-foot"><span class="dc-bank">Not for sale</span></div>'
+
+  let actions = ''
+  if (opts.actions && hasPrice) {
+    const btns = manageButtons(v, v.you, space)
+    if (btns.length > 0) actions = `<div class="dc-actions row">${btns.join('')}</div>`
+  }
+  return `<div class="deed-card" style="--g:${strip}">
+    <div class="dc-head${isStreet(sp) && sp.group === 'yellow' ? ' dark' : ''}">${esc(sp.name)}${badges}</div>
+    ${hint}
+    ${ladder ? `<div class="dc-ladder">${ladder}</div>` : ''}
+    ${foot}
+    ${actions}
+  </div>`
+}
+
+// A portfolio's management buttons — THE gate: they render exactly when the
+// server's allowed list plus the shared rules checks agree. renderPortfolio
+// and the deeds grid both call this, so neither can drift from the engine.
+function manageButtons(v: PlayerView, pid: string, i: number): string[] {
+  const sp: Space = BOARD[i]
+  const acts = new Set(v.allowed)
+  const btns: string[] = []
+  if (acts.has('buyHouse') && canBuildOn(v, pid, i)) btns.push(`<button class="tiny" data-act="buyHouse" data-args='{"space":${i}}'>House +$${isStreet(sp) ? sp.houseCost : ''}</button>`)
+  if (acts.has('sellHouse') && canSellHouseOn(v, pid, i)) btns.push(`<button class="tiny" data-act="sellHouse" data-args='{"space":${i}}'>Sell house +$${isStreet(sp) ? sp.houseCost / 2 : ''}</button>`)
+  if (acts.has('mortgage') && canMortgageOn(v, pid, i)) btns.push(`<button class="tiny" data-act="mortgage" data-args='{"space":${i}}'>Mortgage +$${('price' in sp ? sp.price : 0) / 2}</button>`)
+  if (acts.has('unmortgage') && canUnmortgageOn(v, pid, i)) btns.push(`<button class="tiny" data-act="unmortgage" data-args='{"space":${i}}'>Unmortgage −$${unmortgageCost('price' in sp ? sp.price : 0)}</button>`)
+  return btns
+}
+
+// ── property info card ──
+// Shared by the pocket board (tap a tile), the table's deed chips and the
+// trade strips: every path lands on the same title-deed layout, no
+// management buttons here (ruled) — just the card and a Close row.
+function showPropInfo(space: number): void {
+  const v = view
+  if (!v) return
   document.querySelector('.propinfo-overlay')?.remove()
   const overlay = document.createElement('div')
   overlay.className = 'propinfo-overlay'
   overlay.innerHTML = `
-    <div class="propinfo-card" style="--g:${strip}">
-      <div class="propinfo-title"><span class="ls-swatch"></span>${esc(sp.name)}${houses}</div>
-      ${hasPrice ? `<div class="propinfo-row">Price <b>$${sp.price}</b></div>` : '<div class="propinfo-row">Not for sale</div>'}
-      ${rp ? `<div class="propinfo-row">${rentLine}</div>` : ''}
-      <div class="propinfo-row">Owner <b style="color:${owner?.color ?? 'inherit'}">${owner ? `${avathumb(owner)}${esc(owner.name)}` : 'the bank'}</b></div>
+    <div class="propinfo-card">
+      ${deedCardHTML(v, space, { actions: false })}
       <div class="row"><button data-act="propInfoClose">Close</button></div>
     </div>`
   overlay.addEventListener('click', (ev) => {
@@ -661,6 +793,9 @@ socket.on('lobby', (l: LobbyInfo) => {
   lobby = l
   view = null
   rejoinPending = false
+  // screen transition: the game-only sheets die with the game view
+  menuOpen = false
+  deedsOpen = false
   render()
 })
 
@@ -678,6 +813,7 @@ socket.on('room:closed', (p: { code?: string }) => {
   view = null
   composer = null
   lobbySel = null
+  resetScreenStates()
   joinStage = 'name'
   if (/^[A-Z]{4}$/.test(code)) joinCode = code
   if (name) joinName = name
@@ -698,14 +834,23 @@ socket.on('kicked', () => {
   view = null
   composer = null
   lobbySel = null
+  resetScreenStates()
   render()
   toast(midGame ? 'The host removed you from the game' : 'The host removed you from the room')
 })
 
 socket.on('view', (v: PlayerView) => {
+  const enteringGame = view == null
   view = v
   lobby = null
   rejoinPending = false
+  // entering the game from the lobby/join screen: sheets start closed;
+  // view pushes DURING the game re-emit them, so they survive updates
+  if (enteringGame) {
+    menuOpen = false
+    deedsOpen = false
+    deedFilters = { owner: 'ALL', kind: 'ALL' }
+  }
 
   // fresh card draw? the chest-opening / wheel-spinning animation plays ONLY on
   // the drawer's phone; everyone else reads the info strip instead
@@ -748,6 +893,7 @@ $app.addEventListener('click', (ev) => {
 
   switch (act) {
     case 'theme':
+      menuOpen = false // theme rides the menu sheet: close it before dispatch
       theme = theme === 'light' ? 'dark' : 'light'
       localStorage.setItem('mp-theme', theme)
       document.documentElement.dataset.theme = theme
@@ -892,8 +1038,14 @@ $app.addEventListener('click', (ev) => {
       break
     }
     case 'leave': {
-      // Both exits (lobby "Leave room" and the in-game "Exit") start the
-      // same two-step confirmation — see showExitConfirm.
+      // Both exits (lobby "Leave room" and the menu's "Leave the game")
+      // start the same two-step confirmation — see showExitConfirm. From
+      // the menu the sheet must be torn down FIRST, or it lingers (dead,
+      // screen-blocking) under the confirm overlay's step-1 backdrop.
+      if (menuOpen) {
+        menuOpen = false
+        render()
+      }
       showExitConfirm(1)
       break
     }
@@ -902,9 +1054,45 @@ $app.addEventListener('click', (ev) => {
       break
     }
     case 'showBoard': {
+      menuOpen = false // showBoard re-renders through closeBoard — the sheet dies with it
       showBoard()
       break
     }
+    case 'menu': {
+      menuOpen = !menuOpen
+      render()
+      break
+    }
+    case 'closeMenu': {
+      menuOpen = false
+      render()
+      break
+    }
+    case 'openDeeds': {
+      // fresh defaults every open (table rows pass their player as owner)
+      deedFilters = { owner: args.owner ? String(args.owner) : 'ALL', kind: 'ALL' }
+      deedsOpen = true
+      menuOpen = false
+      render()
+      break
+    }
+    case 'closeDeeds': deedsOpen = false; render(); break
+    case 'deedOwner': {
+      const owner = String(args.owner)
+      deedFilters = { ...deedFilters, owner: deedFilters.owner === owner ? 'ALL' : owner }
+      render()
+      break
+    }
+    case 'deedKind': {
+      const kind = String(args.kind)
+      deedFilters = { ...deedFilters, kind: deedFilters.kind === kind ? 'ALL' : kind }
+      render()
+      break
+    }
+    case 'deedClearFilters':
+      deedFilters = { owner: 'ALL', kind: 'ALL' }
+      render()
+      break
     case 'roll': send({ type: 'roll' }); break
     case 'drawCard': send({ type: 'drawCard' }); break
     case 'goToJail': send({ type: 'goToJail' }); break
@@ -1183,7 +1371,7 @@ function renderGame(v: PlayerView): void {
   // First game view on this browser: one promo teaches that the whole 3D
   // board is in your pocket. Above the action cards, retired on first open.
   if (!localStorage.getItem(BOARD_PROMO_FLAG)) {
-    body += `<button class="big wide boardpromo" data-act="showBoard">🎲 See the whole board — pinch to zoom, drag to roam</button>`
+    body += `<button class="big wide boardpromo" data-act="showBoard">🎲 See the whole board — pinch to zoom, drag to pan</button>`
   }
 
   // What the active player drew — an info strip, NEVER a blocker: the action
@@ -1392,6 +1580,10 @@ function renderGame(v: PlayerView): void {
     body += `<button class="big wide" data-act="openTrade">Propose a trade</button>`
   }
 
+  // ── The whole title-deed book: always available, no phase gating ──
+  const ownedCount = Object.values(v.props).filter((st) => st.owner === I.id).length
+  body += `<button class="big wide" data-act="openDeeds">View properties${ownedCount ? ` · ${ownedCount} owned` : ''}</button>`
+
   // ── The table at a glance — every player's cash and deeds ──
   body += renderTable(v)
 
@@ -1403,16 +1595,16 @@ function renderGame(v: PlayerView): void {
       <span class="me">${avathumb(I)}${esc(I.name)}</span>
       <span class="money" id="moneyChip">$${I.cash}</span>
       <span class="meta">worth $${worth}${I.jailCards > 0 ? ` · jail card ×${I.jailCards}` : ''}${I.jail ? ' · in jail' : ''}</span>
-      <button class="themebtn" data-act="theme">${theme === 'light' ? 'Dark' : 'Light'}</button>
-      <button class="themebtn" data-act="showBoard">Board</button>
-      <button class="themebtn exitbtn" data-act="leave">Exit</button>
+      <button class="menubtn" data-act="menu" aria-label="Menu" aria-expanded="${menuOpen}">☰</button>
     </header>
     ${banner}
     ${landedStrip}
     ${drawStrip}
     ${deadlineChip}
     <main>${body}</main>
-    ${composer && composer.open ? renderComposer(v) : ''}`
+    ${composer && composer.open ? renderComposer(v) : ''}
+    ${menuOpen ? renderMenu() : ''}
+    ${deedsOpen ? renderDeeds(v) : ''}`
 
   // the wallet counts to its new balance, with a floating delta
   if (prevCash != null && prevCash !== I.cash) animateMoney(prevCash, I.cash)
@@ -1477,15 +1669,11 @@ function renderPortfolio(v: PlayerView, pid: string): string {
       }
       if (st.mortgaged) earn = 'mortgaged — no rent while asleep'
       // The server's allowed list is THE gate: a button renders exactly when
-      // the engine would accept it. During freezes (auction/debt) the list
-      // omits management actions, so the buttons simply don't appear — the
-      // phase banner already explains what the table is waiting on.
-      const btns: string[] = []
-      const acts = new Set(v.allowed)
-      if (acts.has('buyHouse') && canBuildOn(v, pid, i)) btns.push(`<button class="tiny" data-act="buyHouse" data-args='{"space":${i}}'>House +$${isStreet(sp) ? sp.houseCost : ''}</button>`)
-      if (acts.has('sellHouse') && canSellHouseOn(v, pid, i)) btns.push(`<button class="tiny" data-act="sellHouse" data-args='{"space":${i}}'>Sell house +$${isStreet(sp) ? sp.houseCost / 2 : ''}</button>`)
-      if (acts.has('mortgage') && canMortgageOn(v, pid, i)) btns.push(`<button class="tiny" data-act="mortgage" data-args='{"space":${i}}'>Mortgage +$${('price' in sp ? sp.price : 0) / 2}</button>`)
-      if (acts.has('unmortgage') && canUnmortgageOn(v, pid, i)) btns.push(`<button class="tiny" data-act="unmortgage" data-args='{"space":${i}}'>Unmortgage −$${unmortgageCost('price' in sp ? sp.price : 0)}</button>`)
+      // the engine would accept it (manageButtons — shared with the deeds
+      // grid, so the two can never drift). During freezes (auction/debt) the
+      // list omits management actions, so the buttons simply don't appear —
+      // the phase banner already explains what the table is waiting on.
+      const btns = manageButtons(v, pid, i)
       return `<div class="prop">
         ${strip}
         <div class="pinfo">
@@ -1500,8 +1688,8 @@ function renderPortfolio(v: PlayerView, pid: string): string {
 }
 
 // The whole table in one quiet section: every player's cash and their
-// deeds as compact colour chips. Tapping a chip opens the property card;
-// tapping a row jumps your ledger to that player's books.
+// deeds as compact colour chips. Tapping a chip opens that deed's card;
+// tapping the row opens the full title-deed screen filtered to that player.
 function abbrName(sp: Space): string {
   // fit ~8-10 chars: drop the long suffixes, then hard-truncate
   let n = sp.name
@@ -1536,13 +1724,13 @@ function renderTable(v: PlayerView): string {
           return `<button class="deedchip" style="--g:${col}" data-act="propInfo" data-args='{"space":${i}}'><span class="dstrip"></span>${esc(abbrName(sp))}</button>`
         })
         .join('')
-      return `<div class="trow" data-act="ledgerTab" data-args='{"id":"${p.id}"}'>
-        <div class="t-top"><span class="t-name" style="color:${p.color}">${avathumb(p)}${esc(p.name)}</span><span class="t-cash">$${p.cash}</span></div>
+      return `<div class="trow" data-act="openDeeds" data-args='{"owner":"${p.id}"}'>
+        <div class="t-top"><span class="t-name" style="color:${p.color}">${avathumb(p)}${esc(p.name)}</span><span class="t-cash">$${p.cash}</span><span class="t-go" aria-hidden="true">▸</span></div>
         ${chips ? `<div class="t-deeds">${chips}</div>` : ''}
       </div>`
     })
     .join('')
-  return `<div class="trades table-sec"><h3>TABLE${ownable ? ` · ${ownedTotal}/${ownable} deeds owned` : ''}</h3>${rows}</div>`
+  return `<div class="trades table-sec"><h3>TABLE${ownable ? ` · ${ownedTotal}/${ownable} deeds owned · tap a player for their deeds` : ''}</h3>${rows}</div>`
 }
 
 // The full-information money ledger: "All" merges every player's books.
@@ -1612,6 +1800,124 @@ function renderComposer(v: PlayerView): string {
           <button class="big primary" data-act="sendTrade">Send offer</button>
           <button class="big" data-act="closeTrade">Cancel</button>
         </div>
+      </div>
+    </div>`
+}
+
+// ── the hamburger sheet ──
+// The topbar's three utility buttons moved behind one ☰: the sheet reuses
+// the composer's shield (.modal backdrop closes, .sheet swallows taps with
+// an empty data-act). Rendered inside $app, so it survives view pushes.
+function renderMenu(): string {
+  return `
+    <div class="modal" data-act="closeMenu">
+      <div class="sheet menu-sheet" data-act="">
+        <button class="menu-item" data-act="showBoard">
+          <span class="mi-label">🎲 Pocket board</span>
+          <span class="mi-hint">Pinch to zoom · drag to pan (or orbit)</span>
+        </button>
+        <button class="menu-item" data-act="openDeeds">
+          <span class="mi-label">🏠 View properties</span>
+          <span class="mi-hint">Every title deed, all owners</span>
+        </button>
+        <button class="menu-item" data-act="theme">
+          <span class="mi-label">${theme === 'light' ? '🌙 Dark theme' : '☀️ Light theme'}</span>
+          <span class="mi-hint">Switch the look of this phone</span>
+        </button>
+        <div class="menu-sep"></div>
+        <button class="menu-item danger" data-act="leave">
+          <span class="mi-label">Leave the game</span>
+        </button>
+      </div>
+    </div>`
+}
+
+// ── the View-properties screen ──
+// Every title deed in the game as one grid of full cards, filtered by owner
+// and by kind (two chip rows, single-select each, AND-combined; re-tapping
+// the selected chip clears it). Unfiltered it groups by board order under
+// colour-run headings; filtered it's one flat grid. Cards show everything
+// inline — only your own deeds carry the (server-gated) action buttons.
+function renderDeeds(v: PlayerView): string {
+  const ownable = Object.keys(v.props).length
+  const ownedTotal = Object.values(v.props).filter((st) => st.owner != null).length
+  const alive = v.players.filter((p) => !p.bankrupt)
+
+  const ownerChips = [
+    `<button class="chip ${deedFilters.owner === 'ALL' ? 'sel' : ''}" data-act="deedOwner" data-args='{"owner":"ALL"}'>All</button>`,
+    ...alive.map(
+      (p) =>
+        `<button class="chip ${deedFilters.owner === p.id ? 'sel' : ''}" ${deedFilters.owner === p.id ? `style="border-color:${p.color}"` : ''} data-act="deedOwner" data-args='{"owner":"${p.id}"}'>${avathumb(p)}${esc(p.name)}</button>`,
+    ),
+    `<button class="chip ${deedFilters.owner === 'UNOWNED' ? 'sel' : ''}" data-act="deedOwner" data-args='{"owner":"UNOWNED"}'>Unowned</button>`,
+  ].join('')
+  const kindChips = [
+    ...GROUP_ORDER.map(
+      (g) =>
+        `<button class="chip ${deedFilters.kind === g ? 'sel' : ''}" style="--g:${GROUP_COLORS[g]}" data-act="deedKind" data-args='{"kind":"${g}"}'><span class="dstrip"></span>${GROUP_LABEL[g]}</button>`,
+    ),
+    `<button class="chip ${deedFilters.kind === 'rail' ? 'sel' : ''}" style="--g:#4b5563" data-act="deedKind" data-args='{"kind":"rail"}'><span class="dstrip"></span>Railroads</button>`,
+    `<button class="chip ${deedFilters.kind === 'utility' ? 'sel' : ''}" style="--g:#6b7280" data-act="deedKind" data-args='{"kind":"utility"}'><span class="dstrip"></span>Utilities</button>`,
+  ].join('')
+
+  const matches = Object.keys(v.props)
+    .map(Number)
+    .sort((a, b) => a - b) // board order — colour runs stay together
+    .filter((i) => {
+      const sp = BOARD[i]
+      const st = v.props[i]
+      const kindOk =
+        deedFilters.kind === 'ALL' || (isStreet(sp) ? sp.group === deedFilters.kind : sp.kind === deedFilters.kind)
+      const ownerOk =
+        deedFilters.owner === 'ALL' ||
+        (deedFilters.owner === 'UNOWNED' ? st.owner == null : st.owner === deedFilters.owner)
+      return kindOk && ownerOk
+    })
+
+  let grid = ''
+  if (matches.length === 0) {
+    const emptyMsg =
+      deedFilters.owner === 'UNOWNED' && deedFilters.kind === 'ALL'
+        ? 'Every property has an owner.'
+        : 'Nothing matches.'
+    grid = `<p class="hint deeds-empty">${emptyMsg}</p><div class="row"><button class="wide" data-act="deedClearFilters">Clear filters</button></div>`
+  } else if (deedFilters.owner === 'ALL' && deedFilters.kind === 'ALL') {
+    // unfiltered: group by board order with a heading per colour run
+    const buckets: Array<{ key: string; heading: string; items: number[] }> = []
+    for (const i of matches) {
+      const sp = BOARD[i]
+      const key = isStreet(sp) ? sp.group : sp.kind
+      const heading = isStreet(sp)
+        ? `${GROUP_LABEL[sp.group]} · ${groupIndices(sp.group).length}`
+        : sp.kind === 'rail'
+          ? 'Railroads'
+          : 'Utilities'
+      const last = buckets[buckets.length - 1]
+      if (last && last.key === key) last.items.push(i)
+      else buckets.push({ key, heading, items: [i] })
+    }
+    grid = buckets
+      .map(
+        (b) =>
+          `<div class="deed-h">${esc(b.heading)}</div><div class="deedgrid">${b.items
+            .map((i) => deedCardHTML(v, i, { actions: true }))
+            .join('')}</div>`,
+      )
+      .join('')
+  } else {
+    grid = `<div class="deedgrid">${matches.map((i) => deedCardHTML(v, i, { actions: true })).join('')}</div>`
+  }
+
+  return `
+    <div class="modal" data-act="closeDeeds">
+      <div class="sheet deeds-sheet" data-act="">
+        <div class="deeds-head">
+          <h3>PROPERTIES · ${ownedTotal}/${ownable}</h3>
+          <button class="deeds-x" data-act="closeDeeds" aria-label="Close">✕</button>
+        </div>
+        <div class="chips">${ownerChips}</div>
+        <div class="chips kind-chips">${kindChips}</div>
+        ${grid}
       </div>
     </div>`
 }
