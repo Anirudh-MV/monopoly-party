@@ -5,6 +5,7 @@
 // controls. Every setting lives in one menu.
 
 import { applyAction, createGame, type PlayerMeta } from '../../shared/engine.js'
+import { allowedActions } from '../../shared/rules.js'
 import { botAction, botActor } from '../../shared/bot.js'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
 import { gridPos, regionOf, cellHTML } from '../../shared/board-grid.js'
@@ -104,6 +105,92 @@ function turnQueue(s: GameState) {
   return idx < 0 ? alive : [...alive.slice(idx), ...alive.slice(0, idx)]
 }
 
+// ── phone views ──
+// One card per bot, mirroring what that player's phone would show: the
+// status banner and the exact action buttons the real controller offers
+// (same allowedActions gate the server enforces). Display-only — the bots
+// play themselves; this is for watching what each player sees.
+
+function phoneCard(s: GameState, pid: string): string {
+  const p = s.players.find((q) => q.id === pid)
+  if (!p) return ''
+  const acts = new Set(allowedActions(s, pid))
+  const cur = s.currentPlayerId === pid
+  const curName = s.players.find((q) => q.id === s.currentPlayerId)?.name ?? ''
+
+  let banner = ''
+  const btns: string[] = []
+  const chip = (on: boolean, label: string): string => (on ? `<span class="pbtn on">${label}</span>` : `<span class="pbtn">${label}</span>`)
+
+  if (s.phase === 'GAME_OVER') {
+    banner = s.winner === pid ? '🏆 You win!' : p.bankrupt ? '💀 Bankrupt — spectating' : 'Game over'
+  } else if (p.bankrupt) {
+    banner = '💀 Bankrupt — spectating'
+  } else if (s.debt && s.debt.debtor === pid) {
+    const cred = s.debt.creditor ? s.players.find((q) => q.id === s.debt?.creditor)?.name : 'the bank'
+    banner = `You owe $${s.debt.amount} to ${esc(cred ?? 'the bank')}${s.debt.memo?.startsWith('Rent: ') ? ` — rent for ${esc(s.debt.memo.slice(6))}` : ''}`
+    btns.push(chip(acts.has('payDebt'), `Pay $${s.debt.amount}`))
+    btns.push(chip(acts.has('bankrupt'), 'Bankrupt'))
+  } else if (s.debt) {
+    const debtor = s.players.find((q) => q.id === s.debt?.debtor)
+    banner = `${esc(debtor?.name ?? '')} is raising funds to pay a debt…`
+  } else if (s.phase === 'AUCTION' && s.auction) {
+    const highBidder = s.auction.bidder ? s.players.find((q) => q.id === s.auction?.bidder)?.name : null
+    banner = `Auction: ${esc(BOARD[s.auction.space].name)} — $${s.auction.bid}${highBidder ? ` (${esc(highBidder)})` : ' — no bids yet'}`
+    if (acts.has('bid')) btns.push(chip(true, `Bid $${s.auction.bid + 1}`))
+    if (acts.has('passBid')) btns.push(chip(true, 'Pass'))
+  } else if (s.pendingJail && s.pendingJail.player === pid) {
+    banner = `You're under arrest — ${s.pendingJail.reason === 'space' ? 'you landed on Go To Jail' : s.pendingJail.reason === 'card' ? 'the card says so' : 'three doubles!'}`
+    if (acts.has('goToJail')) btns.push(chip(true, 'Go to jail'))
+  } else if (s.pendingCardDraw && s.pendingCardDraw.player === pid) {
+    const chest = s.pendingCardDraw.deck === 'chest'
+    banner = chest ? 'You landed on Community Chest' : 'You landed on Chance'
+    if (acts.has('drawCard')) btns.push(chip(true, chest ? 'Open the chest' : 'Spin the wheel'))
+  } else if (s.pendingPurchase != null && cur) {
+    const sp = BOARD[s.pendingPurchase]
+    const price = 'price' in sp ? sp.price : 0
+    banner = `You landed on ${esc(sp.name)}${price ? ` — $${price}` : ''}`
+    if (acts.has('buy')) btns.push(chip(true, `Buy $${price}`))
+    if (acts.has('declineBuy')) btns.push(chip(true, 'Decline'))
+  } else if (s.pendingTax && cur) {
+    banner = 'Income tax — flat or 10%?'
+    if (acts.has('payTax')) {
+      btns.push(chip(true, '$200 flat'))
+      btns.push(chip(true, '10% of worth'))
+    }
+  } else if (s.phase === 'ROLL' && cur) {
+    banner = `Your turn${p.jail ? ` — in jail, attempt ${p.jailRolls}/3` : ''}`
+    if (acts.has('roll')) btns.push(chip(true, 'Roll the dice'))
+    if (acts.has('payJail')) btns.push(chip(true, 'Pay $50 fine'))
+    if (acts.has('useJailCard')) btns.push(chip(true, 'Use jail card'))
+  } else if (s.phase === 'ACTION' && cur) {
+    banner = 'You rolled — build or trade before ending'
+    if (acts.has('endTurn')) btns.push(chip(true, 'End turn'))
+  } else {
+    banner = `${esc(curName)}'s turn — you can build, mortgage, and trade`
+  }
+
+  const incoming = s.trades.filter((t) => t.to === pid).length
+  if (incoming > 0 && !p.bankrupt && s.phase !== 'GAME_OVER') {
+    btns.push(chip(acts.has('respondTrade'), `${incoming} offer${incoming > 1 ? 's' : ''} waiting`))
+  }
+
+  const status =
+    p.bankrupt ? 'dead' : s.phase === 'GAME_OVER' ? 'over' : cur ? 'active' : 'idle'
+  return `
+    <div class="phone st-${status}" style="--c:${p.color}">
+      <div class="ph-top"><span class="ph-tok">${p.token}</span><span class="ph-name">${esc(p.name)}</span><span class="ph-cash">$${p.cash}</span></div>
+      ${p.jail && !p.bankrupt && s.phase !== 'GAME_OVER' ? '<div class="ph-note">🚔 in jail</div>' : ''}
+      <div class="ph-banner">${banner}</div>
+      ${btns.length > 0 ? `<div class="ph-btns">${btns.join('')}</div>` : ''}
+    </div>`
+}
+
+function renderPhones(s: GameState): void {
+  const el = document.getElementById('phones')
+  if (el) el.innerHTML = s.players.map((p) => phoneCard(s, p.id)).join('')
+}
+
 function render(): void {
   const s = state
   if (!s) return
@@ -183,6 +270,9 @@ function render(): void {
       ${s.debt ? `<div class="banner debt">⚠ ${esc(s.players.find((p) => p.id === s.debt?.debtor)?.name ?? '')} owes $${s.debt.amount}</div>` : ''}`
   }
 
+  // phone views — every player's controller, side by side
+  renderPhones(s)
+
   // top bar
   document.getElementById('stats')!.textContent =
     `${running ? '▶ running' : '⏸ paused'} · ${tickMs}ms/tick · turn ${s.turn} · ${steps} actions · ${s.phase.toLowerCase()}`
@@ -203,6 +293,7 @@ function renderShell(): void {
       <div class="boardwrap" id="boardhost"></div>
       <div class="overlay queue" id="queue"></div>
       <div class="overlay ticker" id="ticker"></div>
+      <div class="phones" id="phones"></div>
       <div class="simtop">
         <span class="stat" id="stats"></span>
         <button id="pauseBtn" title="pause/resume">⏸</button>
