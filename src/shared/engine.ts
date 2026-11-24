@@ -134,7 +134,10 @@ export function createGame(players: PlayerMeta[], rng: () => number = Math.rando
 // debtor's phone can show a Pay button that names the exact amount. When a
 // debt is already active, the new one queues behind it and activates through
 // resumeAfterDebt — the warning log belongs to that activation moment, never
-// to the queueing one.
+// to the queueing one. One historical exception to the principle: the 10%
+// bankruptcy-transfer interest below (established one-estate ruling) lands
+// with the seized estate — it is part of settling a losing seat, not a
+// payment a wallet is being asked for.
 function charge(s: GameState, payer: PlayerState, amount: number, creditor: string | null, memo: string): void {
   if (amount <= 0) return
   const d: DebtState = { debtor: payer.id, amount, creditor, memo }
@@ -308,7 +311,7 @@ function land(s: GameState, p: PlayerState, opts: { railMult?: number; utilMult?
         s.pendingTax = { player: p.id, space: i }
         log(s, `${p.name} landed on Income Tax — flat $${sp.flat} or 10% of worth?`)
       } else {
-        log(s, `${p.name} pays $${sp.flat} Luxury Tax`, 'money')
+        log(s, `${p.name} owes $${sp.flat} Luxury Tax`, 'money')
         charge(s, p, sp.flat, null, 'Luxury tax')
       }
       break
@@ -446,7 +449,7 @@ function applyCard(s: GameState, p: PlayerState, card: Card, rng: () => number):
       break
     }
     case 'pay': {
-      log(s, `${p.name} pays $${e.amount}`, 'money')
+      log(s, `${p.name} owes $${e.amount}`, 'money')
       charge(s, p, e.amount, null, `Card: ${card.text}`)
       break
     }
@@ -482,7 +485,7 @@ function applyCard(s: GameState, p: PlayerState, card: Card, rng: () => number):
         const h = s.props[i].houses
         total += h === 5 ? e.perHotel : h * e.perHouse
       }
-      log(s, `${p.name} pays $${total} for repairs`, 'money')
+      log(s, `${p.name} owes $${total} for repairs`, 'money')
       charge(s, p, total, null, `Card: ${card.text}`)
       break
     }

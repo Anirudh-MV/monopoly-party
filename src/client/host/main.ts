@@ -330,10 +330,17 @@ function announceView(v: HostView): void {
 
   // a debt just went active — rent, taxes, card fees, the jail fine. Same
   // dedup as before (debtor, amount or memo changed), minus the Rent-only
-  // filter: every prompt is spoken now, not just rents.
+  // filter: every prompt is spoken now, not just rents. The creditor is part
+  // of the key: a pay-each-player relay has the same debtor/amount/memo per
+  // row and names a DIFFERENT player each time — each row is its own newly
+  // active debt and must be announced (council audit, defa52b round).
   if (
     v.debt &&
-    (!prev.debt || prev.debt.debtor !== v.debt.debtor || prev.debt.amount !== v.debt.amount || prev.debt.memo !== v.debt.memo)
+    (!prev.debt ||
+      prev.debt.debtor !== v.debt.debtor ||
+      prev.debt.amount !== v.debt.amount ||
+      prev.debt.memo !== v.debt.memo ||
+      prev.debt.creditor !== v.debt.creditor)
   ) {
     const rent = v.debt.memo?.startsWith('Rent: ') ? `, ${debtBlurb(v.debt)}` : ''
     announce(`${nameOf(v.debt.debtor)} owes ${v.debt.amount} dollars to ${v.debt.creditor ? nameOf(v.debt.creditor) : 'the bank'}${rent}`)
