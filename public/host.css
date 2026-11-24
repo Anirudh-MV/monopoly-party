@@ -542,3 +542,20 @@ button:hover { filter: brightness(1.06); }
   background: var(--panel2); border: 1px solid var(--line); border-radius: 0.8vh;
   padding: 0.8vh 1.1vh; min-height: 4.6vh;
 }
+
+/* ── update prompt (fixed pill, undismissable until refresh) ── */
+.mp-updater {
+  position: fixed; bottom: 9vh; left: 50%; transform: translateX(-50%);
+  z-index: 8;
+  background: var(--panel); border: 2px solid var(--money-bright);
+  border-radius: 1.4vh; padding: 1.2vh 1.6vh;
+  display: flex; align-items: center; gap: 1.2vh; flex-wrap: wrap;
+  box-shadow: var(--shadow); max-width: 60vw;
+}
+.mp-updater b { font-size: 2.6vh; color: var(--money-bright); }
+.mp-updater span { font-size: 2.2vh; color: var(--ink); }
+.mp-updater button {
+  min-height: 4.6vh; font-size: 2.4vh; font-weight: 700;
+  background: var(--money-bright); color: #1c2333; border: none;
+  border-radius: 1vh; padding: 0 1.4vh; cursor: pointer;
+}

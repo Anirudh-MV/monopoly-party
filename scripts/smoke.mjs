@@ -533,6 +533,14 @@ try {
   const hres = await emitAck(host2, 'room:hostJoin', { code, hostToken: created.hostToken })
   assert(hres.ok, 'TV reconnected with its token')
 
+  // ── update detection: the build-id pipeline serves a stable non-empty id ──
+  {
+    const v1 = await fetch(`http://localhost:${PORT}/version`).then((r) => r.json()).catch(() => null)
+    const v2 = await fetch(`http://localhost:${PORT}/version`).then((r) => r.json()).catch(() => null)
+    assert(v1 && typeof v1.id === 'string' && v1.id.length > 0, 'GET /version serves a non-empty id')
+    assert(v2 && v2.id === v1.id, 'the id is stable across requests')
+  }
+
   // ── automatic win detection: a two-player walk-off ends the game ──
   // A fresh room, no host intervention: one player leaves mid-game and the
   // game must detect the win on its own.

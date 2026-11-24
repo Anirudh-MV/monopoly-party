@@ -9,6 +9,8 @@
 import express, { type ErrorRequestHandler } from 'express'
 import { timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingHttpHeaders } from 'node:http'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { networkInterfaces } from 'node:os'
 import path from 'node:path'
 import { Server } from 'socket.io'
@@ -120,6 +122,24 @@ const pub = path.resolve('public')
 app.get(['/host.js', '/controller.js', '/sim.js'], (_q, res, next) => {
   res.set('Cache-Control', 'no-store')
   next()
+})
+// Build id, minted at build time (scripts/build-clients.mjs writes both the
+// esbuild define into the client bundles and this file). Read per request —
+// a few tiny FS reads a minute are free, and a files-swapped-without-restart
+// deploy still flips instantly. Gated like every other route; clients
+// compare their baked id against this and prompt to refresh on inequality.
+const BUILD_ID_FILE = fileURLToPath(new URL('../../dist/build-id.json', import.meta.url))
+function currentBuildId(): string {
+  try {
+    const raw = JSON.parse(readFileSync(BUILD_ID_FILE, 'utf8')) as { id?: unknown }
+    return typeof raw.id === 'string' ? raw.id : ''
+  } catch {
+    return ''
+  }
+}
+app.get('/version', (_q, res) => {
+  res.set('Cache-Control', 'no-store')
+  res.json({ id: currentBuildId() })
 })
 app.use(express.static(pub))
 app.get('/', (_q, res) => res.sendFile(path.join(pub, 'host.html')))

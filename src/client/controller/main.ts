@@ -11,6 +11,7 @@ import { TOKENS, stripEmoji } from '../../shared/tokens.js'
 import { COLORS } from '../../shared/colors.js'
 import { AvatarPreview, avatarThumbnail } from '../tokens3d.js'
 import { Board3D } from '../host/board3d.js'
+import { startUpdater } from '../version-check.js'
 import {
   canBuildOn,
   canMortgageOn,
@@ -575,6 +576,14 @@ let rejoinPending = myToken != null
 // screen lock, server restart). The stored token reattaches the seat —
 // wallet, deeds and jail cards intact. This is the seamless-rejoin path.
 const socket = io()
+// update detection: pockets hold stale tabs for hours — prompt when the
+// server moves on (reload is safe: the rejoin token restores the seat)
+startUpdater({
+  socket,
+  title: 'Update ready',
+  note: 'Tap Refresh — you keep your seat and your cash.',
+  button: 'Refresh',
+})
 socket.on('connect', () => {
   if (!myToken) return
   rejoinPending = true

@@ -94,6 +94,17 @@ try {
     const withKey = await fetch(`${URL}/?key=${PARTY_KEY}`).catch(() => null)
     assert(withKey && withKey.status === 200, 'express gate 200 with key')
     assert(alive(), 'server alive after gate pokes')
+
+    // GET /version: gated like everything else, ignores garbage input,
+    // serves the build id behind the party key
+    const vNoKey = await fetch(`${URL}/version`).catch(() => null)
+    assert(vNoKey && vNoKey.status === 401, `version route is gated (${vNoKey && vNoKey.status})`)
+    const vOk = await fetch(`${URL}/version?key=${PARTY_KEY}`).catch(() => null)
+    const vBody = vOk ? await vOk.json().catch(() => null) : null
+    assert(vOk && vOk.status === 200 && vBody && typeof vBody.id === 'string', 'version route serves {id} with the key')
+    const vJunk = await fetch(`${URL}/version?key=${PARTY_KEY}&junk=${'x'.repeat(5000)}`).catch(() => null)
+    assert(vJunk && vJunk.status === 200, 'version route ignores garbage query input')
+    assert(alive(), 'server alive after version pokes')
   }
 
   // ── stage a normal game so payloads have something to bite ──

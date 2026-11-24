@@ -12,6 +12,7 @@ import { rentFor, rentPreview } from '../../shared/rules.js'
 import type { ColorGroup, HostView, LobbyInfo, PlayerState, Space } from '../../shared/types.js'
 import { Board3D } from './board3d.js'
 import { announce, bruh, doublesStreak, heeHee, setVoiceEnabled, unlockAudio, voiceEnabled } from './voice.js'
+import { startUpdater } from '../version-check.js'
 
 interface HostAck {
   ok: boolean
@@ -88,6 +89,14 @@ function sendGod(payload: Record<string, unknown>, onResult?: (res: Record<strin
 }
 
 const socket = io()
+// update detection: the TV runs for hours — prompt when the server moves
+// on to a newer build (reload is safe: the host token reclaims the seat)
+startUpdater({
+  socket,
+  title: 'Update ready',
+  note: 'A new version is live. Refresh — your room and game are safe.',
+  button: 'Refresh now',
+})
 let view: HostView | null = null
 let lobby: LobbyInfo | null = null
 let urls: string[] = []

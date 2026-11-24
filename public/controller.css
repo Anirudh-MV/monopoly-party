@@ -466,3 +466,20 @@ button.boardpromo {
   animation: rise 0.2s ease-out;
 }
 @keyframes rise { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
+/* ── update prompt (fixed pill, undismissable until refresh) ── */
+.mp-updater {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  z-index: 45; /* toasts stay king at 50 */
+  background: var(--panel); border: 2px solid var(--money-bright);
+  border-radius: 14px; padding: 12px 16px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  box-shadow: var(--shadow); max-width: 90vw;
+}
+.mp-updater b { font-size: 16px; color: var(--money-bright); }
+.mp-updater span { font-size: 14px; color: var(--ink, #1c2333); }
+.mp-updater button {
+  min-height: 40px; font-size: 15px; font-weight: 700;
+  background: var(--money-bright); color: #1c2333; border: none;
+  border-radius: 10px; padding: 0 16px; cursor: pointer;
+}
