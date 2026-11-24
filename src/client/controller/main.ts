@@ -105,6 +105,14 @@ function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string)
 }
 
+// the player's 3D avatar in their chosen colour — replaces the emoji
+// beside every name in the game (thumbnails are cached per model+colour)
+function avathumb(p?: { token: string; color: string } | null): string {
+  if (!p) return ''
+  if (!TOKENS.includes(p.token)) return `${esc(p.token)} `
+  return `<img class="avathumb" src="${avatarThumbnail(TOKENS.indexOf(p.token), p.color)}" alt="${esc(p.token)}" draggable="false" /> `
+}
+
 function toast(msg: string): void {
   const t = document.createElement('div')
   t.className = 'toast'
@@ -332,7 +340,7 @@ function showRollOverlay(v: PlayerView): void {
   overlay.className = 'roll-overlay'
   overlay.innerHTML = `
     <div class="roll-box">
-      <div class="roll-who">${mine ? 'You roll!' : `${roller?.token ?? ''} ${esc(roller?.name ?? 'Someone')} rolls`}</div>
+      <div class="roll-who">${mine ? 'You roll!' : `${avathumb(roller)}${esc(roller?.name ?? 'Someone')} rolls`}</div>
       <div class="dice-row">
         <div class="die tumbling"></div>
         <div class="die tumbling"></div>
@@ -487,7 +495,7 @@ function showPropInfo(space: number): void {
       <div class="propinfo-title"><span class="ls-swatch"></span>${esc(sp.name)}${houses}</div>
       ${hasPrice ? `<div class="propinfo-row">Price <b>$${sp.price}</b></div>` : '<div class="propinfo-row">Not for sale</div>'}
       ${rp ? `<div class="propinfo-row">${rentLine}</div>` : ''}
-      <div class="propinfo-row">Owner <b style="color:${owner?.color ?? 'inherit'}">${owner ? `${owner.token} ${esc(owner.name)}` : 'the bank'}</b></div>
+      <div class="propinfo-row">Owner <b style="color:${owner?.color ?? 'inherit'}">${owner ? `${avathumb(owner)}${esc(owner.name)}` : 'the bank'}</b></div>
       <div class="row"><button data-act="propInfoClose">Close</button></div>
     </div>`
   overlay.addEventListener('click', (ev) => {
@@ -533,6 +541,49 @@ function maybeDing(v: PlayerView): void {
   dingArmed = true
 }
 
+// ── lobby reset: two-step confirmation ──
+// Dissolving the room is worse than leaving it — every seat goes. Two
+// steps, different wording each, per the council ruling.
+function showResetConfirm(step: 1 | 2): void {
+  document.querySelector('.confirm-overlay')?.remove()
+  const overlay = document.createElement('div')
+  overlay.className = 'confirm-overlay'
+  overlay.dataset.step = String(step)
+  overlay.innerHTML = `
+    <div class="confirm-box">
+      <div class="confirm-title">${step === 1 ? 'Start a fresh room?' : 'Really start over?'}</div>
+      <p class="confirm-body">${
+        step === 1
+          ? 'The current room closes and everyone gets the new room code. Seated players rejoin from their phones.'
+          : 'Final confirmation — the room code changes now.'
+      }</p>
+      <div class="row">
+        <button data-act="resetCancel">${step === 1 ? 'Keep this room' : 'Stay'}</button>
+        <button class="danger" data-act="resetContinue">${step === 1 ? 'Continue' : 'Yes, new room'}</button>
+      </div>
+      <p class="hint confirm-step">Confirmation ${step} of 2</p>
+    </div>`
+  overlay.addEventListener('click', (ev) => {
+    const btn = (ev.target as HTMLElement).closest('[data-act]') as HTMLElement | null
+    if (!btn) {
+      if (ev.target === overlay) overlay.remove()
+      return
+    }
+    if (btn.dataset.act === 'resetCancel') overlay.remove()
+    else if (btn.dataset.act === 'resetContinue') {
+      if (overlay.dataset.step === '1') showResetConfirm(2)
+      else {
+        overlay.remove()
+        if (!socket.connected) return toast('Reconnecting — hang on a sec')
+        socket.emit('room:reset', (res: { ok: boolean; error?: string }) => {
+          if (!res.ok) toast(res.error ?? 'Could not start a new room')
+        })
+      }
+    }
+  })
+  document.body.appendChild(overlay)
+}
+
 // ── the GO salary moment ──
 // Crossing GO credits instantly server-side; the phone still makes a moment
 // of it — a Collect $200 prompt stands between the roll and the end-turn
@@ -566,7 +617,10 @@ function showGoPrompt(): void {
 
 // ── Connection lifecycle ──
 
-const preCode = (new URLSearchParams(location.search).get('code') ?? '').toUpperCase()
+const preCode = (new URLSearchParams(location.search).get('code') ?? '')
+  .toUpperCase()
+  .replace(/[^A-Z]/g, '')
+  .slice(0, 4)
 
 // True while a stored rejoin token is being checked — show a connecting card
 // instead of flashing the join form at a returning player.
@@ -607,6 +661,27 @@ socket.on('lobby', (l: LobbyInfo) => {
   view = null
   rejoinPending = false
   render()
+})
+
+// The party host dissolved the room and minted a fresh one — land on the
+// join screen with the new code (and your name) prefilled; no auto-rejoin,
+// the seat assignment is yours to remake.
+socket.on('room:closed', (p: { code?: string }) => {
+  const code = p.code ?? ''
+  const name = myName
+  localStorage.removeItem('mp-token')
+  localStorage.removeItem('mp-playerid')
+  myToken = null
+  myPlayerId = null
+  lobby = null
+  view = null
+  composer = null
+  lobbySel = null
+  joinStage = 'name'
+  if (/^[A-Z]{4}$/.test(code)) joinCode = code
+  if (name) joinName = name
+  render()
+  toast('This room was closed — join the new room')
 })
 
 // The host removed this seat — back to the join screen, politely. Mid-game
@@ -776,12 +851,16 @@ $app.addEventListener('click', (ev) => {
       })
       break
     }
+    case 'resetRoom': {
+      showResetConfirm(1)
+      break
+    }
     case 'kickPlayer': {
       const target = lobby?.players.find((p) => p.id === String(args.id))
       if (!lobby || !target) return
       showActionConfirm(
         'Kick this player?',
-        `Remove <b>${target.token} ${esc(target.name)}</b> from the room — they can rejoin with the room code until the game starts.`,
+        `Remove <b>${avathumb(target)}${esc(target.name)}</b> from the room - they can rejoin with the room code until the game starts.`,
         'Kick',
         () => {
           if (!ensureConnected()) return
@@ -1028,7 +1107,7 @@ function renderLobby(l: LobbyInfo): void {
       const kick = isHost && p.id !== myPlayerId ? `<button class="tiny kickbtn" data-act="kickPlayer" data-args='{"id":"${p.id}"}' title="Kick from the room">✕</button>` : ''
       // your own row: the only seat whose name you can edit
       const pen = p.id === myPlayerId ? `<button class="tiny renamebtn" data-act="editName" title="Change your name">✎</button>` : ''
-      return `<li${p.id === l.hostId ? ' class="crowned"' : ''}><span class="dot" style="background:${p.color}"></span>${p.token} ${esc(p.name)}${p.id === l.hostId ? ' <span class="crown">Host</span>' : ''}${p.connected ? '' : '<em class="off"> (offline)</em>'}${pen}${kick}</li>`
+      return `<li${p.id === l.hostId ? ' class="crowned"' : ''}><span class="dot" style="background:${p.color}"></span>${avathumb(p)}${esc(p.name)}${p.id === l.hostId ? ' <span class="crown">Host</span>' : ''}${p.connected ? '' : '<em class="off"> (offline)</em>'}${pen}${kick}</li>`
     })
     .join('')
   const others = l.players.filter((p) => p.id !== myPlayerId)
@@ -1064,6 +1143,7 @@ function renderLobby(l: LobbyInfo): void {
         ${others.length > 0 ? `
           <label>Hand over host duties</label>
           <div class="chips">${others.map((p) => `<button class="chip" data-act="handOver" data-args='{"to":"${p.id}"}'>Host: ${esc(p.name)}</button>`).join('')}</div>` : ''}
+        <div class="row"><button class="tiny danger" data-act="resetRoom">New room code</button></div>
       ` : '<p class="hint">Waiting for the host to start the game…<br/>Keep this tab open.</p>'}
       <div class="row"><button class="tiny" data-act="leave">Leave room</button></div>
     </div>`
@@ -1073,6 +1153,13 @@ function renderLobby(l: LobbyInfo): void {
     avatarPreview = new AvatarPreview(stage)
     avatarPreview.show(TOKENS.indexOf(myPiece), myColor)
   }
+  // pre-warm the exact (model, colour) thumbnails the first game frame
+  // will need, while the player is still reading the lobby
+  setTimeout(() => {
+    for (const p of l.players) {
+      if (TOKENS.includes(p.token)) avatarThumbnail(TOKENS.indexOf(p.token), p.color)
+    }
+  }, 0)
 }
 
 function renderGame(v: PlayerView): void {
@@ -1114,7 +1201,7 @@ function renderGame(v: PlayerView): void {
     const sp = BOARD[i]
     const col = stripColorPhone(sp)
     const drawer = v.players.find((p) => p.id === v.currentPlayerId)
-    const who = I.id === v.currentPlayerId ? 'You' : `${drawer?.token ?? ''} ${esc(drawer?.name ?? '')}`
+    const who = I.id === v.currentPlayerId ? 'You' : `${avathumb(drawer)}${esc(drawer?.name ?? '')}`
     // rent line: what landing here is worth right now (or would be)
     let rentLine = ''
     if ('price' in sp) {
@@ -1125,10 +1212,10 @@ function renderGame(v: PlayerView): void {
         // "Yours"; everyone else sees who's earning.
         rentLine = owner.id === I.id
           ? `<span class="ls-rent">Yours — earns <b>$${rp.current}</b>${sp.kind === 'utility' ? ` (${rp.note})` : ''}</span>`
-          : `<span class="ls-rent">${owner.token} ${esc(owner.name)} — earns <b>$${rp.current}</b>${sp.kind === 'utility' ? ` (${rp.note})` : ''}</span>`
+          : `<span class="ls-rent">${avathumb(owner)}${esc(owner.name)} - earns <b>$${rp.current}</b>${sp.kind === 'utility' ? ` (${rp.note})` : ''}</span>`
       } else if (owner) {
         // someone else's property — if it's MINE, the rent is mine to collect
-        const who = owner.id === I.id ? '<b>yours to collect</b>' : `${owner.token} ${esc(owner.name)}`
+        const who = owner.id === I.id ? '<b>yours to collect</b>' : `${avathumb(owner)}${esc(owner.name)}`
         const diceSum = v.dice ? v.dice[0] + v.dice[1] : 7
         rentLine = `<span class="ls-rent">Rent due: <b>$${rentFor(v, i, diceSum)}</b> — ${who}</span>`
       } else {
@@ -1159,7 +1246,7 @@ function renderGame(v: PlayerView): void {
     const creditor = v.debt.creditor ? v.players.find((p) => p.id === v.debt?.creditor) : null
     const canPay = acts.has('payDebt')
     const rentForSpace = v.debt.memo?.startsWith('Rent: ') ? v.debt.memo.slice(6) : null
-    banner = `<div class="banner debt">You owe <b>$${v.debt.amount}</b> to ${creditor ? `${creditor.token} ${esc(creditor.name)}` : 'the bank'}${rentForSpace ? ` — rent for <b>${esc(rentForSpace)}</b>` : ''}</div>`
+    banner = `<div class="banner debt">You owe <b>$${v.debt.amount}</b> to ${creditor ? `${avathumb(creditor)}${esc(creditor.name)}` : 'the bank'}${rentForSpace ? ` - rent for <b>${esc(rentForSpace)}</b>` : ''}</div>`
     if (canPay) {
       // rent they can afford: a deliberate, felt-in-the-hand payment
       body += `
@@ -1228,7 +1315,7 @@ function renderGame(v: PlayerView): void {
     </div>`
   } else if (v.pendingJail) {
     const arrested = v.players.find((p) => p.id === v.pendingJail?.player)
-    banner = `<div class="banner info">${arrested?.token ?? ''} ${esc(arrested?.name ?? '')} is under arrest — waiting for them to go to jail…</div>`
+    banner = `<div class="banner info">${avathumb(arrested)}${esc(arrested?.name ?? '')} is under arrest — waiting for them to go to jail…</div>`
   } else if (v.phase === 'ROLL' && I.id === v.currentPlayerId) {
     banner = `<div class="banner good">Your turn${I.jail ? ` — you're in jail (${I.jailReason ?? 'sentenced earlier'})` : ''}</div>`
     body += `<div class="card actions">
@@ -1270,7 +1357,7 @@ function renderGame(v: PlayerView): void {
       body += `<div class="card actions"><button class="big primary" data-act="endTurn">End turn</button></div>`
     }
   } else {
-    banner = `<div class="banner info">${cur ? `${cur.token} <b>${esc(cur.name)}</b>'s turn` : 'Waiting…'}</div>`
+    banner = `<div class="banner info">${cur ? `${avathumb(cur)}<b>${esc(cur.name)}</b>'s turn` : 'Waiting…'}</div>`
     body += `<div class="card"><p class="hint">You can still build, mortgage, and trade.</p></div>`
   }
 
@@ -1300,7 +1387,7 @@ function renderGame(v: PlayerView): void {
 
   $app.innerHTML = `
     <header class="topbar" style="--c:${I.color}">
-      <span class="me">${I.token} ${esc(I.name)}</span>
+      <span class="me">${avathumb(I)}${esc(I.name)}</span>
       <span class="money" id="moneyChip">$${I.cash}</span>
       <span class="meta">worth $${worth}${I.jailCards > 0 ? ` · jail card ×${I.jailCards}` : ''}${I.jail ? ' · in jail' : ''}</span>
       <button class="themebtn" data-act="theme">${theme === 'light' ? 'Dark' : 'Light'}</button>
@@ -1339,7 +1426,7 @@ function tradeCard(v: PlayerView, t: TradeOffer, dir: 'incoming' | 'outgoing'): 
   // always live — the engine takes it in any phase.
   const frozen = v.phase === 'AUCTION' || v.phase === 'DEBT'
   return `<div class="card trade">
-    <div><b>${from?.token} ${esc(from?.name ?? '')}</b> offers <b>${sideSummary(t.give)}</b><br/>in exchange for <b>${sideSummary(t.receive)}</b> <span class="hint">(${esc(to?.name ?? '')})</span></div>
+    <div><b>${avathumb(from)}${esc(from?.name ?? '')}</b> offers <b>${sideSummary(t.give)}</b><br/>in exchange for <b>${sideSummary(t.receive)}</b> <span class="hint">(${esc(to?.name ?? '')})</span></div>
     ${dir === 'incoming'
       ? `<div class="row"><button class="good" data-act="acceptTrade" data-args='{"id":"${t.id}"}'${frozen ? ' disabled' : ''}>Accept</button><button class="danger" data-act="declineTrade" data-args='{"id":"${t.id}"}'>Decline</button></div>${frozen ? '<p class="hint">Trades pause until this settles</p>' : ''}`
       : `<div class="row"><button data-act="cancelTrade" data-args='{"id":"${t.id}"}'>Withdraw offer</button></div>`}
@@ -1423,7 +1510,7 @@ function renderTable(v: PlayerView): string {
     .map((p) => {
       if (p.bankrupt) {
         return `<div class="trow dead">
-          <div class="t-top"><span class="t-name" style="color:${p.color}">${p.token} 💀 ${esc(p.name)}</span><span class="t-cash">$${p.cash}</span></div>
+          <div class="t-top"><span class="t-name" style="color:${p.color}">${avathumb(p)}💀 ${esc(p.name)}</span><span class="t-cash">$${p.cash}</span></div>
         </div>`
       }
       const chips = Object.entries(v.props)
@@ -1437,7 +1524,7 @@ function renderTable(v: PlayerView): string {
         })
         .join('')
       return `<div class="trow" data-act="ledgerTab" data-args='{"id":"${p.id}"}'>
-        <div class="t-top"><span class="t-name" style="color:${p.color}">${p.token} ${esc(p.name)}</span><span class="t-cash">$${p.cash}</span></div>
+        <div class="t-top"><span class="t-name" style="color:${p.color}">${avathumb(p)}${esc(p.name)}</span><span class="t-cash">$${p.cash}</span></div>
         ${chips ? `<div class="t-deeds">${chips}</div>` : ''}
       </div>`
     })
@@ -1456,7 +1543,7 @@ function renderLedger(v: PlayerView, meId: string): string {
     `<button class="chip ${all ? 'sel' : ''}" data-act="ledgerTab" data-args='{"id":"${ALL}"}'>All</button>`,
     ...v.players.map(
       (p) =>
-        `<button class="chip ${p.id === sel ? 'sel' : ''}" style="${p.id === sel ? `border-color:${p.color}` : ''}" data-act="ledgerTab" data-args='{"id":"${p.id}"}' ${p.bankrupt ? 'disabled' : ''}>${p.token} ${esc(p.name)}</button>`,
+        `<button class="chip ${p.id === sel ? 'sel' : ''}" style="${p.id === sel ? `border-color:${p.color}` : ''}" data-act="ledgerTab" data-args='{"id":"${p.id}"}' ${p.bankrupt ? 'disabled' : ''}>${avathumb(p)}${esc(p.name)}</button>`,
     ),
   ].join('')
   const rows = entries.length
@@ -1464,7 +1551,7 @@ function renderLedger(v: PlayerView, meId: string): string {
         .map((e) => {
           const who = v.players.find((p) => p.id === e.playerId)
           const bal = e.balance != null ? `<span class="bal">$${e.balance}</span>` : ''
-          return `<li><span class="who" style="color:${who?.color ?? 'inherit'}">${who?.token ?? ''}</span><span class="amt ${e.delta > 0 ? 'plus' : 'minus'}">${e.delta > 0 ? '+' : '−'}$${Math.abs(e.delta)}</span>${bal}<span class="memo">${esc(e.memo)}</span><span class="lturn">turn ${e.turn}</span></li>`
+          return `<li><span class="who" style="color:${who?.color ?? 'inherit'}">${avathumb(who)}</span><span class="amt ${e.delta > 0 ? 'plus' : 'minus'}">${e.delta > 0 ? '+' : '-'}$${Math.abs(e.delta)}</span>${bal}<span class="memo">${esc(e.memo)}</span><span class="lturn">turn ${e.turn}</span></li>`
         })
         .join('')
     : '<li><span class="memo hint">No transactions yet.</span></li>'
@@ -1494,7 +1581,7 @@ function renderComposer(v: PlayerView): string {
         <h3>Propose a trade</h3>
         <label>Trade with</label>
         <div class="row">
-          ${partners.map((p) => `<button class="chip ${C.partner === p.id ? 'sel' : ''}" data-act="composerPartner" data-args='{"partner":"${p.id}"}'>${p.token} ${esc(p.name)}</button>`).join('')}
+          ${partners.map((p) => `<button class="chip ${C.partner === p.id ? 'sel' : ''}" data-act="composerPartner" data-args='{"partner":"${p.id}"}'>${avathumb(p)}${esc(p.name)}</button>`).join('')}
         </div>
         <label>You give</label>
         <div class="chips">${mySpaces.map(([iStr]) => chip(Number(iStr), C.giveSpaces.includes(Number(iStr)), 'give')).join('')}</div>
@@ -1502,7 +1589,7 @@ function renderComposer(v: PlayerView): string {
           <input data-k="giveCash" type="number" inputmode="numeric" min="0" value="${C.giveCash}" placeholder="cash up to $${I.cash}" />
           ${I.jailCards > 0 ? `<button class="chip ${C.giveJail > 0 ? 'sel' : ''}" data-act="composerJail" data-args='{"side":"give"}'>Jail card</button>` : ''}
         </div>
-        <label>${partner ? `${partner.token} ${esc(partner.name)} gives` : 'They give'}</label>
+        <label>${partner ? `${avathumb(partner)}${esc(partner.name)} gives` : 'They give'}</label>
         <div class="chips">${theirSpaces.map(([iStr]) => chip(Number(iStr), C.recvSpaces.includes(Number(iStr)), 'recv')).join('') || '<span class="hint">they own nothing</span>'}</div>
         <div class="row">
           <input data-k="recvCash" type="number" inputmode="numeric" min="0" value="${C.recvCash}" placeholder="cash up to $${partner?.cash ?? 0}" />

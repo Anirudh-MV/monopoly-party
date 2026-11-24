@@ -8,6 +8,8 @@
 import { io } from 'socket.io-client'
 import QRCode from 'qrcode'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
+import { TOKENS } from '../../shared/tokens.js'
+import { avatarThumbnail } from '../tokens3d.js'
 import { rentFor, rentPreview } from '../../shared/rules.js'
 import type { ColorGroup, HostView, LobbyInfo, PlayerState, Space } from '../../shared/types.js'
 import { Board3D } from './board3d.js'
@@ -105,6 +107,8 @@ let gameBuilt = false
 // mirrored-screen mode: this TV shows a room created on another screen
 let isWatcher = false
 let watcherCode: string | null = localStorage.getItem('mp-watch')
+// the TV's two-tap "New room" arm state (lobby only)
+let resetArmed = false
 
 function setWatcher(on: boolean): void {
   isWatcher = on
@@ -129,6 +133,14 @@ function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string)
 }
 
+// the player's 3D avatar in their chosen colour — replaces the emoji
+// beside every name on the TV (thumbnails cached per model+colour)
+function avathumb(p?: { token: string; color: string } | null): string {
+  if (!p) return ''
+  if (!TOKENS.includes(p.token)) return `${esc(p.token)} `
+  return `<img class="avathumb" src="${avatarThumbnail(TOKENS.indexOf(p.token), p.color)}" alt="${esc(p.token)}" draggable="false" /> `
+}
+
 // ── Room attach, driven by the URL ──
 // A fresh visit mints a room automatically (no "Create" click) and the code is
 // written into the URL via history.replaceState (?room=CODE), so reloading
@@ -147,20 +159,27 @@ function setRoomInUrl(code: string | null): void {
   history.replaceState(null, '', u.href)
 }
 
+// Adopt a room this screen now hosts — shared by create, reset (ack) and
+// room:moved (co-host tabs), so the three paths can't drift.
+function adoptRoom(res: { code?: string; hostToken?: string; urls?: string[] }): void {
+  if (!res.code || !res.hostToken) return
+  localStorage.setItem(`mp-host-${res.code}`, res.hostToken)
+  setRoomInUrl(res.code)
+  urls = res.urls ?? []
+  if (isWatcher) {
+    watcherCode = null
+    localStorage.removeItem('mp-watch')
+    setWatcher(false)
+  }
+  // The 'lobby' event arrived before this ack with urls still empty —
+  // repaint so the QR and join URL show the real address.
+  render()
+}
+
 function createRoom(): void {
   socket.emit('room:create', (res: HostAck) => {
-    if (!res.ok || !res.code || !res.hostToken) return
-    localStorage.setItem(`mp-host-${res.code}`, res.hostToken)
-    setRoomInUrl(res.code)
-    urls = res.urls ?? []
-    if (isWatcher) {
-      watcherCode = null
-      localStorage.removeItem('mp-watch')
-      setWatcher(false)
-    }
-    // The 'lobby' event arrived before this ack with urls still empty —
-    // repaint so the QR and join URL show the real address.
-    render()
+    if (!res.ok) return
+    adoptRoom(res)
   })
 }
 
@@ -234,7 +253,25 @@ socket.on('lobby', (l: LobbyInfo) => {
   lobby = l
   view = null
   gameBuilt = false
+  resetArmed = false // any lobby repaint disarms the two-tap New room
   render()
+})
+
+// A co-host tab when another screen resets the room; a mirror when the
+// room is closed underneath it — the party moved, follow it.
+socket.on('room:moved', (p: { code?: string; hostToken?: string; urls?: string[] }) => {
+  adoptRoom(p)
+})
+
+socket.on('room:closed', (p: { code?: string }) => {
+  if (!isWatcher) return
+  const code = p.code ?? ''
+  if (!/^[A-Z]{4}$/.test(code)) return
+  watchRoom(code, () => {
+    watcherCode = null
+    localStorage.removeItem('mp-watch')
+    setWatcher(false)
+  })
 })
 
 socket.on('view', (v: HostView) => {
@@ -326,6 +363,22 @@ $app.addEventListener('click', (ev) => {
     socket.emit('room:settings', { turnTimeoutMs: ms }, (res: { ok: boolean; error?: string }) => {
       if (!res.ok) console.warn('timer change failed:', res.error)
     })
+  } else if (el.dataset.act === 'resetRoom') {
+    // two-tap arm, TV style: first tap swaps the label, second tap fires
+    if (!resetArmed) {
+      resetArmed = true
+      el.textContent = 'Tap again — new room code'
+      return
+    }
+    resetArmed = false
+    socket.emit('room:reset', (res: HostAck) => {
+      if (!res.ok) {
+        console.warn('new room failed:', res.error)
+        render()
+        return
+      }
+      adoptRoom(res)
+    })
   }
 })
 
@@ -364,7 +417,7 @@ function renderLobby(l: LobbyInfo): void {
   const players = l.players
     .map(
       (p) =>
-        `<li${p.id === l.hostId ? ' class="crowned"' : ''}><span class="dot" style="background:${p.color}"></span><span class="ptoken">${p.token}</span> ${esc(p.name)}${p.id === l.hostId ? ' <span class="crown">Host</span>' : ''}${p.connected ? '' : '<em class="off">offline</em>'}</li>`,
+        `<li${p.id === l.hostId ? ' class="crowned"' : ''}><span class="dot" style="background:${p.color}"></span><span class="ptoken">${avathumb(p)}</span> ${esc(p.name)}${p.id === l.hostId ? ' <span class="crown">Host</span>' : ''}${p.connected ? '' : '<em class="off">offline</em>'}</li>`,
     )
     .join('')
   $app.innerHTML = `
@@ -388,7 +441,8 @@ function renderLobby(l: LobbyInfo): void {
         <label style="margin-top:2vh">Decision timer</label>
         <div class="chips">${TIMERS.map(
           ([label, ms]) => `<button class="chip ${l.turnTimeoutMs === ms ? 'sel' : ''}" data-act="setTimer" data-args='{"ms":${ms}}'>${label}</button>`,
-        ).join('')}</div>`
+        ).join('')}</div>
+        <div style="margin-top:1.6vh"><button class="chip" data-act="resetRoom">New room</button></div>`
         }
       </div>
     </div>`
@@ -396,6 +450,13 @@ function renderLobby(l: LobbyInfo): void {
   if (canvas && urls[0]) {
     QRCode.toCanvas(canvas, urls[0], { width: 260, margin: 1 }).catch(() => {})
   }
+  // pre-warm the exact (model, colour) thumbnails the first game frame
+  // will need, while the room is still filling up
+  setTimeout(() => {
+    for (const p of l.players) {
+      if (TOKENS.includes(p.token)) avatarThumbnail(TOKENS.indexOf(p.token), p.color)
+    }
+  }, 0)
 }
 
 // ── Game ──
@@ -495,7 +556,7 @@ function updateTopbar(v: HostView): void {
   if (v.trades.length > 0) captions.push(`${v.trades.length} trade offer${v.trades.length > 1 ? 's' : ''} on the table`)
   if (v.phase === 'ROLL') captions.push(cur && cur.jail ? 'Roll from jail on your phone' : 'Roll on your phone')
   el.innerHTML = `
-    ${cur ? `<div class="tb-turn">${cur.token} <b>${esc(cur.name)}</b>'s turn${cur.jail ? ' · in jail' : ''}</div>` : ''}
+    ${cur ? `<div class="tb-turn">${avathumb(cur)}<b>${esc(cur.name)}</b>'s turn${cur.jail ? ' · in jail' : ''}</div>` : ''}
     <div class="tb-caps">${captions.map((c) => `<span class="tb-cap">${c}</span>`).join('')}</div>`
 }
 
@@ -513,7 +574,7 @@ function landedCompact(v: HostView): string {
       const badges =
         (st.mortgaged ? ' · mortgaged' : '') +
         (st.houses > 0 ? ` · ${st.houses === 5 ? 'hotel' : `${st.houses} house${st.houses > 1 ? 's' : ''}`}` : '')
-      info = `${owner.token} ${esc(owner.name)}${badges}`
+      info = `${avathumb(owner)}${esc(owner.name)}${badges}`
       if (owner.id !== v.currentPlayerId) {
         const diceSum = v.dice ? v.dice[0] + v.dice[1] : 7
         info += ` — rent $${rentFor(v, i, diceSum)}`
@@ -555,7 +616,7 @@ function updateQueue(v: HostView): void {
   el.innerHTML = `
     <div class="qhead">ROOM ${esc(v.code)} · TURN ${v.turn}</div>
     <div class="qnow" style="--c:${now.color}">
-      <span class="qt">${now.token}</span>
+      <span class="qt">${avathumb(now).trim()}</span>
       <span class="qn">${esc(now.name)}${crown(now)}${jailBadge(now)}</span>
       <span class="qc">$${now.cash}</span>
     </div>
@@ -563,7 +624,7 @@ function updateQueue(v: HostView): void {
       .map(
         (p) => `
     <div class="qitem" style="--c:${p.color}">
-      <span class="qt">${p.token}</span>
+      <span class="qt">${avathumb(p).trim()}</span>
       <span class="qn">${esc(p.name)}${crown(p)}${jailBadge(p)}${!p.connected ? '<em class="off">off</em>' : ''}</span>
       <span class="qc">$${p.cash}</span>
     </div>`,
@@ -607,7 +668,7 @@ function updateStandings(v: HostView): void {
         })()
       return `<div class="srow${p.bankrupt ? ' dead' : ''}" style="--c:${p.color}">
         <span class="sdots">${dots}</span>
-        <span class="st">${p.token}</span>
+        <span class="st">${avathumb(p).trim()}</span>
         <span class="sn">${esc(p.name)}</span>
         ${marks ? `<span class="smarks">${marks}</span>` : ''}
         <span class="sc">$${p.cash}</span>
@@ -661,7 +722,7 @@ function landedCard(v: HostView): string {
       (st.mortgaged ? ' · mortgaged' : '') +
       (st.houses > 0 ? ` · ${st.houses === 5 ? 'hotel' : `${st.houses} house${st.houses > 1 ? 's' : ''}`}` : '')
     if (owner) {
-      info = `<div class="l-owner" style="--c:${owner.color}">${owner.token} ${esc(owner.name)}${badges}</div>`
+      info = `<div class="l-owner" style="--c:${owner.color}">${avathumb(owner)}${esc(owner.name)}${badges}</div>`
       if (owner.id !== v.currentPlayerId) {
         const diceSum = v.dice ? v.dice[0] + v.dice[1] : 7
         rentLine = `<div class="l-rent">Rent due: $${rentFor(v, i, diceSum)}</div>`
@@ -682,7 +743,7 @@ function landedCard(v: HostView): string {
   return `
     <div class="landed">
       <div class="l-strip" style="background:${stripColor(sp)}"></div>
-      <div class="l-name">${mover ? `${mover.token} ` : ''}${esc(sp.name)}${'price' in sp ? ` <span class="l-price">$${sp.price}</span>` : ''}</div>
+      <div class="l-name">${mover ? avathumb(mover) : ''}${esc(sp.name)}${'price' in sp ? ` <span class="l-price">$${sp.price}</span>` : ''}</div>
       ${rentLine}
       ${info}
     </div>`
@@ -776,7 +837,7 @@ function updateCenter(v: HostView): void {
         : 'rolled three doubles in a row'
     el.innerHTML = `
       <div class="cardprompt jailprompt">
-        <div class="cp-title">${arrested?.token ?? ''} ${esc(arrested?.name ?? '')} is under arrest</div>
+        <div class="cp-title">${avathumb(arrested)}${esc(arrested?.name ?? '')} is under arrest</div>
         <div class="cp-sub">${esc(arrested?.name ?? '')} ${reason}</div>
         <div class="cp-sub">Tap "Go to Jail" on ${esc(arrested?.name ?? '')}'s phone</div>
       </div>`
@@ -793,7 +854,7 @@ function updateCenter(v: HostView): void {
         <div class="a-title">AUCTION</div>
         <div class="a-prop">${esc(sp.name)}${'price' in sp ? ` · $${sp.price}` : ''}</div>
         <div class="a-bid">$${v.auction.bid}</div>
-        <div class="a-bidder">${v.auction.bidder ? `high bidder: ${bidder?.token} ${esc(bidder?.name ?? '')}` : 'no bids yet'}</div>
+        <div class="a-bidder">${v.auction.bidder ? `high bidder: ${avathumb(bidder)}${esc(bidder?.name ?? '')}` : 'no bids yet'}</div>
         <div class="a-count">${passing}/${total - 1} players passed</div>
       </div>`
     return
@@ -858,7 +919,7 @@ function updateGodPanel(v: HostView): void {
     .map(
       (p) => `
     <div class="gp-player" style="--c:${p.color}">
-      <div class="gp-pname">${p.token} ${esc(p.name)} — $${p.cash}${p.bankrupt ? ' (bankrupt)' : ''}${p.jail ? ' · in jail' : ''}</div>
+      <div class="gp-pname">${avathumb(p)}${esc(p.name)} — $${p.cash}${p.bankrupt ? ' (bankrupt)' : ''}${p.jail ? ' · in jail' : ''}</div>
       <div class="gp-chips">
         <button class="tiny" data-god='{"cmd":"setCash","playerId":"${p.id}","amount":${Math.max(0, p.cash - 100)}}'>-$100</button>
         <button class="tiny" data-god='{"cmd":"setCash","playerId":"${p.id}","amount":${p.cash + 100}}'>+$100</button>
@@ -890,7 +951,7 @@ function updateGodPanel(v: HostView): void {
       ${open ? `
         <div class="gp-chips">
           <button class="tiny" data-god='{"cmd":"setProperty","space":${i},"owner":null}'>Bank</button>
-          ${v.players.map((p) => `<button class="tiny" data-god='{"cmd":"setProperty","space":${i},"owner":"${p.id}"}'>${p.token} ${esc(p.name)}</button>`).join('')}
+          ${v.players.map((p) => `<button class="tiny" data-god='{"cmd":"setProperty","space":${i},"owner":"${p.id}"}'>${avathumb(p)}${esc(p.name)}</button>`).join('')}
         </div>
         ${isStreetSpace ? `
         <div class="gp-chips">
@@ -915,7 +976,7 @@ function updateGodPanel(v: HostView): void {
     </div>
     <div class="gp-chips">${v.players
       .filter((p) => !p.bankrupt)
-      .map((p) => `<button class="chip" data-god='{"cmd":"replayTurn","playerId":"${p.id}"}'>Turn &#8594; ${p.token} ${esc(p.name)}</button>`)
+      .map((p) => `<button class="chip" data-god='{"cmd":"replayTurn","playerId":"${p.id}"}'>Turn &#8594; ${avathumb(p)}${esc(p.name)}</button>`)
       .join('')}</div>
     <div class="gp-sec">FORCE REVEAL</div>
     <div class="gp-chips">

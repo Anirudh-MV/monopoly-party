@@ -182,22 +182,27 @@ io.use((socket, next) => {
   }
 })
 
-function joinUrls(): string[] {
+function joinUrls(code?: string): string[] {
   // Advertised links carry the key: the QR code on the TV becomes a one-tap
   // sign-in for phones. The key is on the big screen anyway — it gates the
-  // internet, not the room (room codes still do that).
-  const key = PARTY_KEY ? `?key=${encodeURIComponent(PARTY_KEY)}` : ''
-  if (PUBLIC_URL) return [`${PUBLIC_URL}/join${key}`]
+  // internet, not the room (room codes still do that). The room code rides
+  // along too (?code=), so a scanned link prefills the join form; the gate
+  // reads only req.query.key and ignores unknown params.
+  const params: string[] = []
+  if (PARTY_KEY) params.push(`key=${encodeURIComponent(PARTY_KEY)}`)
+  if (code) params.push(`code=${encodeURIComponent(code)}`)
+  const q = params.length > 0 ? `?${params.join('&')}` : ''
+  if (PUBLIC_URL) return [`${PUBLIC_URL}/join${q}`]
   const urls: string[] = []
   for (const list of Object.values(networkInterfaces())) {
     for (const ni of list ?? []) {
-      if (ni.family === 'IPv4' && !ni.internal) urls.push(`http://${ni.address}:${PORT}/join${key}`)
+      if (ni.family === 'IPv4' && !ni.internal) urls.push(`http://${ni.address}:${PORT}/join${q}`)
     }
   }
   return urls
 }
 
-attach(io, () => joinUrls(), path.resolve(process.env.SNAP_DIR ?? 'snapshots'))
+attach(io, joinUrls, path.resolve(process.env.SNAP_DIR ?? 'snapshots'))
 
 // A restart must not lose acknowledged moves: snapshot writes are batched
 // over ~250ms, so flush whatever is pending before the process goes down.

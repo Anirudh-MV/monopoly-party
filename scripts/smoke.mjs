@@ -3,6 +3,7 @@
 // proves reconnect works. Run: npm run smoke
 
 import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { io } from 'socket.io-client'
 
 const PORT = 3123
@@ -66,6 +67,7 @@ try {
   assert(created.ok && /^[A-Z]{4}$/.test(created.code || ''), `room created: ${created.code}`)
   const code = created.code
   assert(Array.isArray(created.urls), `join URLs advertised (${(created.urls || []).length} LAN interface(s))`)
+  assert(created.urls.every((u) => u.endsWith('code=' + created.code)), 'join URLs carry the room code (QR prefills it)')
 
   const names = ['Maya', 'Leo', 'Sam']
   const phones = []
@@ -442,6 +444,101 @@ try {
     tvk.disconnect()
   }
 
+  // ── lobby reset: dissolve the room, mint a fresh one ──
+  // Own rooms only — this dissolves seats by design. Covers the council
+  // spec: ack shape, phone evacuation, watcher follow, timer carry-over,
+  // dead old code/tokens, refusals, snapshot hygiene, and the crown path.
+  {
+    const rtv = connect()
+    const rc = await emitAck(rtv, 'room:create')
+    await emitAck(rtv, 'room:settings', { turnTimeoutMs: 120000 })
+    let rlobby = null
+    rtv.on('lobby', (l) => {
+      rlobby = l
+    })
+    const rp1 = connect()
+    const rj1 = await emitAck(rp1, 'room:join', { code: rc.code, name: 'Ada' })
+    const rp2 = connect()
+    await emitAck(rp2, 'room:join', { code: rc.code, name: 'Bea' })
+    let closed1 = null
+    let closed2 = null
+    let closedW = null
+    rp1.on('room:closed', (p) => {
+      closed1 = p
+    })
+    rp2.on('room:closed', (p) => {
+      closed2 = p
+    })
+    const rw = connect()
+    await emitAck(rw, 'room:watch', { code: rc.code })
+    rw.on('room:closed', (p) => {
+      closedW = p
+    })
+    await sleep(150)
+
+    const nonHost = await emitAck(rp2, 'room:reset')
+    assert(nonHost && !nonHost.ok, 'a plain phone cannot reset the room')
+
+    const rres = await emitAck(rtv, 'room:reset')
+    assert(rres && rres.ok && /^[A-Z]{4}$/.test(rres.code || ''), 'reset minted a new room')
+    assert(rres.code !== rc.code, 'the new room code differs')
+    assert(typeof rres.hostToken === 'string' && rres.hostToken.length > 0 && Array.isArray(rres.urls), 'reset ack carries a fresh host token + urls')
+    await sleep(350)
+
+    assert(closed1 && closed1.code === rres.code && closed2 && closed2.code === rres.code, 'every seated phone was told the new code')
+    assert(closedW && closedW.code === rres.code, 'the mirror was told the new code')
+    assert(rlobby && rlobby.code === rres.code && rlobby.players.length === 0, 'the TV is in the fresh empty lobby')
+    assert(rlobby && rlobby.turnTimeoutMs === 120000, 'the decision-timer preference carried over')
+
+    const oldJoin = await emitAck(connect(), 'room:join', { code: rc.code, name: 'Zed' })
+    assert(oldJoin && !oldJoin.ok, 'the old room code is dead')
+    const oldRejoin = await emitAck(connect(), 'room:rejoin', { token: rj1.token })
+    assert(oldRejoin && !oldRejoin.ok, 'old rejoin tokens are dead')
+    const oldHost = await emitAck(connect(), 'room:hostJoin', { code: rc.code, hostToken: rc.hostToken })
+    assert(oldHost && !oldHost.ok, 'the old host token is dead')
+    const rtv2 = connect()
+    const newHost = await emitAck(rtv2, 'room:hostJoin', { code: rres.code, hostToken: rres.hostToken })
+    assert(newHost && newHost.ok, 'the fresh host token reclaims the new room')
+    const newJoin = await emitAck(connect(), 'room:join', { code: rres.code, name: 'Cy' })
+    assert(newJoin && newJoin.ok, 'a phone can join the new room')
+    await sleep(400)
+    assert(!existsSync('snapshots-test/' + rc.code + '.json'), 'the old room snapshot is deleted')
+    assert(existsSync('snapshots-test/' + rres.code + '.json'), "the new room's snapshot appears")
+
+    // mid-game refusal: start the fresh room and try to reset
+    const dj = connect()
+    await emitAck(dj, 'room:join', { code: rres.code, name: 'Di' })
+    const startNew = await emitAck(rtv, 'game:start', {})
+    assert(startNew && startNew.ok, 'the new room starts a game')
+    const midReset = await emitAck(rtv, 'room:reset')
+    assert(midReset && !midReset.ok, 'a started game refuses the reset (' + (midReset && midReset.error) + ')')
+    rtv.disconnect()
+    rtv2.disconnect()
+    rp1.disconnect()
+    rp2.disconnect()
+    rw.disconnect()
+
+    // crown phone path: the party host can reset, and the TV follows room:moved
+    const ctv = connect()
+    const cc = await emitAck(ctv, 'room:create')
+    let moved = null
+    ctv.on('room:moved', (p) => {
+      moved = p
+    })
+    const cphone = connect()
+    await emitAck(cphone, 'room:join', { code: cc.code, name: 'Eve' }) // first joiner = crown
+    const crownReset = await emitAck(cphone, 'room:reset')
+    assert(crownReset && crownReset.ok && crownReset.code !== cc.code, 'the crown phone can reset the room')
+    await sleep(300)
+    assert(moved && moved.code === crownReset.code && typeof moved.hostToken === 'string', 'the TV was told to move (room:moved)')
+    const ctv2 = connect()
+    const movedHost = await emitAck(ctv2, 'room:hostJoin', { code: moved.code, hostToken: moved.hostToken })
+    assert(movedHost && movedHost.ok, 'the moved host token reclaims the new room')
+    ctv.disconnect()
+    ctv2.disconnect()
+    cphone.disconnect()
+  }
+
   // ── exit mid-game: forfeit — the estate goes under the hammer ──
   // Runs after every section that needs all phones attached: walking out
   // is an immediate bankrupt-to-bank forfeit. The game plays on without
@@ -532,6 +629,7 @@ try {
   const host2 = connect()
   const hres = await emitAck(host2, 'room:hostJoin', { code, hostToken: created.hostToken })
   assert(hres.ok, 'TV reconnected with its token')
+  assert((hres.urls || []).every((u) => u.endsWith('code=' + code)), 'hostJoin URLs carry the room code too')
 
   // ── update detection: the build-id pipeline serves a stable non-empty id ──
   {

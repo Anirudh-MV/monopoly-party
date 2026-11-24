@@ -106,6 +106,24 @@ function playerRoom(code: string, playerId: string): string {
   return `p:${code}:${playerId}`
 }
 
+// One room-minting path for create and reset, so the guards and defaults
+// can never drift apart.
+function mintRoom(turnTimeoutMs: number = DEFAULT_TURN_TIMEOUT_MS): Room {
+  return {
+    code: newCode(),
+    hostToken: randomUUID(),
+    hostPlayerId: null,
+    turnTimeoutMs,
+    state: null,
+    hostSockets: new Set(),
+    players: [],
+    lastActive: Date.now(),
+    timer: null,
+    timerKey: null,
+    watchdogBusy: false,
+  }
+}
+
 // True if this socket is the player's CURRENT connection for its seat. A
 // stale socket (phone already rejoined elsewhere; socket.io notices the old
 // one ~45s later) must never act, leave, or hand over duties for a seat
@@ -538,6 +556,9 @@ function saveRoom(room: Room): void {
         const batch = [...dirtyRooms]
         dirtyRooms.clear()
         for (const r of batch) {
+          // a room dissolved mid-flush (lobby reset) must not resurrect its
+          // snapshot after the unlink — skip anything no longer registered
+          if (!rooms.has(r.code)) continue
           try {
             await flushSnapshot(r)
           } catch (e) {
@@ -932,7 +953,7 @@ export async function flushSnapshots(): Promise<void> {
   }
 }
 
-export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 'snapshots'): void {
+export function attach(io: IOServer, getJoinUrls: (code: string) => string[], snapshotDir = 'snapshots'): void {
   ioRef = io
   SNAP_DIR = snapshotDir
   loadSnapshots()
@@ -964,19 +985,7 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       if (rooms.size >= MAX_ROOMS) {
         return ack?.({ ok: false, error: 'Server is full — try again in a few minutes' })
       }
-      const room: Room = {
-        code: newCode(),
-        hostToken: randomUUID(),
-        hostPlayerId: null,
-        turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS,
-        state: null,
-        hostSockets: new Set(),
-        players: [],
-        lastActive: Date.now(),
-        timer: null,
-        timerKey: null,
-        watchdogBusy: false,
-      }
+      const room: Room = mintRoom()
       rooms.set(room.code, room)
       data.roomsCreated = (data.roomsCreated ?? 0) + 1
       // one connection, one room: detach from any previous room first
@@ -986,7 +995,7 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       data.code = room.code
       data.role = 'host'
       socket.emit('lobby', lobbyInfo(room)) // render the empty lobby immediately
-      ack?.({ ok: true, code: room.code, hostToken: room.hostToken, urls: getJoinUrls() })
+      ack?.({ ok: true, code: room.code, hostToken: room.hostToken, urls: getJoinUrls(room.code) })
     })
 
     on('room:hostJoin', (raw: unknown, ack?: (res: unknown) => void) => {
@@ -1004,7 +1013,7 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       data.role = 'host'
       if (room.state) socket.emit('view', hostView(room.state, room.code, room.hostPlayerId, room.turnTimeoutMs))
       else socket.emit('lobby', lobbyInfo(room))
-      ack?.({ ok: true, code: room.code, urls: getJoinUrls() })
+      ack?.({ ok: true, code: room.code, urls: getJoinUrls(room.code) })
     })
 
     // Extra TVs: mirror the room on any other screen. The watcher joins the
@@ -1021,7 +1030,7 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       data.role = 'watcher'
       if (room.state) socket.emit('view', hostView(room.state, room.code, room.hostPlayerId, room.turnTimeoutMs))
       else socket.emit('lobby', lobbyInfo(room))
-      ack?.({ ok: true, code: room.code, urls: getJoinUrls() })
+      ack?.({ ok: true, code: room.code, urls: getJoinUrls(room.code) })
     })
 
     // ── Phones ──
@@ -1280,6 +1289,96 @@ export function attach(io: IOServer, getJoinUrls: () => string[], snapshotDir = 
       room.hostPlayerId = target.meta.id
       broadcastLobby(io, room)
       ack?.({ ok: true })
+    })
+
+    // ── Lobby reset: dissolve this room and mint a fresh one ──
+    // Lobby-only by hard guard — never touches the engine or the estate
+    // rules. The initiator (TV socket or crown phone) gets the new room via
+    // the ack; other TVs follow via room:moved; every seated phone is
+    // evacuated with room:closed carrying the new code so the join form
+    // prefills it. Watchers auto-follow on the client.
+    on('room:reset', (_raw: unknown, ack?: (res: unknown) => void) => {
+      const old = data.code ? rooms.get(data.code) : undefined
+      if (!old) return ack?.({ ok: false, error: 'Room not found' })
+      if (old.state) return ack?.({ ok: false, error: 'The game already started' })
+      const isTvHost = old.hostSockets.has(socket.id)
+      const isPartyHost = isCurrentConnection(old, data, socket.id) && data.playerId === old.hostPlayerId
+      if (!isTvHost && !isPartyHost) {
+        return ack?.({ ok: false, error: data.role === 'player' ? 'Only the party host can do that' : 'Hosts only' })
+      }
+      if ((data.roomsCreated ?? 0) >= MAX_ROOMS_PER_SOCKET) {
+        return ack?.({ ok: false, error: 'This screen has made too many rooms — reload the page' })
+      }
+      if (rooms.size >= MAX_ROOMS) {
+        return ack?.({ ok: false, error: 'Server is full — try again in a few minutes' })
+      }
+
+      // the fresh room keeps the screen's timer preference — that's a
+      // preference, not part of the mess being reset
+      const next = mintRoom(old.turnTimeoutMs)
+      rooms.set(next.code, next)
+      data.roomsCreated = (data.roomsCreated ?? 0) + 1
+      const urls = getJoinUrls(next.code)
+
+      // TVs: migrate every host socket; the initiator learns via the ack,
+      // the others via room:moved
+      for (const sid of old.hostSockets) {
+        const tv = io.sockets.sockets.get(sid)
+        if (!tv) continue
+        tv.leave(hostRoom(old.code))
+        tv.join(hostRoom(next.code))
+        next.hostSockets.add(sid) // host powers must follow the screen
+        const td = tv.data as SocketData
+        td.code = next.code
+        td.role = 'host'
+        tv.emit('lobby', lobbyInfo(next))
+        if (tv !== socket) tv.emit('room:moved', { code: next.code, hostToken: next.hostToken, urls })
+      }
+
+      // phones: every seat is dissolved — tokens die, identities clear,
+      // sockets hear room:closed with the new code (offline seats included:
+      // their tokens must die too)
+      for (const entry of old.players) {
+        playerTokens.delete(entry.token)
+        if (entry.socketId == null) continue
+        const phone = io.sockets.sockets.get(entry.socketId)
+        if (!phone) continue
+        const pd = phone.data as SocketData
+        if (pd.code === old.code && pd.playerId === entry.meta.id) {
+          pd.code = undefined
+          pd.role = undefined
+          pd.playerId = undefined
+        }
+        phone.leave(playerRoom(old.code, entry.meta.id))
+        phone.emit('room:closed', { code: next.code })
+      }
+
+      // watchers/mirrors: after the TVs migrated, whoever is left in the old
+      // host channel is a watcher — tell them where the party went
+      for (const sid of io.sockets.adapter.rooms.get(hostRoom(old.code)) ?? []) {
+        const ws = io.sockets.sockets.get(sid)
+        if (!ws) continue
+        const wd = ws.data as SocketData
+        if (wd.code === old.code) {
+          wd.code = undefined
+          if (wd.role === 'watcher') wd.role = undefined
+        }
+        ws.leave(hostRoom(old.code))
+        ws.emit('room:closed', { code: next.code })
+      }
+
+      // teardown: the old room is gone; its snapshot must not come back —
+      // drop it from the pending-save set BEFORE unlinking, or the 250ms
+      // coalescing flush resurrects the file
+      rooms.delete(old.code)
+      dirtyRooms.delete(old)
+      try {
+        unlinkSync(path.join(SNAP_DIR, `${old.code}.json`))
+      } catch {
+        /* already gone */
+      }
+
+      ack?.({ ok: true, code: next.code, hostToken: next.hostToken, urls })
     })
 
     // ── Game flow ──

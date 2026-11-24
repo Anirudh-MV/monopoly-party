@@ -258,6 +258,8 @@ try {
     ['game:handOver', null],
     ['game:handOver', { to: { evil: BIG } }],
     ['game:start', { force: true }],
+    ['room:reset', null], // mid-game refusal (the malformed game is running)
+    ['room:reset', { hostile: true }], // junk payload sits in the ack slot — ignored
     ['room:setPiece', null],
     ['room:setPiece', { piece: 42 }],
     ['room:setPiece', { piece: BIG }],
@@ -478,6 +480,31 @@ try {
     assert(kres2 && !kres2.ok, 'kicking a bankrupt player is refused')
     assert(alive(), 'server alive after the refusal')
     tvk.close()
+  }
+
+  // ── lobby reset: guarded against hostile use ──
+  {
+    // a bare socket with no room cannot reset anything
+    const bare = connect()
+    const bres = await emitAck(bare, 'room:reset')
+    assert(bres && !bres.ok, 'reset from a socket with no room is refused')
+    bare.close()
+    assert(alive(), 'server alive after the bare reset')
+
+    // a plain phone cannot reset (the original game room's phones)
+    const pres = await emitAck(players[0].sock, 'room:reset')
+    assert(pres && !pres.ok, 'reset from a plain phone is refused')
+    assert(alive(), 'server alive after the phone reset attempt')
+
+    // the per-socket mint cap counts resets too: this socket already minted
+    // five rooms in the create storm, so a reset for its current (junk)
+    // room is refused with the cap copy before any room is touched
+    const tvc = connect()
+    for (let i = 0; i < 5; i++) await emitAck(tvc, 'room:create')
+    const capped = await emitAck(tvc, 'room:reset')
+    assert(capped && !capped.ok && /too many rooms/i.test(capped.error || ''), 'the mint cap counts resets')
+    tvc.close()
+    assert(alive(), 'server alive after the reset cap probe')
   }
 
   // ── the game must still be fully playable ──
