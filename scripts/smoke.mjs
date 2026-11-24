@@ -198,14 +198,39 @@ try {
   // ── drive the game via allowed actions ──
   // Interactive rent (and auctions) pause the table on a pending decision;
   // settleTable closes those so the script always drives from a live phase.
+  // Relay cards (birthday, chairman) queue several debts behind one another —
+  // with always-outflow the whole table pays through DEBT states now. Drain
+  // the relay: each iteration, the debtor's phone taps Pay. When they can't
+  // cover a row outright the phone raises funds (sell/mortgage) exactly like
+  // a human would — the script never declares bankruptcy. Bounded so a
+  // pathological queue can never hang the suite.
   async function settleDebt() {
-    for (const p of phones) {
-      const acts = (p.view && p.view.allowed) || []
-      if (acts.includes('payDebt')) {
-        await emitAck(p.sock, 'game:action', { type: 'payDebt' })
-        await sleep(120)
-        return
+    for (let n = 0; n < 20 && lastHostView.debt; n++) {
+      let acted = false
+      const debtorId = lastHostView.debt.debtor
+      const phone = phones.find((p) => p.id === debtorId)
+      if (phone && phone.view) {
+        const acts = phone.view.allowed || []
+        if (acts.includes('payDebt')) {
+          await emitAck(phone.sock, 'game:action', { type: 'payDebt' })
+          acted = true
+        } else {
+          const owned = Object.entries(phone.view.props || {})
+            .filter(([, st]) => st.owner === debtorId)
+            .map(([i]) => Number(i))
+          const sell = owned.find((i) => acts.includes('sellHouse') && phone.view.props[i].houses > 0)
+          const mort = owned.find((i) => acts.includes('mortgage') && !phone.view.props[i].mortgaged)
+          if (sell != null) {
+            await emitAck(phone.sock, 'game:action', { type: 'sellHouse', space: sell })
+            acted = true
+          } else if (mort != null) {
+            await emitAck(phone.sock, 'game:action', { type: 'mortgage', space: mort })
+            acted = true
+          }
+        }
       }
+      await sleep(120)
+      if (!acted) return // nothing to raise and nothing to pay — leave it to the clock
     }
   }
   async function settleAuction() {
@@ -221,7 +246,6 @@ try {
     for (let k = 0; k < 8; k++) {
       if (lastHostView.debt) {
         await settleDebt()
-        await sleep(120)
         continue
       }
       if (lastHostView.auction) {

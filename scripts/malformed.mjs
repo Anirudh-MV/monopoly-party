@@ -445,6 +445,52 @@ try {
     const okColor = Array.isArray(snapPlayers) && snapPlayers.every((p) => /^#[0-9a-f]{6}$/i.test(p.meta.color))
     const okToken = Array.isArray(snapPlayers) && snapPlayers.every((p) => typeof p.meta.token === 'string' && p.meta.token.length <= 8 && !p.meta.token.includes('<'))
     assert(xres.ok && okColor && okToken, 'injected color/piece normalized to safe values')
+
+    // ── debt memos: the phone banner reads them, so they get the same
+    // treatment — a clean memo survives byte-identical, a hostile one is
+    // defaulted away, never rendered.
+    const mres = await emitAck(tvg, 'god:command', {
+      cmd: 'import',
+      json: {
+        players: [
+          { meta: { id: 'p0', name: 'Ann', color: '#000000', token: '🎩' }, token: 'tk0' },
+          { meta: { id: 'p1', name: 'Bob', color: '#111111', token: '🚗' }, token: 'tk1' },
+        ],
+        state: bare({
+          phase: 'DEBT',
+          players: [
+            { id: 'p0', cash: 100, pos: 0, jail: false, jailRolls: 0, jailCards: 0, jailReason: null, bankrupt: false, connected: true },
+            { id: 'p1', cash: 100, pos: 0, jail: false, jailRolls: 0, jailCards: 0, jailReason: null, bankrupt: false, connected: true },
+          ],
+          pendingCard: null,
+          pendingCardDraw: null,
+          pendingJail: null,
+          pendingPurchase: null,
+          pendingTax: null,
+          pendingMove: null,
+          auction: null,
+          auctionQueue: [],
+          lastLanded: null,
+          lastMove: null,
+          deadline: null,
+          deadlineFor: null,
+          winner: null,
+          debt: { debtor: 'p0', amount: 60, creditor: null, memo: { html: '<img src=x onerror=alert(1)>' } },
+          debtQueue: [
+            { debtor: 'p1', amount: 5, creditor: 'p0', memo: 'Rent: Boardwalk' },
+            { debtor: 'p1', amount: 6, creditor: 'p0', memo: 'x'.repeat(121) },
+          ],
+        }),
+      },
+    })
+    const msnap = await emitAck(tvg, 'god:command', { cmd: 'export' })
+    const mdebt = msnap.snapshot && msnap.snapshot.state && msnap.snapshot.state.debt
+    const mqueue = (msnap.snapshot && msnap.snapshot.state && msnap.snapshot.state.debtQueue) || []
+    assert(mres.ok && msnap.ok && mdebt, 'debt-memo import round-tripped (object memo rejected, debt kept)')
+    assert(mdebt && mdebt.memo === undefined, 'an object memo is defaulted away, never rendered')
+    assert(mqueue[0] && mqueue[0].memo === 'Rent: Boardwalk', 'a clean memo survives byte-identical')
+    assert(mqueue[1] && mqueue[1].memo === undefined, 'an oversized memo is defaulted away too')
+    assert(alive(), 'server alive after the hostile debt memos')
     tvg.close()
   }
 

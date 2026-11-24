@@ -80,6 +80,36 @@ export function rentFor(
 // (avoid Math.ceil(price * 0.55) — float epsilon makes 100 → 56).
 export const unmortgageCost = (price: number): number => Math.floor(price / 2) + Math.ceil(price / 20)
 
+// ── The debt blurb ──
+// One short human phrase for WHY a debt exists, built from the ledger memo
+// and shared by phones, the TV and the announcer. 'Rent: Boardwalk' becomes
+// 'rent for Boardwalk'; card memos drop their instruction tail ("Hospital
+// fees. Pay $100." → "Hospital fees"). Deliberately no regex lookbehind —
+// the bundles target older iPhones (es2020).
+export function debtBlurb(d: { memo?: string } | null | undefined): string {
+  const memo = d?.memo
+  if (!memo) return 'a debt'
+  if (memo === 'Luxury tax') return 'Luxury Tax'
+  if (memo === 'Income tax') return 'Income Tax'
+  if (memo === 'Jail release fine') return 'jail fine'
+  if (memo.startsWith('Rent: ')) return `rent for ${memo.slice(6)}`
+  if (memo.startsWith('Card: ')) {
+    // Split on '. ' and drop sentences that START with the instruction verbs —
+    // never a lookbehind, never a greedy regex on untrusted card text.
+    const kept = memo
+      .slice(6)
+      .split('. ')
+      .filter((seg) => {
+        const first = seg.trim().toLowerCase().split(/\s+/)[0]?.replace(/[^a-z]/g, '') ?? ''
+        return first !== 'pay' && first !== 'collect'
+      })
+      .join('. ')
+      .replace(/[.,;:\s]+$/, '')
+    return kept || 'a card fee'
+  }
+  return memo
+}
+
 // Display helper: what this space EARNS right now, and what the next
 // investment tier would earn — for landed info and the portfolio.
 // `current` for utilities is the dice multiplier (4 or 10), see `note`.

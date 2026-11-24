@@ -4,8 +4,8 @@
 // Run: npm run remedy
 
 import { createGame, type PlayerMeta } from '../shared/engine.js'
-import { remedyActionsFor } from './rooms.js'
-import type { GameState } from '../shared/types.js'
+import { decisionFor, remedyActionsFor } from './rooms.js'
+import type { DebtState, GameState } from '../shared/types.js'
 
 const METAS: PlayerMeta[] = [
   { id: 'p0', name: 'Asha', color: '#000', token: 'a' },
@@ -84,6 +84,64 @@ function fresh(): GameState {
   const s = fresh()
   s.phase = 'GAME_OVER'
   eq(remedyActionsFor(s), [], 'no remedy for GAME_OVER')
+}
+
+// ── decisionFor: the two-tier debt clock ──
+
+// an AFFORDABLE debt arms a fixed 30s tap clock even with the host timer off
+{
+  const s = fresh()
+  s.phase = 'DEBT'
+  s.debt = { debtor: 'p0', amount: 50, creditor: null, memo: 'Luxury tax' }
+  eq(decisionFor(s, 0), { key: 'debt:1:p0:bank:50:0', playerId: 'p0', ms: 30_000 }, 'affordable debt arms 30s even at timeout 0')
+}
+
+// an UNAFFORDABLE debt: unarmed while the timer is off, host clock when on
+{
+  const s = fresh()
+  s.phase = 'DEBT'
+  s.players[0].cash = 10
+  s.debt = { debtor: 'p0', amount: 500, creditor: 'p1', memo: 'Rent: Boardwalk' }
+  eq(decisionFor(s, 0), null, 'unaffordable debt stays unarmed while the timer is off')
+  eq(decisionFor(s, 120_000)?.ms, 120_000, 'unaffordable debt runs on the host clock')
+}
+
+// relay rows from ONE debtor must never collide into a single clock key —
+// the old `debt:turn:debtor` key reused itself, and later rows inherited an
+// already-expired timer (scheduleDeadline returned early).
+{
+  const s = fresh()
+  s.phase = 'DEBT'
+  const memo = 'Card: Elected Chairman of the Board. Pay each player $50.'
+  const rows: DebtState[] = [
+    { debtor: 'p0', amount: 50, creditor: 'p1', memo },
+    { debtor: 'p0', amount: 50, creditor: 'p2', memo },
+    { debtor: 'p0', amount: 50, creditor: null, memo }, // bank re-point — same shape again
+  ]
+  const keys: string[] = []
+  for (let n = 0; n < rows.length; n++) {
+    s.debt = rows[n]
+    s.debtQueue = rows.slice(n + 1)
+    const d = decisionFor(s, 0)
+    if (d) keys.push(d.key)
+  }
+  eq(keys.length, 3, 'every relay row was clocked')
+  eq(new Set(keys).size, 3, 'relay rows never collide — one fresh clock per debt')
+}
+
+// a plain roll decision respects the host switch entirely
+{
+  const s = fresh()
+  eq(decisionFor(s, 0), null, 'no clock for a roll when the timer is off')
+  eq(decisionFor(s, 90_000)?.ms, 90_000, 'the roll clock follows the host timer')
+}
+
+// arrests keep their fixed clock
+{
+  const s = fresh()
+  s.phase = 'ACTION'
+  s.pendingJail = { player: 'p0', reason: 'card' }
+  eq(decisionFor(s, 0)?.ms, 30_000, 'the arrest clock survives the timer switch')
 }
 
 if (failures.length > 0) {

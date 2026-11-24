@@ -5,7 +5,7 @@
 // controls. Every setting lives in one menu.
 
 import { applyAction, createGame, type PlayerMeta } from '../../shared/engine.js'
-import { allowedActions } from '../../shared/rules.js'
+import { allowedActions, debtBlurb } from '../../shared/rules.js'
 import { botAction, botActor } from '../../shared/bot.js'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
 import { gridPos, regionOf, cellHTML } from '../../shared/board-grid.js'
@@ -128,12 +128,13 @@ function phoneCard(s: GameState, pid: string): string {
     banner = '💀 Bankrupt — spectating'
   } else if (s.debt && s.debt.debtor === pid) {
     const cred = s.debt.creditor ? s.players.find((q) => q.id === s.debt?.creditor)?.name : 'the bank'
-    banner = `You owe $${s.debt.amount} to ${esc(cred ?? 'the bank')}${s.debt.memo?.startsWith('Rent: ') ? ` — rent for ${esc(s.debt.memo.slice(6))}` : ''}`
+    banner = `You owe $${s.debt.amount} to ${esc(cred ?? 'the bank')} — ${esc(debtBlurb(s.debt))}`
     btns.push(chip(acts.has('payDebt'), `Pay $${s.debt.amount}`))
     btns.push(chip(acts.has('bankrupt'), 'Bankrupt'))
   } else if (s.debt) {
     const debtor = s.players.find((q) => q.id === s.debt?.debtor)
-    banner = `${esc(debtor?.name ?? '')} is raising funds to pay a debt…`
+    const cred = s.debt.creditor ? s.players.find((q) => q.id === s.debt?.creditor)?.name : 'the bank'
+    banner = `${esc(debtor?.name ?? '')} is paying ${esc(cred ?? 'the bank')} $${s.debt.amount} — ${esc(debtBlurb(s.debt))}${s.debtQueue.length > 0 ? ` (${1 + s.debtQueue.length} left)` : ''}`
   } else if (s.phase === 'AUCTION' && s.auction) {
     const highBidder = s.auction.bidder ? s.players.find((q) => q.id === s.auction?.bidder)?.name : null
     banner = `Auction: ${esc(BOARD[s.auction.space].name)} — $${s.auction.bid}${highBidder ? ` (${esc(highBidder)})` : ' — no bids yet'}`

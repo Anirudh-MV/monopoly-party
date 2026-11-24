@@ -17,6 +17,7 @@ import {
   canMortgageOn,
   canSellHouseOn,
   canUnmortgageOn,
+  debtBlurb,
   netWorth,
   rentFor,
   rentPreview,
@@ -1245,8 +1246,10 @@ function renderGame(v: PlayerView): void {
   } else if (v.phase === 'DEBT' && v.debt && v.debt.debtor === I.id) {
     const creditor = v.debt.creditor ? v.players.find((p) => p.id === v.debt?.creditor) : null
     const canPay = acts.has('payDebt')
-    const rentForSpace = v.debt.memo?.startsWith('Rent: ') ? v.debt.memo.slice(6) : null
-    banner = `<div class="banner debt">You owe <b>$${v.debt.amount}</b> to ${creditor ? `${avathumb(creditor)}${esc(creditor.name)}` : 'the bank'}${rentForSpace ? ` - rent for <b>${esc(rentForSpace)}</b>` : ''}</div>`
+    // one phrase for every kind of charge, straight off the memo the server
+    // put on the debt — no per-card parsing here.
+    const blurb = debtBlurb(v.debt)
+    banner = `<div class="banner debt">You owe <b>$${v.debt.amount}</b> to ${creditor ? `${avathumb(creditor)}${esc(creditor.name)}` : 'the bank'} — ${esc(blurb)}</div>`
     if (canPay) {
       // rent they can afford: a deliberate, felt-in-the-hand payment
       body += `
@@ -1265,7 +1268,17 @@ function renderGame(v: PlayerView): void {
     }
   } else if (v.phase === 'DEBT' && v.debt) {
     const debtor = v.players.find((p) => p.id === v.debt?.debtor)
-    banner = `<div class="banner info">${esc(debtor?.name ?? '')} is raising funds to pay a debt…</div>`
+    const creditor = v.debt.creditor ? v.players.find((p) => p.id === v.debt?.creditor) : null
+    const blurb = debtBlurb(v.debt)
+    // A relay card queues several payments through one freeze. If I'M the one
+    // getting paid, show how much of the relay is still owed to me.
+    const dq = v.debtQueue || []
+    let relay = ''
+    if (v.debt.creditor === I.id && dq.some((d) => d.creditor === I.id)) {
+      const mine = 1 + dq.filter((d) => d.creditor === I.id).length
+      relay = ` — <b>${mine} of ${1 + dq.length} still to pay</b>`
+    }
+    banner = `<div class="banner info">${avathumb(debtor)}${esc(debtor?.name ?? '')} is paying ${creditor ? `${avathumb(creditor)}${esc(creditor.name)}` : 'the bank'} <b>$${v.debt.amount}</b> — ${esc(blurb)}${relay}</div>`
   } else if (v.phase === 'AUCTION' && v.auction) {
     const sp = BOARD[v.auction.space]
     const bidder = v.players.find((p) => p.id === v.auction?.bidder)

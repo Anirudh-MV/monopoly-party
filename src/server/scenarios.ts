@@ -5,9 +5,9 @@
 // Run: npm run scenarios
 
 import { applyAction, createGame, forfeitEstate, type PlayerMeta, type Result } from '../shared/engine.js'
-import { forfeitSeat } from './rooms.js'
-import { allowedActions, rentFor, rentPreview } from '../shared/rules.js'
-import type { Action, GameState, PlayerState, PropertyState } from '../shared/types.js'
+import { decisionFor, forfeitSeat } from './rooms.js'
+import { allowedActions, debtBlurb, rentFor, rentPreview } from '../shared/rules.js'
+import type { Action, DebtState, GameState, PlayerState, PropertyState } from '../shared/types.js'
 
 const NAMES = ['Asha', 'Ben', 'Cho', 'Dara']
 const TOKENS = ['🎩', '🚗', '🐕', '🚢']
@@ -394,6 +394,10 @@ scenario('chance: go back 3 spaces chains into Community Chest', 4, (h) => {
   h.eq(h.s.lastMove != null && h.s.lastMove.path, [35, 34, 33], 'backward moves record their path in walk order')
   h.eq(h.s.pendingCardDraw != null && h.s.pendingCardDraw.deck, 'chest', 'the chained chest also prompts')
   h.ok(h.act(0, { type: 'drawCard' }), 'open the chained chest')
+  h.eq(h.s.phase, 'DEBT', 'the hospital fee waits for a tap — no silent deduction')
+  h.eq(h.s.debt != null && h.s.debt.memo, 'Card: Hospital fees. Pay $100.', 'the memo rides along to the phone')
+  h.eq(h.p(0).cash, 1500, 'the wallet is untouched until the tap')
+  h.ok(h.act(0, { type: 'payDebt' }), 'pay the fee')
   h.eq(h.p(0).cash, 1400, 'drew and paid the chest card')
   h.eq(h.s.pendingCard != null && h.s.pendingCard.deck, 'chest', 'the chained chest card is showing')
   h.eq(h.s.cardDrawSeq, 2, 'both reveals counted')
@@ -408,6 +412,11 @@ scenario('chance: repairs card counts houses and hotels', 4, (h) => {
   h.p(0).pos = 34
   h.roll(0, [[1, 1]]) // → 36 Chance: $25/house, $100/hotel
   h.ok(h.act(0, { type: 'drawCard' }), 'spin')
+  h.eq(h.s.phase, 'DEBT', 'the repair bill arrives as a prompt, not a skim')
+  h.eq(h.s.debt != null && h.s.debt.amount, 150, '2 houses and a hotel')
+  h.eq(h.s.debt != null && h.s.debt.memo, 'Card: Make general repairs: pay $25 per house, $100 per hotel.', 'the memo names the card')
+  h.eq(h.p(0).cash, 1500, 'cash untouched until the tap')
+  h.ok(h.act(0, { type: 'payDebt' }), 'pay the repairs by hand')
   h.eq(h.p(0).cash, 1500 - 2 * 25 - 100, 'paid $150 in repairs')
 })
 
@@ -435,7 +444,9 @@ scenario('mortgage math is exact (no float drift)', 4, (h) => {
 })
 
 scenario('debt resolution: raise funds, then pay — with a queue', 4, (h) => {
-  // Birthday card: $10 from every player. Two of them can't pay.
+  // Birthday card: $10 from every player. Always-outflow makes this a
+  // relay — Ben pays by hand first, and only then does the drawer collect;
+  // the short seats follow on their own clocks.
   h.s.chestDeck = ['cc10']
   h.cash(2, 5)
   h.cash(3, 3)
@@ -445,15 +456,22 @@ scenario('debt resolution: raise funds, then pay — with a queue', 4, (h) => {
   h.p(0).pos = 15
   h.roll(0, [[1, 1]]) // → 17 Chest
   h.ok(h.act(0, { type: 'drawCard' }), 'open the chest')
-  h.eq(h.s.phase, 'DEBT', 'Cho cannot pay her $10')
-  h.eq(allowedActions(h.s, h.id(1)).length, 0, 'everyone else is frozen while a debt resolves')
-  h.eq(h.p(0).cash, 1510, 'collected from Ben, who could afford it')
+  h.eq(h.s.phase, 'DEBT', 'the first payer is prompted — nobody is skimmed silently')
+  h.eq(h.s.debt != null && h.s.debt.debtor, h.id(1), 'Ben is up first')
+  h.eq(h.s.debtQueue.length, 2, 'Cho and Dara queue behind him')
+  h.eq(h.p(0).cash, 1500, 'the drawer collects nothing before the taps')
+  h.eq(allowedActions(h.s, h.id(2)).length, 0, 'queued debtors are frozen until it is their row')
+  h.ok(h.act(1, { type: 'payDebt' }), 'Ben taps Pay')
+  h.eq(h.p(0).cash, 1510, 'the drawer collects inline')
+  h.eq(h.p(1).cash, 1490, 'and Ben is $10 lighter')
+  h.eq(h.s.debt != null && h.s.debt.debtor, h.id(2), 'Cho\u2019s debt activates next')
+  h.eq(allowedActions(h.s, h.id(1)).length, 0, 'Ben is frozen while Cho raises funds')
   h.ok(h.act(2, { type: 'mortgage', space: 11 }), 'Cho mortgages St. Charles')
   h.ok(h.act(2, { type: 'payDebt' }), 'and pays')
   h.eq(h.s.phase, 'DEBT', 'the queued debt (Dara) is now active')
   h.ok(h.act(3, { type: 'mortgage', space: 13 }), 'Dara mortgages States')
   h.ok(h.act(3, { type: 'payDebt' }), 'and pays')
-  h.eq(h.p(0).cash, 1530, 'host collected from everyone in the end')
+  h.eq(h.p(0).cash, 1530, 'drawer collected from everyone in the end')
   h.eq(h.s.debt, null, 'no debts left')
   h.eq(h.s.phase, 'ROLL', 'doubles on the birthday roll: Asha rolls again')
 })
@@ -853,6 +871,178 @@ scenario('a disconnect is not a forfeit: the seat waits', 4, (h) => {
   h.eq(h.s.winner, null, 'no automatic winner')
   h.ok(h.roll(0, [[1, 2]]), 'the game plays on without them')
   h.eq(h.s.phase, 'ACTION', 'a fresh landing is live for the current player')
+})
+
+// ── Prompt before money leaves ──
+
+scenario('luxury tax prompts before the cash leaves', 4, (h) => {
+  h.now(0)
+  h.p(0).pos = 36
+  h.roll(0, [[1, 1]]) // → 38 Luxury Tax ($75)
+  h.eq(h.s.phase, 'DEBT', 'the tax is a prompt, not a deduction')
+  h.eq(h.s.debt != null && h.s.debt.amount, 75, 'the full luxury tax is named')
+  h.eq(h.s.debt != null && h.s.debt.memo, 'Luxury tax', 'charge() preserves the memo')
+  h.eq(h.s.debt != null && h.s.debt.creditor, null, 'the bank is the creditor')
+  h.eq(h.p(0).cash, 1500, 'nothing has left the wallet yet')
+  h.ok(h.act(0, { type: 'payDebt' }), 'one named tap pays it')
+  h.eq(h.p(0).cash, 1425, 'the money left on the tap')
+  const last = h.s.ledger[h.s.ledger.length - 1]
+  h.eq(last != null && last.memo, 'Luxury tax', 'ledger memo byte-identical to the old instant path')
+  h.eq(last != null && last.delta, -75, 'recorded as a payment')
+  h.eq(last != null && last.balance, 1425, 'post-transaction balance')
+  h.eq(h.s.phase, 'ROLL', 'the doubles chain continues after the payment')
+})
+
+scenario('a card fee prompts before the cash leaves', 4, (h) => {
+  h.s.chestDeck = ['cc13'] // School fees. Pay $50.
+  h.now(0)
+  h.p(0).pos = 15
+  h.roll(0, [[1, 1]]) // → 17 Chest
+  h.ok(h.act(0, { type: 'drawCard' }), 'open the chest')
+  h.eq(h.s.phase, 'DEBT', 'the school fee arrives as a prompt')
+  h.eq(h.s.debt != null && h.s.debt.amount, 50, 'the card amount')
+  h.eq(h.s.debt != null && h.s.debt.memo, 'Card: School fees. Pay $50.', 'the card memo rides along')
+  h.eq(h.s.debt != null && h.s.debt.creditor, null, 'a pay card bills the bank')
+  h.eq(h.p(0).cash, 1500, 'cash untouched before the tap')
+  h.ok(h.act(0, { type: 'payDebt' }), 'tap to pay')
+  h.eq(h.p(0).cash, 1450, 'paid on the tap')
+  h.eq(h.s.ledger[h.s.ledger.length - 1]?.memo, 'Card: School fees. Pay $50.', 'ledger memo byte-identical')
+})
+
+scenario('birthday relay: three solvent payers, sequential prompts', 4, (h) => {
+  h.s.chestDeck = ['cc10'] // It's your birthday. Collect $10 from every player.
+  h.now(0)
+  h.p(0).pos = 15
+  h.roll(0, [[1, 1]]) // → 17 Chest
+  h.ok(h.act(0, { type: 'drawCard' }), 'open the chest')
+  h.eq(h.s.phase, 'DEBT', 'the first payer is asked, not skimmed')
+  for (let n = 0; n < 3; n++) {
+    const debtor = 1 + n
+    h.eq(h.s.debt != null && h.s.debt.debtor, h.id(debtor), `relay row ${n + 1} is p${debtor}\u2019s`)
+    h.eq(h.s.debtQueue.length, 2 - n, `the queue drains behind it (${2 - n} left)`)
+    h.eq(h.p(0).cash, 1500 + n * 10, 'the drawer has only collected what was paid')
+    h.ok(h.act(debtor, { type: 'payDebt' }), `payer ${n + 1} taps`)
+    h.eq(h.p(debtor).cash, 1490, 'and only now loses the $10')
+    h.eq(h.p(0).cash, 1510 + n * 10, 'the drawer collects inline')
+  }
+  h.eq(h.s.debt, null, 'the relay drained')
+  h.eq(h.s.phase, 'ROLL', 'Asha rolls again on the birthday doubles')
+})
+
+scenario('chairman relay: one debtor, three creditors — fresh clock per row', 4, (h) => {
+  h.s.chanceDeck = ['ch15'] // Elected Chairman of the Board. Pay each player $50.
+  h.now(0)
+  h.p(0).pos = 34
+  h.roll(0, [[1, 1]]) // → 36 Chance
+  h.ok(h.act(0, { type: 'drawCard' }), 'spin the wheel')
+  h.eq(h.s.debt != null && h.s.debt.debtor, h.id(0), 'the chairman owes the first row')
+  h.eq(h.s.debtQueue.length, 2, 'two more rows queued behind it')
+  const keys: string[] = []
+  for (let n = 0; n < 3; n++) {
+    const d = decisionFor(h.s, 0) // host clock OFF — an affordable debt arms anyway
+    h.assert(d != null, `relay row ${n + 1} is clocked even with the timer off`)
+    h.eq(d != null ? d.ms : -1, 30_000, `affordable relay row ${n + 1} gets the 30s tap clock`)
+    h.eq(d != null ? d.playerId : '', h.id(0), 'the clock belongs to the chairman')
+    if (d) keys.push(d.key)
+    h.eq(h.s.debt != null && h.s.debt.creditor, h.id(1 + n), `row ${n + 1} is addressed to p${1 + n}`)
+    h.ok(h.act(0, { type: 'payDebt' }), 'chairman pays this row')
+    h.eq(h.p(1 + n).cash, 1550, 'this creditor collected')
+  }
+  h.eq(new Set(keys).size, keys.length, 'every relay row gets its OWN clock key — no inherited expiry')
+  h.eq(h.s.debt, null, 'relay done')
+  h.eq(h.p(0).cash, 1350, 'the chairman paid all three by tap')
+})
+
+scenario('repairs with nothing owned raises no prompt', 4, (h) => {
+  h.s.chanceDeck = ['ch11'] // general repairs — total is $0 with no buildings
+  h.now(0)
+  h.p(0).pos = 34
+  h.roll(0, [[1, 1]]) // → 36 Chance
+  h.ok(h.act(0, { type: 'drawCard' }), 'spin')
+  h.eq(h.s.debt, null, 'a $0 bill never becomes a debt (charge guards amount>0)')
+  h.eq(h.s.debtQueue.length, 0, 'nothing queued either')
+  h.eq(h.p(0).cash, 1500, 'wallet untouched')
+  h.eq(h.s.phase === 'DEBT', false, 'and the table never freezes on $0')
+})
+
+scenario('affordable 3-fail jail fine: prompt, then the stroll completes', 4, (h) => {
+  h.p(0).jail = true
+  h.p(0).jailRolls = 2
+  h.p(0).pos = 10
+  h.now(0)
+  h.roll(0, [[3, 4]]) // third failure, sum 7 — the $50 is sitting in the wallet
+  h.eq(h.s.phase, 'DEBT', 'even the solvent fine waits for a tap')
+  h.eq(h.s.debt != null && h.s.debt.amount, 50, 'the $50 fine')
+  h.eq(h.s.debt != null && h.s.debt.memo, 'Jail release fine', 'the memo names the reason')
+  h.eq(h.s.pendingMove, 7, 'the stroll is parked until it settles')
+  h.eq(h.p(0).cash, 1500, 'cash untouched pre-tap')
+  h.ok(h.act(0, { type: 'payDebt' }), 'pay the fine')
+  h.eq(h.p(0).cash, 1450, 'the fine left on the tap')
+  h.eq(h.p(0).pos, 17, 'the walk completes: 10 + 7')
+  h.eq(h.s.pendingMove, null, 'the parked move is spent')
+  h.eq(h.s.debt, null, 'debt cleared')
+  h.eq(h.s.phase, 'ACTION', 'the stroll landed on a chest — the turn continues live')
+})
+
+scenario('debtBlurb reads every memo shape', 4, (h) => {
+  h.eq(debtBlurb({ memo: 'Rent: Boardwalk' }), 'rent for Boardwalk', 'rent names the street')
+  h.eq(debtBlurb({ memo: 'Luxury tax' }), 'Luxury Tax', 'luxury is title-cased')
+  h.eq(debtBlurb({ memo: 'Income tax' }), 'Income Tax', 'income tax is title-cased')
+  h.eq(debtBlurb({ memo: 'Jail release fine' }), 'jail fine', 'the jail fine is terse')
+  h.eq(debtBlurb({ memo: "Card: It's your birthday. Collect $10 from every player." }), "It's your birthday", 'the collect tail is dropped')
+  h.eq(debtBlurb({ memo: 'Card: Hospital fees. Pay $100.' }), 'Hospital fees', 'the pay tail is dropped')
+  h.eq(debtBlurb({ memo: 'Card: Collect $200.' }), 'a card fee', 'all-instruction text falls back')
+  h.eq(debtBlurb({ memo: 'Card: Speeding fine. Pay $15.' }), 'Speeding fine', 'mid-word pay is not matched')
+  h.eq(debtBlurb({ memo: 'House rules note.' }), 'House rules note.', 'a plain memo passes through as-is')
+  h.eq(debtBlurb({}), 'a debt', 'no memo, no blurb')
+  h.eq(debtBlurb(null), 'a debt', 'a missing debt still speaks')
+})
+
+scenario('forfeit mid-relay redirects the queued collections to the bank', 4, (h) => {
+  // birthday relay INTO Ben; Ben walks out mid-freeze. Neither the active
+  // row nor any queued row may ever land on a dead seat.
+  const memo = "Card: It's your birthday. Collect $10 from every player."
+  h.s.debt = { debtor: h.id(0), amount: 10, creditor: h.id(1), memo }
+  h.s.debtQueue = [
+    { debtor: h.id(2), amount: 10, creditor: h.id(1), memo },
+    { debtor: h.id(3), amount: 10, creditor: h.id(1), memo },
+  ]
+  h.s.phase = 'DEBT'
+  h.give(1, [6]) // Ben owns a deed, so the forfeit has an estate
+  h.cash(1, 200)
+  h.ok(forfeitSeat(h.s, h.id(1), 'Ben left the party'), 'the creditor forfeits mid-relay')
+  h.eq(h.s.debt != null && h.s.debt.creditor, null, 'the active row now pays the bank')
+  h.eq(h.s.debtQueue.every((d) => d.creditor === null), true, 'every queued row re-points to the bank')
+  h.ok(h.act(0, { type: 'payDebt' }), 'Asha pays')
+  h.eq(h.p(0).cash, 1490, 'the $10 left her wallet')
+  h.eq(h.p(1).cash, 0, 'no cash landed on the dead seat')
+  h.eq(h.s.debt != null && h.s.debt.debtor, h.id(2), 'the queued debt activated behind it')
+  h.ok(h.act(2, { type: 'payDebt' }), 'Cho pays the bank too')
+  h.eq(h.s.debt != null && h.s.debt.debtor, h.id(3), 'and the last row is live')
+  h.ok(h.act(3, { type: 'payDebt' }), 'Dara pays')
+  h.eq(h.s.debt, null, 'the relay drained — nothing pays a corpse')
+  h.eq(h.s.phase, 'AUCTION', "Ben\u2019s forfeited deed goes under the hammer next")
+})
+
+scenario('exit with an unpaid bank prompt kills the debt and wakes the queue', 4, (h) => {
+  // Asha is frozen on a bank debt with more rows queued — one of hers, one
+  // of Cho's. Walking out kills her rows, wakes the stranger's.
+  h.s.debt = { debtor: h.id(0), amount: 75, creditor: null, memo: 'Luxury tax' }
+  h.s.debtQueue = [
+    { debtor: h.id(0), amount: 10, creditor: h.id(1), memo: "Card: It's your birthday. Collect $10 from every player." },
+    { debtor: h.id(2), amount: 10, creditor: h.id(1), memo: "Card: It's your birthday. Collect $10 from every player." },
+  ]
+  h.s.phase = 'DEBT'
+  h.now(0)
+  h.ok(forfeitSeat(h.s, h.id(0), 'Asha left the party'), 'she walks out mid-prompt')
+  h.eq(h.s.debt != null && h.s.debt.debtor, h.id(2), 'the next queued debt activates')
+  h.eq(h.s.debt != null && h.s.debt.creditor, h.id(1), "the stranger's row keeps its creditor")
+  h.eq(h.s.debtQueue.length, 0, "her own queued row died with the seat")
+  h.eq(h.p(0).cash, 0, 'no payment ever left the wallet — the debt died with it')
+  h.eq(h.s.phase, 'DEBT', 'the relay continues without her')
+  h.eq(h.p(1).cash, 1500, 'the creditor still waits for Cho')
+  h.ok(h.act(2, { type: 'payDebt' }), 'Cho settles the woken row')
+  h.eq(h.p(1).cash, 1510, 'Ben finally collects the one live row')
 })
 
 // ── summary ──

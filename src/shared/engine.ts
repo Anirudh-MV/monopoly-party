@@ -129,28 +129,46 @@ export function createGame(players: PlayerMeta[], rng: () => number = Math.rando
 
 // ── Money flow ──
 
+// "Prompt before money leaves": a charge NEVER deducts cash on its own. It
+// always raises a pending debt with the reason preserved in the memo, so the
+// debtor's phone can show a Pay button that names the exact amount. When a
+// debt is already active, the new one queues behind it and activates through
+// resumeAfterDebt — the warning log belongs to that activation moment, never
+// to the queueing one.
 function charge(s: GameState, payer: PlayerState, amount: number, creditor: string | null, memo: string): void {
   if (amount <= 0) return
-  if (payer.cash >= amount) {
-    payer.cash -= amount
-    logMoney(s, payer.id, -amount, memo)
-    if (creditor) {
-      const c = R.byId(s, creditor)
-      if (c) {
-        c.cash += amount
-        logMoney(s, c.id, amount, `Received from ${payer.name}: ${memo}`)
-      }
-    }
+  const d: DebtState = { debtor: payer.id, amount, creditor, memo }
+  if (s.debt) {
+    s.debtQueue.push(d)
     return
   }
-  // Can't pay now — freeze the game until the debtor raises funds or goes bankrupt.
-  const d = { debtor: payer.id, amount, creditor }
-  if (s.debt) s.debtQueue.push(d)
-  else {
-    s.debt = d
-    s.phase = 'DEBT'
+  s.debt = d
+  s.phase = 'DEBT'
+  warnIfShort(s, d)
+}
+
+// The ⚠ line only fires when a debt becomes ACTIVE and the debtor genuinely
+// cannot cover it — they must raise funds, and the table should hear about it.
+function warnIfShort(s: GameState, d: DebtState): void {
+  const payer = R.byId(s, d.debtor)
+  if (!payer || payer.cash >= d.amount) return
+  log(s, `⚠ ${payer.name} owes $${d.amount}${d.creditor ? ` to ${R.byId(s, d.creditor)?.name}` : ' to the bank'} and must raise funds`, 'bad')
+}
+
+// The old instant path, kept ONLY for decisions whose buttons already named
+// the amount (income tax's flat/10% choice). Everything else routes through
+// the debt-always charge() above.
+function instantPay(s: GameState, payer: PlayerState, amount: number, creditor: string | null, memo: string): void {
+  if (amount <= 0) return
+  payer.cash -= amount
+  logMoney(s, payer.id, -amount, memo)
+  if (creditor) {
+    const c = R.byId(s, creditor)
+    if (c) {
+      c.cash += amount
+      logMoney(s, c.id, amount, `Received from ${payer.name}: ${memo}`)
+    }
   }
-  log(s, `⚠ ${payer.name} owes $${amount}${creditor ? ` to ${R.byId(s, creditor)?.name}` : ' to the bank'} and must raise funds`, 'bad')
 }
 
 // ── Phase bookkeeping ──
@@ -201,6 +219,9 @@ function resumeAfterDebt(s: GameState, rng: () => number): void {
   if (nextDebt) {
     s.debt = nextDebt
     s.phase = 'DEBT'
+    // the warning belongs to the moment the debt goes ACTIVE — charge()
+    // stayed silent when it was only queued behind another
+    warnIfShort(s, nextDebt)
     return
   }
   const auctionSpace = s.auctionQueue.shift()
@@ -772,13 +793,12 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
             releaseFromJail(s, p)
             p.jailRolls = 0
             log(s, `${p.name} failed 3 times — must pay the $${JAIL_FINE} fine`, 'bad')
+            // charge() always raises a debt now — the stroll is parked until
+            // the fine is settled by tap, by the clock, or by bankruptcy.
             charge(s, p, JAIL_FINE, null, 'Jail release fine')
-            if (s.debt) {
-              s.pendingMove = d1 + d2 // finish the move after the debt is settled
-              s.phase = 'DEBT'
-              return OK
-            }
-            advance(s, d1 + d2, rng)
+            s.pendingMove = d1 + d2 // finish the move after the debt is settled
+            s.phase = 'DEBT'
+            return OK
           } else {
             log(s, `${p.name} stays in jail (attempt ${p.jailRolls}/${MAX_JAIL_ATTEMPTS})`)
             s.phase = 'ACTION'
@@ -922,7 +942,10 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       const amount = a.choice === 'flat' ? sp.flat : Math.ceil(R.netWorth(s, by) / 10)
       s.pendingTax = null
       log(s, `${p.name} pays Income Tax (${a.choice === 'flat' ? 'flat' : '10% of worth'}): $${amount}`, 'money')
-      charge(s, p, amount, null, 'Income tax')
+      // The choice buttons already named the exact amount, so this is the one
+      // payment that may leave instantly — but only when the wallet covers it.
+      if (p.cash >= amount) instantPay(s, p, amount, null, 'Income tax')
+      else charge(s, p, amount, null, 'Income tax')
       advancePhase(s)
       return OK
     }
@@ -956,6 +979,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
       if (!d || d.debtor !== by) return fail('No debt to pay')
       if (p.cash < d.amount) return fail('Not enough cash yet — mortgage or sell below')
       const memo = d.memo ?? 'Debt settlement'
+      const blurb = d.memo ? R.debtBlurb(d) : null
       p.cash -= d.amount
       logMoney(s, by, -d.amount, memo)
       if (d.creditor) {
@@ -966,7 +990,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
         }
       }
       s.debt = null
-      log(s, `${p.name} pays the $${d.amount} they owed`, 'good')
+      log(s, blurb ? `${p.name} paid $${d.amount} — ${blurb}` : `${p.name} pays the $${d.amount} they owed`, 'good')
       resumeAfterDebt(s, rng)
       return OK
     }

@@ -217,6 +217,9 @@ export interface HostView {
   pendingPurchase: number | null
   pendingTax: { player: string; space: number } | null
   debt: DebtState | null
+  /** Debts queued behind the active one (relay cards, chained charges).
+   *  Ships to every screen so phones and the TV can show relay progress. */
+  debtQueue: DebtState[]
   winner: string | null
   trades: TradeOffer[]
   lastLanded: { playerId: string; space: number } | null

@@ -382,7 +382,17 @@ function currentDecision(s: GameState): Decision | null {
     if (s.pendingTax) return { key: `tax:${s.turn}`, playerId: s.currentPlayerId }
     return { key: `end:${s.turn}:${s.currentPlayerId}`, playerId: s.currentPlayerId }
   }
-  if (s.phase === 'DEBT' && s.debt) return { key: `debt:${s.turn}:${s.debt.debtor}`, playerId: s.debt.debtor }
+  if (s.phase === 'DEBT' && s.debt) {
+    const d = s.debt
+    // debtor AND creditor AND amount AND queue-depth in the key: a same-debtor
+    // relay (chairman paying each player) reuses one debtor+turn — with only
+    // those fields every relay row looked like the SAME decision, the timer
+    // never re-armed and later debts inherited an expired clock.
+    return {
+      key: `debt:${s.turn}:${d.debtor}:${d.creditor ?? 'bank'}:${d.amount}:${s.debtQueue.length}`,
+      playerId: d.debtor,
+    }
+  }
   if (s.phase === 'AUCTION' && s.auction) {
     // The bid and bidder are in the key so every new bid restarts the clock
     // — the hammer falls only after real silence, never mid-bidding-war.
@@ -415,18 +425,49 @@ function autoActionsFor(room: Room, d: Decision): Array<[string, Action]> {
   return []
 }
 
+// The single source of truth for the decision clock, pure so the remedy
+// checks can test it directly: which decision is ticking, whose hands are
+// tied, and how long it gets. null = no clock (nothing is blocking play, or
+// the host turned the timer off for a decision that isn't on a fixed clock).
+//
+// Two-tier debt clocks: an AFFORDABLE debt arms a fixed 30 seconds even when
+// the host clock is off — the money is sitting in the wallet, one tap away,
+// and a stalled phone must not stall the table. An UNAFFORDABLE debt stays
+// on the host clock and unarmed when the timer is off — the debtor can always
+// sell, mortgage or bankrupt themselves, and the watchdog remains
+// "nobody-can-act"-based rather than a debt-specific hammer.
+export function decisionFor(s: GameState, turnTimeoutMs: number): { key: string; playerId: string | null; ms: number } | null {
+  const decision = currentDecision(s)
+  if (!decision) return null
+  const key = decision.key
+  // Arrests and end-of-turn waits run on a fixed 30-second clock even when
+  // the host has disabled the general decision timer — they must never strand.
+  if (key.startsWith('jail:') || key.startsWith('end:')) return { ...decision, ms: 30_000 }
+  if (key.startsWith('debt:')) {
+    const d = s.debt
+    if (!d) return null
+    const debtor = s.players.find((q) => q.id === d.debtor)
+    if (debtor && debtor.cash >= d.amount) return { ...decision, ms: 30_000 }
+    if (turnTimeoutMs <= 0) return null
+    return { ...decision, ms: turnTimeoutMs }
+  }
+  if (turnTimeoutMs <= 0) return null
+  if (key.startsWith('auc:')) {
+    // Auctions: a generous opening window, then a short fuse that every bid
+    // resets.
+    const auctionIdle = s.auction != null && (s.auction.bidder != null || s.auction.bid > 0)
+    return { ...decision, ms: Math.min(turnTimeoutMs, auctionIdle ? AUCTION_IDLE_MS : AUCTION_OPEN_MS) }
+  }
+  return { ...decision, ms: turnTimeoutMs }
+}
+
 function scheduleDeadline(room: Room): void {
   const s = room.state
   if (!s) return
-  const decision = currentDecision(s)
-  // Arrests run on a fixed 30-second clock even when the host has disabled
-  // the general decision timer — the two-step arrest must never strand.
-  // End-of-turn waits get the same treatment: nobody should be able to sit
-  // on a finished turn forever.
-  const jailClock = decision != null && decision.key.startsWith('jail:')
-  const endClock = decision != null && decision.key.startsWith('end:')
-  if (!decision || (room.turnTimeoutMs <= 0 && !jailClock && !endClock)) {
-    // Host disabled the decision clock entirely (and no arrest/end wait is pending).
+  const decision = decisionFor(s, room.turnTimeoutMs)
+  if (!decision) {
+    // Host disabled the decision clock entirely (and no fixed-clock wait is
+    // pending), or nothing is blocking play.
     if (room.timer) clearTimeout(room.timer)
     room.timer = null
     room.timerKey = null
@@ -437,15 +478,7 @@ function scheduleDeadline(room: Room): void {
   if (room.timerKey === decision.key) return // already ticking for this decision
   if (room.timer) clearTimeout(room.timer)
   room.timerKey = decision.key
-  // Auctions: a generous opening window, then a short fuse that every bid
-  // resets. Arrest and end-turn: a fixed 30s. The rest run on the
-  // host-configured clock.
-  const auctionIdle = s.auction != null && (s.auction.bidder != null || s.auction.bid > 0)
-  const duration = jailClock ? 30_000
-    : endClock ? 30_000
-    : decision.key.startsWith('auc:')
-      ? Math.min(room.turnTimeoutMs, auctionIdle ? AUCTION_IDLE_MS : AUCTION_OPEN_MS)
-      : room.turnTimeoutMs
+  const duration = decision.ms
   s.deadline = Date.now() + duration
   s.deadlineFor = decision.playerId
   room.timer = setTimeout(() => {
@@ -762,11 +795,18 @@ function validateSnapshot(raw: unknown): RoomSnapshot | null {
       const amount = snapInt(q.amount, 1, 1_000_000_000)
       const creditor = q.creditor == null ? null : metas.has(snapStr(q.creditor, 64) ?? '') ? (q.creditor as string) : null
       if (debtor === null || amount === null) return null
-      return { debtor, amount, creditor }
+      // The memo rides along: with always-outflow debts the phone banner reads
+      // its reason from here. Anything that isn't a plain, bounded string
+      // (an object, a number, a 4KB blob) is dropped — the debt defaults to
+      // a generic blurb instead of ever rendering hostile input.
+      const memo = typeof q.memo === 'string' && q.memo.length > 0 && q.memo.length <= 120 ? q.memo : undefined
+      const d: DebtState = { debtor, amount, creditor }
+      if (memo !== undefined) d.memo = memo
+      return d
     }
     const debt = snapDebt(st.debt)
     if (debt === null && st.debt != null) return null
-    if (!Array.isArray(st.debtQueue) || st.debtQueue.length > 8) return null
+    if (!Array.isArray(st.debtQueue) || st.debtQueue.length > 16) return null
     const debtQueue: DebtState[] = []
     for (const x of st.debtQueue) {
       const dq = snapDebt(x)

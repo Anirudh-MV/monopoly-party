@@ -10,7 +10,7 @@ import QRCode from 'qrcode'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
 import { TOKENS } from '../../shared/tokens.js'
 import { avatarThumbnail } from '../tokens3d.js'
-import { rentFor, rentPreview } from '../../shared/rules.js'
+import { debtBlurb, rentFor, rentPreview } from '../../shared/rules.js'
 import type { ColorGroup, HostView, LobbyInfo, PlayerState, Space } from '../../shared/types.js'
 import { Board3D } from './board3d.js'
 import { announce, bruh, doublesStreak, heeHee, setVoiceEnabled, unlockAudio, voiceEnabled } from './voice.js'
@@ -328,9 +328,15 @@ function announceView(v: HostView): void {
     announce(`${nameOf(v.pendingJail.player)} is under arrest`)
   }
 
-  // rent owed by hand: "Ben owes Maya 24 dollars rent"
-  if (v.debt && v.debt.memo?.startsWith('Rent: ') && (!prev.debt || prev.debt.debtor !== v.debt.debtor)) {
-    announce(`${nameOf(v.debt.debtor)} owes ${v.debt.creditor ? nameOf(v.debt.creditor) : 'the bank'} $${v.debt.amount} rent`)
+  // a debt just went active — rent, taxes, card fees, the jail fine. Same
+  // dedup as before (debtor, amount or memo changed), minus the Rent-only
+  // filter: every prompt is spoken now, not just rents.
+  if (
+    v.debt &&
+    (!prev.debt || prev.debt.debtor !== v.debt.debtor || prev.debt.amount !== v.debt.amount || prev.debt.memo !== v.debt.memo)
+  ) {
+    const rent = v.debt.memo?.startsWith('Rent: ') ? `, ${debtBlurb(v.debt)}` : ''
+    announce(`${nameOf(v.debt.debtor)} owes ${v.debt.amount} dollars to ${v.debt.creditor ? nameOf(v.debt.creditor) : 'the bank'}${rent}`)
   }
 
   // game over
@@ -863,9 +869,19 @@ function updateCenter(v: HostView): void {
   if (v.debt) {
     const debtor = v.players.find((p) => p.id === v.debt?.debtor)
     const creditor = v.debt.creditor ? v.players.find((p) => p.id === v.debt?.creditor) : null
+    const name = esc(debtor?.name ?? '')
+    // The subline is affordability-aware: with cash in hand it's a tap away,
+    // only a short wallet is actually raising funds.
+    const affordable = debtor != null && debtor.cash >= v.debt.amount
+    const dq = v.debtQueue || []
+    const relayLine =
+      dq.length > 0
+        ? `<div class="sub">PAYING UP — ${name} pays ${creditor ? esc(creditor.name) : 'the bank'} $${v.debt.amount} (${1 + dq.filter((d) => d.creditor === v.debt?.creditor).length} of ${1 + dq.length} left)</div>`
+        : ''
     el.innerHTML = `
-      <div class="banner debt">${esc(debtor?.name ?? '')} owes $${v.debt.amount} to ${creditor ? esc(creditor.name) : 'the bank'}</div>
-      <div class="sub">${esc(debtor?.name ?? '')} is raising funds — selling houses, mortgaging…</div>`
+      <div class="banner debt">${name} owes $${v.debt.amount} to ${creditor ? esc(creditor.name) : 'the bank'}</div>
+      <div class="sub">${affordable ? `One tap on ${name}'s phone to pay` : `${name} is raising funds — selling houses, mortgaging…`}</div>
+      ${relayLine}`
     return
   }
 
