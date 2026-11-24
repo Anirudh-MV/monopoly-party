@@ -77,8 +77,13 @@ function labelTexture(sp: (typeof BOARD)[number], tileLabel: boolean, dark: bool
     }
     lines.push(cur.trim())
     ctx.fillStyle = ink
-    ctx.font = 'bold 30px Segoe UI, sans-serif'
-    lines.forEach((ln, k) => ctx.fillText(ln, 128, lines.length > 1 ? 40 + k * 34 : 46))
+    // long names (e.g. "JR Central - Nozomi Shinkansen") wrap to 3 lines —
+    // shrink the type and tighten the leading so the price keeps its spot
+    const nameFont = lines.length >= 3 ? 24 : 30
+    const lineH = lines.length >= 3 ? 26 : 34
+    const startY = lines.length >= 3 ? 32 : lines.length > 1 ? 40 : 46
+    ctx.font = `bold ${nameFont}px Segoe UI, sans-serif`
+    lines.forEach((ln, k) => ctx.fillText(ln, 128, startY + k * lineH))
     ctx.fillStyle = accent
     ctx.font = 'bold 26px Segoe UI, sans-serif'
     ctx.fillText(`$${sp.price}`, 128, 104)

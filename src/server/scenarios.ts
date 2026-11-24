@@ -192,7 +192,7 @@ scenario('income tax: flat $200 or 10% of total worth', 4, (h) => {
 scenario('auction: bids, invalid bids, passes, winner', 4, (h) => {
   h.now(0)
   h.p(0).pos = 3
-  h.roll(0, [[1, 1]]) // → 5 Reading, unowned
+  h.roll(0, [[1, 1]]) // → 5 JR East - Yamanote Line, unowned
   h.ok(h.act(0, { type: 'declineBuy' }), 'decline → auction')
   h.eq(h.s.phase, 'AUCTION', 'auction phase')
   h.ok(h.act(1, { type: 'bid', amount: 50 }), 'Ben bids $50')

@@ -19,7 +19,7 @@ export const ALL_CARDS: Card[] = [
   { id: 'ch10', deck: 'chance', text: 'Go directly to Jail.', effect: { kind: 'gotojail' } },
   { id: 'ch11', deck: 'chance', text: 'Make general repairs: pay $25 per house, $100 per hotel.', effect: { kind: 'repairs', perHouse: 25, perHotel: 100 } },
   { id: 'ch12', deck: 'chance', text: 'Speeding fine. Pay $15.', effect: { kind: 'pay', amount: 15 } },
-  { id: 'ch13', deck: 'chance', text: 'Take a trip to Reading Railroad.', effect: { kind: 'goto', target: 5 } },
+  { id: 'ch13', deck: 'chance', text: 'Take a trip to JR East - Yamanote Line.', effect: { kind: 'goto', target: 5 } },
   { id: 'ch14', deck: 'chance', text: 'Take a walk on the Boardwalk.', effect: { kind: 'goto', target: 39 } },
   { id: 'ch15', deck: 'chance', text: 'Elected Chairman of the Board. Pay each player $50.', effect: { kind: 'payEach', amount: 50 } },
   { id: 'ch16', deck: 'chance', text: 'Your building loan matures. Collect $150.', effect: { kind: 'money', amount: 150 } },

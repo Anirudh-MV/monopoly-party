@@ -1,55 +1,56 @@
 // ── Company registry (rails + utilities) ──
-// For each of the 6 company spaces, the FIRST web-search result's company
-// name for the query "{board name} company" (searched 2026-11-21).
-// The user will supply images later, keyed by `company` (or `space`);
-// drop them in `public/img/companies/` and set `image` below.
+// For each of the 6 company spaces, the real-world company the board space
+// is themed after (renamed 2026-11-24: railways to JR East / JR Central /
+// South Western Railway / Namma Metro, electric company to BESCOM).
+// The user will supply images later, keyed by `company` (or `space`); drop
+// them in `public/img/companies/` and set `image` below.
 
 export interface CompanyBrand {
   /** Board space index this company occupies */
   space: number
   /** Name as printed on the board */
   boardName: string
-  /** First search result's company name — stored verbatim */
+  /** The company the space is themed after */
   company: string
-  /** The exact query used */
+  /** The exact query used to find the company */
   query: string
-  /** Source URL of the first result */
+  /** Source URL for the company */
   source: string
-  /** Image path — set when the user provides artwork */
+  /** Image path - set when the user provides artwork */
   image: string | null
 }
 
 export const COMPANIES: CompanyBrand[] = [
   {
     space: 5,
-    boardName: 'Reading Railroad',
-    company: 'Reading Company',
-    query: 'Reading Railroad company',
-    source: 'https://readingrailroad.org/about-us',
+    boardName: 'JR East - Yamanote Line',
+    company: 'JR East',
+    query: 'JR East Yamanote Line',
+    source: 'https://www.jreast.co.jp/e/',
     image: null,
   },
   {
     space: 12,
-    boardName: 'Electric Company',
-    company: 'The Electric Company',
-    query: 'Electric Company company',
-    source: 'https://mkeelectriccompany.com',
+    boardName: 'BESCOM',
+    company: 'BESCOM',
+    query: 'BESCOM Bangalore electricity',
+    source: 'https://bescom.karnataka.gov.in',
     image: null,
   },
   {
     space: 15,
-    boardName: 'Pennsylvania Railroad',
-    company: 'Pennsylvania Railroad Company',
-    query: 'Pennsylvania Railroad company',
-    source: 'http://pennsylvania-railroad.com/history',
+    boardName: 'JR Central - Nozomi Shinkansen',
+    company: 'JR Central',
+    query: 'JR Central Nozomi Shinkansen',
+    source: 'https://global.jr-central.co.jp/en/',
     image: null,
   },
   {
     space: 25,
-    boardName: 'B&O Railroad',
-    company: 'Baltimore and Ohio Railroad',
-    query: 'B&O Railroad company',
-    source: 'https://sova.si.edu/record/nmah.ac.1086',
+    boardName: 'South Western Railway',
+    company: 'South Western Railway',
+    query: 'South Western Railway UK',
+    source: 'https://www.southwesternrailway.com',
     image: null,
   },
   {
@@ -62,10 +63,10 @@ export const COMPANIES: CompanyBrand[] = [
   },
   {
     space: 35,
-    boardName: 'Short Line',
-    company: 'Patriot Rail',
-    query: 'Short Line company',
-    source: 'https://patriotrail.com/about-us/',
+    boardName: 'Namma Metro',
+    company: 'Namma Metro',
+    query: 'Namma Metro Bangalore',
+    source: 'https://english.bmrc.co.in',
     image: null,
   },
 ]
