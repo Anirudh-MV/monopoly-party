@@ -59,9 +59,15 @@ body {
    head:   4.2vh ≈ 45px
    display: 7-12vh                        */
 
-/* theme toggle */
+/* TV corner controls — one fixed column, top right; buttons join the
+   stack automatically (no hand-tuned per-button tops). z-index 6 at
+   body level keeps them above #app (z1) and the god drawer (z7 inside
+   #app's context) so the God button stays the drawer's close toggle. */
+.cornerctl {
+  position: fixed; top: 2.8vh; right: 3vh; z-index: 6;
+  display: flex; flex-direction: column; align-items: stretch; gap: 1vh;
+}
 .themetoggle {
-  position: absolute; top: 2.8vh; right: 3vh; z-index: 6;
   background: var(--panel); color: var(--ink);
   border: 1px solid var(--line); border-radius: 1.2vh;
   min-height: 5.2vh; min-width: 5.2vh;

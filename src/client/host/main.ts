@@ -40,40 +40,42 @@ board3d.setTheme(theme)
 // first tap anywhere unlocks the TV's voice (browser autoplay policy)
 window.addEventListener('pointerdown', unlockAudio, { capture: true })
 
-// persistent theme toggle, outside #app so re-renders never destroy it
+// persistent corner controls, outside #app so re-renders never destroy
+// them. One fixed flex column — buttons join the stack automatically, no
+// hand-tuned per-button tops (that drift is what once piled them up).
+const corner = document.createElement('div')
+corner.className = 'cornerctl'
+document.body.appendChild(corner)
+
+// theme toggle
 const themeBtn = document.createElement('button')
 themeBtn.className = 'themetoggle'
-themeBtn.style.position = 'fixed'
 themeBtn.textContent = theme === 'light' ? 'Dark' : 'Light'
 themeBtn.addEventListener('click', () => {
   applyTheme(theme === 'light' ? 'dark' : 'light')
   themeBtn.textContent = theme === 'light' ? 'Dark' : 'Light'
 })
-document.body.appendChild(themeBtn)
+corner.appendChild(themeBtn)
 
 // the announcer toggle — speech narration + the card sounds
 const voiceBtn = document.createElement('button')
 voiceBtn.className = 'themetoggle voicetoggle'
-voiceBtn.style.position = 'fixed'
-voiceBtn.style.top = '4.5vh'
 voiceBtn.textContent = voiceEnabled() ? '🔊' : '🔇'
 voiceBtn.addEventListener('click', () => {
   setVoiceEnabled(!voiceEnabled())
   voiceBtn.textContent = voiceEnabled() ? '🔊' : '🔇'
 })
-document.body.appendChild(voiceBtn)
+corner.appendChild(voiceBtn)
 
 // god console toggle — the operator's emergency exit for mid-game trouble
 const godBtn = document.createElement('button')
 godBtn.className = 'themetoggle godtoggle'
-godBtn.style.position = 'fixed'
-godBtn.style.top = '9vh'
 godBtn.textContent = 'God'
 godBtn.addEventListener('click', () => {
   godOpen = !godOpen
   render()
 })
-document.body.appendChild(godBtn)
+corner.appendChild(godBtn)
 
 function sendGod(payload: Record<string, unknown>, onResult?: (res: Record<string, unknown>) => void): void {
   socket.emit('god:command', payload, (res: { ok: boolean; error?: string; snapshot?: unknown }) => {
