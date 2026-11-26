@@ -11,7 +11,7 @@ import { mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
 import * as fsp from 'node:fs/promises'
 import path from 'node:path'
 import type { Server as IOServer, Socket } from 'socket.io'
-import { applyAction, createGame, declareBankruptcy, forfeitEstate, type PlayerMeta, type Result } from '../shared/engine.js'
+import { applyAction, createGame, declareBankruptcy, forfeitEstate, MAX_GAME_LOG, type PlayerMeta, type Result } from '../shared/engine.js'
 import { ALL_CARDS } from '../shared/cards.js'
 import { hostView, playerView } from '../shared/views.js'
 import { allowedActions, alivePlayers, netWorth } from '../shared/rules.js'
@@ -349,6 +349,7 @@ export function forfeitSeat(s: GameState, pid: string, headline: string): Result
   if (!p) return { ok: false, error: 'Not in this game' }
   if (p.bankrupt) return { ok: false, error: 'Already bankrupt' }
   s.log.push({ text: headline, kind: 'bad' })
+  if (s.log.length > MAX_LOG) s.log.splice(0, s.log.length - MAX_LOG)
   if (s.phase === 'DEBT' && s.debt && s.debt.debtor === pid && s.debt.creditor != null) {
     // a walk-off win still reads like one, even when the lender gets paid
     return declareBankruptcy(s, p, true)
@@ -664,7 +665,7 @@ function loadSnapshots(): void {
 const SNAPSHOT_MAX_BYTES = 256 * 1024 // real snapshots top out around 20KB
 const MAX_OPEN_TRADES = 16
 const MAX_LEDGER = 600
-const MAX_LOG = 1000
+const MAX_LOG = MAX_GAME_LOG // must equal the engine's cap: a god export of any live game has to survive god import
 const PHASES = new Set(['LOBBY', 'ROLL', 'ACTION', 'AUCTION', 'DEBT', 'GAME_OVER'])
 const HEX_COLOR = /^#[0-9a-f]{6}$/i
 const CARD_IDS = new Set(ALL_CARDS.map((c) => c.id))
@@ -935,6 +936,7 @@ function validateSnapshot(raw: unknown): RoomSnapshot | null {
 
 function godLog(next: GameState, note: string): void {
   next.log.push({ text: `GOD: ${note}`, kind: 'info' })
+  if (next.log.length > MAX_LOG) next.log.splice(0, next.log.length - MAX_LOG)
 }
 
 function godMutate(io: IOServer, room: Room, note: string, fn: (s: GameState) => void): boolean {

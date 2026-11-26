@@ -418,6 +418,7 @@ try {
         },
       ],
       ['state with no players', { players: seats(2), state: bare({}) }],
+      ['1001 log entries', { players: seats(2), state: bare({ log: Array.from({ length: 1001 }, () => ({ text: 'x', kind: 'info' })) }) }],
     ]
     for (const [label, json] of tries) {
       const res = await emitAck(tvg, 'god:command', { cmd: 'import', json })
@@ -491,6 +492,45 @@ try {
     assert(mqueue[0] && mqueue[0].memo === 'Rent: Boardwalk', 'a clean memo survives byte-identical')
     assert(mqueue[1] && mqueue[1].memo === undefined, 'an oversized memo is defaulted away too')
     assert(alive(), 'server alive after the hostile debt memos')
+
+    // ── log cap alignment: the engine trims at MAX_GAME_LOG, so an
+    // exactly-at-cap log (what any long game now exports) must import
+    // cleanly — the round-trip the cap exists to guarantee.
+    const stPlayers = (cash) => [
+      { id: 'p0', cash, pos: 0, jail: false, jailRolls: 0, jailCards: 0, jailReason: null, bankrupt: false, connected: true },
+      { id: 'p1', cash, pos: 0, jail: false, jailRolls: 0, jailCards: 0, jailReason: null, bankrupt: false, connected: true },
+    ]
+    const lres = await emitAck(tvg, 'god:command', {
+      cmd: 'import',
+      json: {
+        players: [
+          { meta: { id: 'p0', name: 'Ann', color: '#000000', token: '🎩' }, token: 'tk0' },
+          { meta: { id: 'p1', name: 'Bob', color: '#111111', token: '🚗' }, token: 'tk1' },
+        ],
+        state: bare({
+          phase: 'ROLL',
+          players: stPlayers(1500),
+          pendingCard: null,
+          pendingCardDraw: null,
+          pendingJail: null,
+          pendingPurchase: null,
+          pendingTax: null,
+          pendingMove: null,
+          auction: null,
+          auctionQueue: [],
+          lastLanded: null,
+          lastMove: null,
+          deadline: null,
+          deadlineFor: null,
+          winner: null,
+          debt: null,
+          debtQueue: [],
+          log: Array.from({ length: 1000 }, () => ({ text: 'x', kind: 'info' })),
+        }),
+      },
+    })
+    assert(lres.ok, 'an exactly-at-cap log imports cleanly (export/import aligned)')
+    assert(alive(), 'server alive after the at-cap import')
     tvg.close()
   }
 

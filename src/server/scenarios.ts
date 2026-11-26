@@ -4,7 +4,7 @@
 // plays rigged dice through the real reducer, and asserts exact outcomes.
 // Run: npm run scenarios
 
-import { applyAction, createGame, forfeitEstate, type PlayerMeta, type Result } from '../shared/engine.js'
+import { applyAction, createGame, forfeitEstate, MAX_GAME_LOG, type PlayerMeta, type Result } from '../shared/engine.js'
 import { decisionFor, forfeitSeat } from './rooms.js'
 import { allowedActions, debtBlurb, rentFor, rentPreview } from '../shared/rules.js'
 import type { Action, DebtState, GameState, PlayerState, PropertyState } from '../shared/types.js'
@@ -1043,6 +1043,17 @@ scenario('exit with an unpaid bank prompt kills the debt and wakes the queue', 4
   h.eq(h.p(1).cash, 1500, 'the creditor still waits for Cho')
   h.ok(h.act(2, { type: 'payDebt' }), 'Cho settles the woken row')
   h.eq(h.p(1).cash, 1510, 'Ben finally collects the one live row')
+})
+
+scenario('the game log is capped so a god export always re-imports', 4, (h) => {
+  // A long 6-player game writes well over the import validator's limit,
+  // which made ordinary games impossible to export and import back. The
+  // engine now trims as it writes, oldest lines first.
+  h.s.log.push(...Array.from({ length: MAX_GAME_LOG + 5 }, (_, k) => ({ text: `filler ${k}`, kind: 'info' as const })))
+  h.roll(0, [[2, 3]]) // sum 5 → lands on the unowned first railroad — writes a line
+  h.eq(h.s.log.length, MAX_GAME_LOG, 'the log never grows past the cap')
+  h.eq(h.s.log[h.s.log.length - 1].text.includes('landed on unowned'), true, 'the newest line survived the trim')
+  h.eq(h.s.log[0].text.startsWith('filler'), true, 'the oldest lines were the ones dropped')
 })
 
 // ── summary ──

@@ -57,8 +57,16 @@ function roll1(rng: () => number): number {
   return 1 + Math.floor(rng() * 6)
 }
 
+// The game log is capped: god export/import round-trips must always work,
+// and the import validator refuses logs over MAX_LOG. An uncapped log made
+// ordinary long games (6 players, ~2h) impossible to re-import (panel
+// review, Nov 2026). The cap trims the OLDEST lines — views only ever
+// ship the last 40 anyway.
+export const MAX_GAME_LOG = 1000
+
 function log(s: GameState, text: string, kind: LogEntry['kind'] = 'info'): void {
   s.log.push({ text, kind })
+  if (s.log.length > MAX_GAME_LOG) s.log.splice(0, s.log.length - MAX_GAME_LOG)
 }
 
 // ── Money ledger ──
