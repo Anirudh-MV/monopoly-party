@@ -7,7 +7,7 @@
 
 import { io } from 'socket.io-client'
 import QRCode from 'qrcode'
-import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
+import { BOARD, GROUP_COLORS, groupIndices, isStreet } from '../../shared/board.js'
 import { TOKENS } from '../../shared/tokens.js'
 import { avatarThumbnail } from '../tokens3d.js'
 import { debtBlurb, rentFor } from '../../shared/rules.js'
@@ -666,11 +666,20 @@ function updateQueue(v: HostView): void {
     ${landedCompact(v)}`
 }
 
-// Left-flank ownership standings: per player (turn order, bankrupt last),
-// one dot per street colour group — filled with the group colour when
-// they hold ANY deed there — plus rail/bulb markers and the house count.
-// Pure HTML/CSS projection of the view; no server involvement.
+// ── holdings standings ──
+// Colour-blind ruling: never colour alone. Each group dot keeps its fill
+// but carries the deed COUNT ("2/3"; a hollow dot reads 0), and a
+// complete set goes bold. Pure HTML/CSS projection of the view; no
+// server involvement.
 const STREET_GROUPS = Object.keys(GROUP_COLORS) as ColorGroup[]
+
+// readable ink on any group colour (lightblue/yellow need dark text)
+function inkOn(hex: string): string {
+  const r = parseInt(hex.slice(1, 3), 16)
+  const g = parseInt(hex.slice(3, 5), 16)
+  const b = parseInt(hex.slice(5, 7), 16)
+  return 0.299 * r + 0.587 * g + 0.114 * b > 150 ? '#1c2333' : '#fff'
+}
 
 function standingsOrder(v: HostView): PlayerState[] {
   return [...turnQueue(v), ...v.players.filter((p) => p.bankrupt)]
@@ -684,14 +693,14 @@ function updateStandings(v: HostView): void {
       const mine = Object.entries(v.props)
         .map(([iStr, st]) => ({ i: Number(iStr), st }))
         .filter(({ st }) => st.owner === p.id)
-      const inGroup = (g: ColorGroup): boolean =>
-        mine.some(({ i }) => {
+      const dots = STREET_GROUPS.map((g) => {
+        const set = groupIndices(g)
+        const n = mine.filter(({ i }) => {
           const sp = BOARD[i]
           return isStreet(sp) && sp.group === g
-        })
-      const dots = STREET_GROUPS.map(
-        (g) => `<span class="sdot${inGroup(g) ? ' on' : ''}" style="--gc:${GROUP_COLORS[g]}"></span>`,
-      ).join('')
+        }).length
+        return `<span class="sdot${n > 0 ? ' on' : ''}${n === set.length ? ' full' : ''}" style="--gc:${GROUP_COLORS[g]}${n > 0 ? `;color:${inkOn(GROUP_COLORS[g])}` : ''}">${n}/${set.length}</span>`
+      }).join('')
       const marks =
         (mine.some(({ i }) => BOARD[i].kind === 'rail') ? '<span class="smark">🚂</span>' : '') +
         (mine.some(({ i }) => BOARD[i].kind === 'utility') ? '<span class="smark">💡</span>' : '') +
@@ -711,9 +720,35 @@ function updateStandings(v: HostView): void {
   el.innerHTML = `<div class="shead">HOLDINGS</div>${rows}`
 }
 
+// The decision-clock line — who the game waits on, honestly: with the
+// live countdown ONLY when a clock is armed, never a faked one when the
+// host timer is off. Auctions wait on everyone. It rides WITH the ticker
+// family (NOT .cornerctl — the fixed-flex-column ruling stands).
+function waitLineHTML(v: HostView): string {
+  const w = v.waitingOn
+  if (!w || v.phase === 'GAME_OVER') return ''
+  const name = w.playerId != null ? (v.players.find((p) => p.id === w.playerId)?.name ?? 'someone') : null
+  const who = name != null ? esc(name) : 'everyone'
+  const clock = v.deadline != null ? ' — <b class="cdval"></b>' : ''
+  return `<span class="t wait"${v.deadline != null ? ` id="tvWait" data-until="${v.deadline}"` : ''}>Waiting on ${who}${clock}</span>`
+}
+
+// The TV's live countdown tail — updates the armed clock in place
+// (pushes rebuild the line; between pushes it ticks).
+setInterval(() => {
+  const el = document.getElementById('tvWait')
+  if (!el) return
+  const until = Number(el.dataset.until ?? 0)
+  const rem = Math.max(0, Math.ceil((until - Date.now()) / 1000))
+  const b = el.querySelector('.cdval') as HTMLElement | null
+  if (b) b.textContent = `${Math.floor(rem / 60)}:${String(rem % 60).padStart(2, '0')}`
+  el.classList.toggle('urgent', rem <= 10)
+}, 250)
+
 function updateTicker(v: HostView): void {
   const el = document.getElementById('ticker')
   if (!el) return
+  const wait = waitLineHTML(v)
   // While a drawn card is in play, the bottom bar carries the whole story:
   // "Chance said: …" plus the landed property as a chip — price when
   // unowned, the live rent due when owned (never on a mortgaged deed).
@@ -731,11 +766,11 @@ function updateTicker(v: HostView): void {
       }
       propHTML = deedChip(v, i, { value })
     }
-    el.innerHTML = `<span class="t">${isChest ? 'Community Chest' : 'Chance'} said: ${esc(v.pendingCard.text)}</span>${propHTML}`
+    el.innerHTML = `${wait}<span class="t">${isChest ? 'Community Chest' : 'Chance'} said: ${esc(v.pendingCard.text)}</span>${propHTML}`
     return
   }
   const last = v.log[v.log.length - 1]
-  el.innerHTML = last ? `<span class="t ${last.kind}">${esc(last.text)}</span>` : ''
+  el.innerHTML = `${wait}${last ? `<span class="t ${last.kind}">${esc(last.text)}</span>` : ''}`
 }
 
 // Spotlight: what the active piece just landed on — the full deed with

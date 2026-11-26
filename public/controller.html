@@ -12,8 +12,9 @@
 <body>
   <div id="app"></div>
   <!-- The patch-managed layer: everything that must SURVIVE #app's wholesale
-       innerHTML rebuilds (the three sheets) mounts here. A sibling, not a
-       child — renderGame never touches it; updateChrome patches in place. -->
+       innerHTML rebuilds (the dock, the your-move bar, the open sheet)
+       mounts here. A sibling, not a child — renderGame never touches it;
+       updateChrome patches in place. -->
   <div id="chrome"></div>
   <script type="module" src="/controller.js"></script>
 </body>

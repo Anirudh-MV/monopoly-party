@@ -253,9 +253,19 @@ button:hover { filter: brightness(1.06); }
 .srow .sn { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .srow .sc { color: var(--money); flex: none; }
 .srow.dead { opacity: 0.45; }
-.sdots { display: inline-flex; gap: 0.5vh; flex: none; }
-.sdot { width: 1.9vh; height: 1.9vh; border-radius: 50%; border: 2px solid var(--line); display: inline-block; }
+.sdots { display: inline-flex; gap: 0.5vh; flex: none; flex-wrap: wrap; max-width: 46%; }
+/* count-in-dots (colour-blind ruling): every dot carries its deed count
+   ("2/3"; hollow reads 0) — colour AND count, never colour alone; a
+   complete set goes bold */
+.sdot {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 3.7vh; height: 2.4vh; padding: 0 0.5vh;
+  border-radius: 999px; border: 2px solid var(--line);
+  font-size: 1.55vh; font-weight: 700; color: var(--dim);
+  font-variant-numeric: tabular-nums; line-height: 1;
+}
 .sdot.on { background: var(--gc); border-color: var(--gc); }
+.sdot.full { font-weight: 800; outline: 2px solid var(--gc); outline-offset: 1px; }
 .smarks { display: inline-flex; gap: 0.5vh; flex: none; }
 .smark { font-size: 2.1vh; font-weight: 700; }
 
@@ -280,6 +290,12 @@ button:hover { filter: brightness(1.06); }
 .overlay.ticker .t.good { color: var(--good); }
 .overlay.ticker .t.bad { color: var(--bad); }
 .overlay.ticker .t.money { color: var(--money); }
+/* the decision-clock line: honest — a countdown only when a clock is
+   armed, plain when the host timer is off */
+.overlay.ticker .t.wait { color: var(--dim); font-variant-numeric: tabular-nums; }
+.overlay.ticker .t.wait b { color: var(--money); font-weight: 800; }
+.overlay.ticker .t.wait.urgent { color: var(--bad); }
+.overlay.ticker .t.wait.urgent b { color: var(--bad); }
 /* the landed-property chip inside the card ticker is the shared deed
    chip (deed.css) — the .tv root scales it with the vh convention */
 

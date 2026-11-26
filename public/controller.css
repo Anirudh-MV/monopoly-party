@@ -41,7 +41,10 @@ body {
   padding-bottom: env(safe-area-inset-bottom);
   transition: background 0.3s, color 0.3s;
 }
-#app { max-width: 520px; margin: 0 auto; padding: 10px 12px 40px; }
+/* a sheet owns the screen: the body behind it never scrolls */
+body[data-sheet] { overflow: hidden; }
+/* the fixed dock clears the flow: 56px + safe area (landscape shrinks it) */
+#app { max-width: 520px; margin: 0 auto; padding: 10px 12px calc(68px + env(safe-area-inset-bottom)); }
 
 /* join + lobby */
 .join { min-height: 90vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; }
@@ -137,8 +140,7 @@ button.disabled, button:disabled { opacity: 0.4; }
 .topbar .me { font-weight: 800; font-size: 17px; white-space: nowrap; max-width: 45%; overflow: hidden; text-overflow: ellipsis; }
 .topbar .money { font-size: 26px; font-weight: 800; color: var(--money-bright); margin-left: auto; white-space: nowrap; }
 .topbar .meta { color: var(--dim); font-size: 13px; order: 3; flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* the ☰ that replaced the old theme/Board/Exit topbar buttons */
-.topbar .menubtn { order: 4; min-height: 44px; min-width: 44px; font-size: 20px; padding: 4px 12px; border-radius: 10px; white-space: nowrap; flex-shrink: 0; line-height: 1; }
+/* the ☰ is gone: the dock at the bottom carries every tool now */
 
 /* banners */
 .banner { margin: 10px 0 4px; padding: 12px 14px; border-radius: 12px; font-size: 16px; font-weight: 600; }
@@ -205,15 +207,24 @@ main { display: block; }
 }
 .chip.sel { background: color-mix(in srgb, var(--accent) 22%, var(--panel)); border-color: var(--accent); }
 
-/* the one-time board discovery promo */
-button.boardpromo {
-  margin: 10px 0 4px;
-  background: color-mix(in srgb, var(--accent) 10%, var(--panel));
-  border: 2px solid var(--accent);
-  color: var(--accent);
-  font-weight: 700;
-  border-radius: 14px;
+/* the spectator countdown tail on waiting banners (someone else's
+   decision, honestly clocked only when a clock is armed) */
+.banner .wt { font-size: 0.82em; font-weight: 700; opacity: 0.75; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* ── the bystander dice strip — non-blocking awareness, in flow ── */
+.dice-strip {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 8px 0 0; padding: 8px 12px; border-radius: 12px;
+  background: var(--panel); border: 1px solid var(--line);
+  font-size: 14px; font-weight: 600;
 }
+.dice-strip .die.mini {
+  width: 28px; height: 28px; border-radius: 6px; flex: none;
+  box-shadow: inset 0 -2px 4px rgba(0, 0, 0, 0.12);
+}
+.dice-strip .die.mini .pip { width: 5px; height: 5px; }
+.dice-strip .ds-who b { font-weight: 800; }
+.dice-strip .ds-dbl { color: var(--money-bright); font-weight: 800; letter-spacing: 0.06em; }
 
 /* ── the table at a glance — every player's cash + deed chips ── */
 .table-sec .trow {
@@ -249,7 +260,10 @@ button.boardpromo {
 
 /* modal sheet — scoped to #chrome (the patch-managed layer, a sibling of
    #app): the sheets mount there and survive renderGame's wholesale
-   innerHTML rebuilds of $app. Sheets stay at z 20, same layer as ever. */
+   innerHTML rebuilds of $app. Sheets stay at z 20 — the dock (z 30)
+   floats above them so Board/Deeds stay tappable mid-sheet. The bottom
+   padding clears the dock (56px + safe area) so content never stops
+   behind it. */
 #chrome .modal {
   position: fixed; inset: 0; z-index: 20;
   background: rgba(10, 12, 20, 0.55); backdrop-filter: blur(3px);
@@ -259,9 +273,58 @@ button.boardpromo {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 20px 20px 0 0;
-  padding: 18px 16px calc(18px + env(safe-area-inset-bottom));
+  padding: 18px 16px calc(74px + env(safe-area-inset-bottom));
   width: 100%; max-width: 520px;
   max-height: 88vh; overflow-y: auto;
+}
+
+/* ── the dock (z 30 — above sheets, under the opaque board at 80) ──
+   Four permanent tools, fixed bottom, 56px + safe-area, 44px+ taps. */
+#dock {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
+  display: flex; gap: 8px; max-width: 540px; margin: 0 auto;
+  padding: 6px 10px calc(6px + env(safe-area-inset-bottom));
+}
+.dockbtn {
+  flex: 1 1 0; min-width: 0; min-height: 44px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  position: relative; padding: 4px 6px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  font-size: 11px; font-weight: 700; line-height: 1.2;
+}
+.dockbtn .db-ic { font-size: 17px; line-height: 1; }
+.dockbtn.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--panel)); }
+/* the freeze caption replaces the label when proposing is off (decline /
+   withdraw still work — those keep the button enabled) */
+.dockbtn.frozen .db-t { font-size: 8.5px; color: var(--dim); line-height: 1.25; }
+.dock-badge {
+  position: absolute; top: -7px; right: 0;
+  min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px;
+  background: var(--money-bright); color: #1c2333;
+  font-size: 11px; font-weight: 800; line-height: 18px; text-align: center;
+  border: 2px solid var(--bg);
+}
+.dock-badge.zero { display: none; }
+
+/* ── the your-move bar (z 82 — above the opaque board at 80, under the
+   confirm at 84): the escape hatch from any cover ── */
+#movebar {
+  position: fixed; left: 50%; transform: translateX(-50%);
+  bottom: calc(68px + env(safe-area-inset-bottom));
+  z-index: 82;
+  width: min(92vw, 508px); min-height: 44px;
+  background: var(--money-bright); color: #1c2333;
+  border: none; border-radius: 14px; box-shadow: var(--shadow);
+  font-size: 15px; font-weight: 800; padding: 10px 14px;
+  font-variant-numeric: tabular-nums;
+}
+#movebar.urgent { background: var(--bad); color: #fff; }
+
+/* the bar's landing: the action card pulses once (~600ms) */
+.card.pulse-card { animation: cardPulse 0.6s ease-out; }
+@keyframes cardPulse {
+  0%, 100% { box-shadow: none; }
+  50% { box-shadow: 0 0 0 3px var(--money-bright); border-color: var(--money-bright); }
 }
 
 /* ── card reveal: chest + wheel ── */
@@ -283,9 +346,10 @@ button.boardpromo {
 }
 /* the reveal box's content: chest/wheel animation + the shared card face */
 
-/* ── two-step exit confirmation ── */
+/* ── confirmations (two-step exit, action confirms, GO) — z 84, ABOVE the
+   roller's dice overlay at 70 so the GO prompt can never fire under it ── */
 .confirm-overlay {
-  position: fixed; inset: 0; z-index: 60;
+  position: fixed; inset: 0; z-index: 84;
   background: rgba(10, 12, 20, 0.72);
   display: flex; align-items: center; justify-content: center;
   animation: fadeIn 0.25s ease-out;
@@ -303,8 +367,8 @@ button.boardpromo {
 .confirm-body { font-size: 14px; color: var(--dim); line-height: 1.55; margin-bottom: 16px; }
 .confirm-step { margin-top: 14px; }
 
-/* ── the hamburger sheet (z 20 — same layer as every other sheet) ── */
-.menu-sheet { padding-top: 10px; }
+/* ── the More sheet (z 20 — same layer as every other sheet) ── */
+.more-sheet { padding-top: 10px; }
 .menu-item {
   display: block; width: 100%; text-align: left;
   min-height: 44px; padding: 8px 12px; margin: 2px 0;
@@ -314,8 +378,9 @@ button.boardpromo {
 .menu-item .mi-label { display: block; font-size: 16px; font-weight: 700; }
 .menu-item .mi-hint { display: block; font-size: 12px; font-weight: 500; color: var(--dim); margin-top: 1px; }
 .menu-sep { height: 1px; background: var(--line); margin: 8px 6px; }
-/* the red the old topbar Exit carried */
-.menu-item.danger { color: #e15b5b; }
+/* the danger row — var(--bad) passes AA on both themes (the old #e15b5b
+   is retired) */
+.menu-item.danger { color: var(--bad); }
 .menu-item.danger .mi-label { color: inherit; }
 
 /* ── pocket board ── */
@@ -488,12 +553,12 @@ button.boardpromo {
 .revealcard.chance-card { animation: cardRise 0.5s 1.9s ease-out forwards; }
 @keyframes cardRise { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
 
-/* toast */
+/* toast — 96, the top dog: always visible over everything */
 .toast {
   position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
   background: color-mix(in srgb, var(--bad) 16%, var(--panel)); color: var(--bad); border: 1px solid #d98080;
   padding: 12px 18px; border-radius: 12px; font-weight: 600;
-  z-index: 50; max-width: 90vw; text-align: center;
+  z-index: 96; max-width: 90vw; text-align: center;
   animation: rise 0.2s ease-out;
 }
 @keyframes rise { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
@@ -501,7 +566,8 @@ button.boardpromo {
 /* ── update prompt (fixed pill, undismissable until refresh) ── */
 .mp-updater {
   position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
-  z-index: 45; /* toasts stay king at 50 */
+  z-index: 45; /* the your-move bar (82) and confirmations (84) sit above
+     the pill — it never blocks a decision's escape hatch; toasts rule at 96 */
   background: var(--panel); border: 2px solid var(--money-bright);
   border-radius: 14px; padding: 12px 16px;
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
@@ -533,3 +599,30 @@ button.boardpromo {
 .playerlist .avathumb { height: 1.9em; width: 1.9em; vertical-align: -0.45em; }
 .deed-foot .avathumb { height: 1.5em; width: 1.5em; vertical-align: -0.3em; }
 .roll-who .avathumb { height: 1.35em; width: 1.35em; }
+.dice-strip .ds-who .avathumb { height: 1.5em; width: 1.5em; }
+
+/* ── landscape phones (max-height 420px): every control stays reachable ──
+   the exit-confirm's buttons used to clip unreachable at the bottom; the
+   boxes scroll now, the dock shrinks to 48px, the bar to 40px. */
+@media (max-height: 420px) {
+  .confirm-box, .reveal-box { max-height: 92vh; overflow-y: auto; }
+  #dock { padding: 4px 10px calc(4px + env(safe-area-inset-bottom)); gap: 6px; }
+  .dockbtn { min-height: 40px; }
+  #movebar { min-height: 40px; font-size: 14px; padding: 8px 12px; bottom: calc(56px + env(safe-area-inset-bottom)); }
+}
+
+/* ── reduced motion: collapse the decorative keyframes to a no-op.
+   The dice paths also settle immediately in JS (showRollOverlay), the
+   board3d camera snaps instead of easing, and the your-move bar's scroll
+   jumps instead of gliding. */
+@media (prefers-reduced-motion: reduce) {
+  .reveal-overlay, .confirm-overlay, .propinfo-overlay, .roll-overlay, .toast,
+  .revealcard.chest-card, .revealcard.chance-card,
+  .die.tumbling, .die.settled,
+  .money-float, .chestlid, .wheeldisc,
+  .deadline.urgent, .card.pulse-card {
+    animation-duration: 0.01s !important;
+    animation-delay: 0s !important;
+    animation-iteration-count: 1 !important;
+  }
+}

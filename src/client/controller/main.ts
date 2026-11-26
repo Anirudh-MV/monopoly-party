@@ -25,7 +25,7 @@ import {
   rentPreview,
   unmortgageCost,
 } from '../../shared/rules.js'
-import type { Action, Card, ColorGroup, LobbyInfo, PlayerView, Space, TradeOffer, TradeSide } from '../../shared/types.js'
+import type { Action, Card, ColorGroup, LobbyInfo, PlayerView, Space, TradeOffer, TradeSide, WaitingKind } from '../../shared/types.js'
 
 interface JoinAck {
   ok: boolean
@@ -52,15 +52,19 @@ type Theme = 'light' | 'dark'
 let theme: Theme = (localStorage.getItem('mp-theme') as Theme | null) ?? 'light'
 document.documentElement.dataset.theme = theme
 
+// ── the attention ding's on/off (persisted per browser) ──
+let dingOn = (localStorage.getItem('mp-ding') ?? '1') !== '0'
+
 let view: PlayerView | null = null
 let lobby: LobbyInfo | null = null
 let myName = ''
 let myToken: string | null = localStorage.getItem('mp-token')
 let myPlayerId: string | null = localStorage.getItem('mp-playerid')
 
-// Trade composer state survives re-renders (views arrive after every action).
+// Trade composer state survives re-renders AND sheet closes: a view push
+// patches the open sheet in place (inputs untouched), and closing it only
+// hides the draft — reopening shows it exactly as it was left.
 interface Composer {
-  open: boolean
   partner: string
   giveCash: number
   giveSpaces: number[]
@@ -71,10 +75,30 @@ interface Composer {
 }
 let composer: Composer | null = null
 
-// Hamburger menu + View-properties screen are module-level UI state, re-emitted
-// inside $app on every render (composer precedent) so they survive view pushes.
-let menuOpen = false
-let deedsOpen = false
+// ── the sheet system ──
+// ONE sheet at a time (the pocket board is deliberately NOT a sheet —
+// it is the full-screen WebGL overlay with its own toolbar). Every close
+// funnels through closeSheet(): the ✕, the backdrop, Escape, Android
+// back and the Leave teardown are one code path, so none can double-fire.
+// The chrome patcher mounts/patches (never rebuilds) whichever sheet is
+// open — the composer's input-survival guarantee rides on that.
+type SheetKind = 'deeds' | 'more' | 'composer'
+const SHEET_KINDS: readonly SheetKind[] = ['deeds', 'more', 'composer']
+const SHEET_IDS: Record<SheetKind, string> = { deeds: 'chromeDeeds', more: 'chromeMore', composer: 'chromeComposer' }
+const SHEET_CLASSES: Record<SheetKind, string> = { deeds: 'deeds-sheet', more: 'more-sheet', composer: '' }
+const SHEET_CLOSE_ACTS: Record<SheetKind, string> = { deeds: 'closeDeeds', more: 'closeMore', composer: 'closeTrade' }
+const SHEET_LABELS: Record<SheetKind, string> = {
+  deeds: 'Title deeds',
+  more: 'More tools',
+  composer: 'Propose a trade',
+}
+let sheet: SheetKind | null = null
+// who had focus before the sheet opened (restored on close)
+let sheetFocusSaved: HTMLElement | null = null
+// true while our own history.back() is consuming the pushed sheet entry —
+// the popstate handler recognises its own pop and stands down
+let popGuard = false
+
 // Deed grid filters: owner is 'ALL' | 'UNOWNED' | a playerId; kind is 'ALL' |
 // a color-group key | 'rail' | 'utility'. Both single-select, AND-combined.
 let deedFilters = { owner: 'ALL' as string, kind: 'ALL' as string }
@@ -128,17 +152,110 @@ function toast(msg: string): void {
   setTimeout(() => t.remove(), 2600)
 }
 
-// Deadline chip ticker — updates the countdown in place so a running
-// timer never re-renders (and never steals focus from inputs).
+// Countdown ticker — updates every countdown surface in place so a
+// running timer never re-renders (and never steals focus from inputs).
+// Three surfaces share it: the last-30s own-decision chip, the your-move
+// bar's tail, and the spectator banner tail.
+function clockFmt(rem: number): string {
+  return `${Math.floor(rem / 60)}:${String(rem % 60).padStart(2, '0')}`
+}
 setInterval(() => {
-  const el = document.getElementById('deadlineChip') as HTMLElement | null
-  if (!el) return
-  const until = Number(el.dataset.until ?? 0)
-  const rem = Math.max(0, Math.ceil((until - Date.now()) / 1000))
-  const span = el.querySelector('span')
-  if (span) span.textContent = `${rem}s`
-  el.classList.toggle('urgent', rem <= 10)
+  const tick = (id: string, fmt: (rem: number) => string): void => {
+    const el = document.getElementById(id) as HTMLElement | null
+    if (!el) return
+    const until = Number(el.dataset.until ?? 0)
+    const rem = Math.max(0, Math.ceil((until - Date.now()) / 1000))
+    const span = el.querySelector('span') ?? el
+    span.textContent = fmt(rem)
+    // the last-10s urgency marks the whole control (the bar button, the chip)
+    ;(el.closest('button') ?? el).classList.toggle('urgent', rem <= 10)
+  }
+  tick('deadlineChip', (r) => `${r}s`)
+  tick('barCount', (r) => ` — ${r}s`)
+  tick('waitTail', (r) => ` — ${clockFmt(r)}`)
 }, 250)
+
+// ── the sheet system's one open / one close path ──
+
+// Open a sheet. Opening one closes another: the pushed history entry is
+// REPLACED on a switch (still exactly one entry to pop on close) and
+// PUSHED on a fresh open — always the same URL, so the update pill and
+// the ?code= prefill are untouched. Mounting (inside updateChrome) does
+// the open-time side effects: focus capture, scroll lock, first control.
+function openSheet(kind: SheetKind): void {
+  if (sheet === kind) return
+  const switching = sheet != null
+  sheet = kind
+  if (switching) history.replaceState({ mpSheet: kind }, '', location.href)
+  else history.pushState({ mpSheet: kind }, '', location.href)
+  updateChrome(view)
+}
+
+// THE one close path. The composer's draft survives (hide, never lose).
+// The pushed history entry is consumed exactly once: a UI close pops it
+// via history.back() (the popstate handler recognises its own pop), a
+// real Android back has already popped it — history.state no longer
+// carries mpSheet, so no second back fires.
+function closeSheet(): void {
+  if (!sheet) return
+  const el = document.getElementById(SHEET_IDS[sheet])
+  sheet = null
+  delete document.body.dataset.sheet
+  const saved = sheetFocusSaved
+  sheetFocusSaved = null
+  el?.remove()
+  composerSigLast = ''
+  deedsSigLast = ''
+  if (saved && saved.isConnected) saved.focus()
+  const st = history.state as { mpSheet?: string } | null
+  if (st?.mpSheet && !popGuard) {
+    popGuard = true
+    history.back()
+  }
+  updateDock(view)
+  updateMoveBar(view)
+}
+
+// Android back / browser back: the popstate is either our own pop (the
+// sheet is already closed — stand down) or the user's (close, exactly once).
+window.addEventListener('popstate', (ev) => {
+  if (popGuard) {
+    popGuard = false
+    return
+  }
+  if (sheet && !(ev.state as { mpSheet?: string } | null)?.mpSheet) closeSheet()
+})
+
+// Dialog keyboard semantics: Escape closes (one path — closeSheet), and
+// Tab / Shift-Tab cycle within the open sheet. The dock sits ABOVE sheets
+// but outside the cycle: the sheet is the dialog, the dock is furniture.
+// A body-level overlay stacked above (confirm, reveal, propinfo, the
+// roller, the board) owns the screen instead — Escape stands down.
+document.addEventListener('keydown', (ev) => {
+  if (!sheet) return
+  if (document.querySelector('.confirm-overlay, .reveal-overlay, .propinfo-overlay, .roll-overlay, .board-overlay')) return
+  if (ev.key === 'Escape') {
+    closeSheet()
+    return
+  }
+  if (ev.key !== 'Tab') return
+  const el = document.getElementById(SHEET_IDS[sheet])
+  if (!el) return
+  const focusables = [...el.querySelectorAll<HTMLElement>('button:not([disabled]), input, select, textarea, [href]')].filter(
+    (n) => n.offsetParent != null,
+  )
+  if (focusables.length === 0) return
+  const first = focusables[0]!
+  const last = focusables[focusables.length - 1]!
+  const active = document.activeElement as HTMLElement | null
+  if (ev.shiftKey && (!el.contains(active) || active === first)) {
+    ev.preventDefault()
+    last.focus()
+  } else if (!ev.shiftKey && (!el.contains(active) || active === last)) {
+    ev.preventDefault()
+    first.focus()
+  }
+})
 
 // ── card reveal overlay (chest opens / wheel spins) ──
 
@@ -241,10 +358,10 @@ function performExit(): void {
 // Seat gone (leave, kick, room closed): every screen-local state must go
 // back to cold. A rejoin's first view is then a fresh baseline — the old
 // roll machine must not replay the previous seat's last roll, and a dead
-// sheet must not greet the join screen.
+// sheet must not greet the join screen. closeSheet funnels the teardown
+// (DOM, scroll lock, focus, the pushed history entry).
 function resetScreenStates(): void {
-  menuOpen = false
-  deedsOpen = false
+  closeSheet()
   deedFilters = { owner: 'ALL', kind: 'ALL' }
   rollSeen = false
   rollKey = ''
@@ -338,8 +455,13 @@ function showRenameEditor(current: string): void {
 
 // ── the dice roll moment ──
 // Every phone at the table plays the roll together, in sync with the TV's
-// suspense beat: the dice tumble for the TV's 1150ms hold, settle on the
-// real values, and only then does the landing underneath get revealed.
+// suspense beat — but SPLIT by role since the dock round: the roller keeps
+// the full overlay (tap anywhere settles the faces and dismisses — the
+// taps lost to the overlay become intentional skips), while everyone else
+// gets a small NON-BLOCKING strip under the banner: two mini faces, who
+// rolled what, DOUBLES where applicable, gone at the same ~2.6s. No
+// countdown on the strip — it is awareness, the your-move bar is pressure
+// — and the screen stays fully tappable, so a bid mid-roll must land.
 //
 // The roll state machine (council ruling, replaces the old lastRollKey
 // dedupe): dice are a NEW roll only when they first appear (the previous
@@ -352,6 +474,34 @@ let rollKey = ''
 let rollPrevHadDice = false
 let rollPrevPhase: PlayerView['phase'] | '' = ''
 let rollSeen = false
+
+// The bystander strip re-emits inside the main template for its lifetime,
+// so a view push mid-strip rebuilds it instead of orphaning it.
+let diceStrip: { html: string; until: number } | null = null
+
+function diceStripHTML(v: PlayerView, until: number): string {
+  const roller = v.players.find((p) => p.id === v.currentPlayerId)
+  const d1 = v.dice?.[0] ?? 1
+  const d2 = v.dice?.[1] ?? 1
+  return `<div class="dice-strip" role="status" data-until="${until}">
+    <span class="die mini">${pipsFor(d1)}</span><span class="die mini">${pipsFor(d2)}</span>
+    <span class="ds-who">${avathumb(roller)}<b>${esc(roller?.name ?? 'Someone')}</b> rolled ${d1 + d2}</span>
+    ${d1 === d2 ? '<span class="ds-dbl">DOUBLES!</span>' : ''}
+  </div>`
+}
+
+function showDiceStrip(v: PlayerView): void {
+  const until = Date.now() + 2600
+  diceStrip = { html: diceStripHTML(v, until), until }
+  document.querySelectorAll('.dice-strip').forEach((n) => n.remove())
+  $app.querySelector('.banner')?.insertAdjacentHTML('afterend', diceStrip.html)
+  setTimeout(() => {
+    document.querySelectorAll('.dice-strip').forEach((n) => {
+      if (Number((n as HTMLElement).dataset.until ?? 0) <= Date.now() + 50) n.remove()
+    })
+    if (diceStrip && Date.now() >= diceStrip.until) diceStrip = null
+  }, 2600)
+}
 
 const rollKeyOf = (v: PlayerView): string =>
   v.dice ? `${v.turn}:${v.currentPlayerId}:${v.dice.join(',')}` : ''
@@ -384,15 +534,20 @@ function pipsFor(n: number): string {
 }
 
 function showRollOverlay(v: PlayerView): void {
-  const roller = v.players.find((p) => p.id === v.currentPlayerId)
-  const mine = v.currentPlayerId === v.you
+  // the role split happens here, AFTER the gate: bystanders never get the
+  // blocking overlay at all
+  if (v.currentPlayerId !== v.you) {
+    showDiceStrip(v)
+    return
+  }
   const d1 = v.dice?.[0] ?? 1
   const d2 = v.dice?.[1] ?? 1
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches
   const overlay = document.createElement('div')
   overlay.className = 'roll-overlay'
   overlay.innerHTML = `
-    <div class="roll-box${mine ? ' mine' : ''}">
-      <div class="roll-who">${mine ? 'You roll!' : `${avathumb(roller)}${esc(roller?.name ?? 'Someone')} rolls`}</div>
+    <div class="roll-box mine">
+      <div class="roll-who">You roll!</div>
       <div class="dice-row">
         <div class="die tumbling"></div>
         <div class="die tumbling"></div>
@@ -403,15 +558,12 @@ function showRollOverlay(v: PlayerView): void {
   const [dieA, dieB] = [...overlay.querySelectorAll('.die')] as HTMLElement[]
   const total = overlay.querySelector('.roll-total') as HTMLElement
 
-  // tumbling faces, swapping fast — the anticipation phase
-  const tumbler = setInterval(() => {
-    dieA.innerHTML = pipsFor(1 + Math.floor(Math.random() * 6))
-    dieB.innerHTML = pipsFor(1 + Math.floor(Math.random() * 6))
-  }, 90)
-
-  // the TV's dice hold is 1150ms; settle when it does
-  setTimeout(() => {
-    clearInterval(tumbler)
+  let settled = false
+  let tumbler: ReturnType<typeof setInterval> | null = null
+  const settle = (): void => {
+    if (settled) return
+    settled = true
+    if (tumbler != null) clearInterval(tumbler)
     dieA.innerHTML = pipsFor(d1)
     dieB.innerHTML = pipsFor(d2)
     dieA.classList.remove('tumbling')
@@ -419,9 +571,32 @@ function showRollOverlay(v: PlayerView): void {
     dieA.classList.add('settled')
     dieB.classList.add('settled')
     total.textContent = `${d1} + ${d2} = ${d1 + d2}${d1 === d2 ? ' — DOUBLES!' : ''}`
-  }, 1150)
+  }
+
+  if (reduced) {
+    // reduced motion: no tumbling — the faces settle at once and the
+    // overlay is pure awareness, gone at ~600ms
+    settle()
+    setTimeout(() => overlay.remove(), 600)
+    return
+  }
+
+  // tumbling faces, swapping fast — the anticipation phase
+  tumbler = setInterval(() => {
+    dieA.innerHTML = pipsFor(1 + Math.floor(Math.random() * 6))
+    dieB.innerHTML = pipsFor(1 + Math.floor(Math.random() * 6))
+  }, 90)
+
+  // the TV's dice hold is 1150ms; settle when it does
+  setTimeout(settle, 1150)
   // the piece on the TV has (mostly) arrived by now — show the landing
   setTimeout(() => overlay.remove(), 2600)
+  // the roller's taps are intentional skips: tap anywhere settles the
+  // faces instantly and dismisses
+  overlay.addEventListener('click', () => {
+    settle()
+    setTimeout(() => overlay.remove(), 350)
+  })
 }
 
 // ── wallet pulse ──
@@ -459,12 +634,10 @@ function animateMoney(from: number, to: number): void {
 // pinch to zoom, and the view stays exactly where you leave it. Reset
 // snaps back to the whole-board overview, Follow re-pins to the action,
 // Close returns to the controller. It stays live with the game while open.
+// The dock's Board button is the permanent entry point — discovery is
+// structural now, no one-time promo needed.
 let phoneBoard: Board3D | null = null
 
-// One-time discovery: playtesters never found the Board button, so
-// the first game view gets a full-width promo above the action cards.
-// Opening the board (promo or menu) retires it forever, per browser.
-const BOARD_PROMO_FLAG = 'mp-board-promo'
 // Persisted single-finger gesture verb for the pocket board: 'pan' (map-style
 // lateral drag, the default) or 'orbit'. Stored per browser.
 const GESTURE_FLAG = 'mp-board-gesture'
@@ -473,7 +646,6 @@ const gestureLabel = (m: GestureMode): string => (m === 'pan' ? '✋ Pan' : '�
 
 function showBoard(): void {
   if (!view) return
-  localStorage.setItem(BOARD_PROMO_FLAG, '1')
   closeBoard()
   const mode: GestureMode = localStorage.getItem(GESTURE_FLAG) === 'orbit' ? 'orbit' : 'pan'
   const overlay = document.createElement('div')
@@ -643,7 +815,7 @@ function ding(): void {
 
 function maybeDing(v: PlayerView): void {
   const key = (v.allowed || []).join(',')
-  if (dingArmed && key.length > 0 && key !== prevAllowedKey) ding()
+  if (dingArmed && dingOn && key.length > 0 && key !== prevAllowedKey) ding()
   prevAllowedKey = key
   dingArmed = true
 }
@@ -768,8 +940,7 @@ socket.on('lobby', (l: LobbyInfo) => {
   view = null
   rejoinPending = false
   // screen transition: the game-only sheets die with the game view
-  menuOpen = false
-  deedsOpen = false
+  if (sheet) closeSheet()
   render()
 })
 
@@ -819,10 +990,9 @@ socket.on('view', (v: PlayerView) => {
   lobby = null
   rejoinPending = false
   // entering the game from the lobby/join screen: sheets start closed;
-  // view pushes DURING the game re-emit them, so they survive updates
+  // view pushes DURING the game keep whichever sheet is open, patched
   if (enteringGame) {
-    menuOpen = false
-    deedsOpen = false
+    if (sheet) closeSheet()
     deedFilters = { owner: 'ALL', kind: 'ALL' }
   }
 
@@ -871,13 +1041,22 @@ function onActionClick(ev: MouseEvent): void {
   const args = JSON.parse(el.dataset.args ?? '{}') as Record<string, unknown>
 
   switch (act) {
-    case 'theme':
-      menuOpen = false // theme rides the menu sheet: close it before dispatch
+    case 'theme': {
       theme = theme === 'light' ? 'dark' : 'light'
       localStorage.setItem('mp-theme', theme)
       document.documentElement.dataset.theme = theme
-      render()
+      // imperative: the More sheet's label patches in place, nothing re-renders
+      const label = document.querySelector('[data-mi="theme"]') as HTMLElement | null
+      if (label) label.textContent = theme === 'light' ? '🌙 Dark theme' : '☀️ Light theme'
       break
+    }
+    case 'dingToggle': {
+      dingOn = !dingOn
+      localStorage.setItem('mp-ding', dingOn ? '1' : '0')
+      const label = document.querySelector('[data-mi="ding"]') as HTMLElement | null
+      if (label) label.textContent = dingOn ? '🔔 Sound ding on' : '🔇 Sound ding off'
+      break
+    }
     case 'joinNext': {
       const code = (document.getElementById('code') as HTMLInputElement).value.trim().toUpperCase()
       const name = stripEmoji((document.getElementById('name') as HTMLInputElement).value)
@@ -1017,14 +1196,11 @@ function onActionClick(ev: MouseEvent): void {
       break
     }
     case 'leave': {
-      // Both exits (lobby "Leave room" and the menu's "Leave the game")
-      // start the same two-step confirmation — see showExitConfirm. From
-      // the menu the sheet must be torn down FIRST, or it lingers (dead,
-      // screen-blocking) under the confirm overlay's step-1 backdrop.
-      if (menuOpen) {
-        menuOpen = false
-        render()
-      }
+      // Both exits (lobby "Leave room" and the More sheet's "Leave the
+      // game") start the same two-step confirmation — see showExitConfirm.
+      // The sheet closes FIRST (the funneled closeSheet), so it can never
+      // linger dead under the confirm overlay's step-1 backdrop.
+      if (sheet) closeSheet()
       showExitConfirm(1)
       break
     }
@@ -1033,44 +1209,44 @@ function onActionClick(ev: MouseEvent): void {
       break
     }
     case 'showBoard': {
-      menuOpen = false // showBoard re-renders through closeBoard — the sheet dies with it
+      // the board is NOT a sheet: it overlays everything, and whatever
+      // sheet was open simply waits underneath (unchanged, still patched)
       showBoard()
       break
     }
-    case 'menu': {
-      menuOpen = !menuOpen
-      render()
+    case 'openMore': {
+      if (sheet === 'more') closeSheet() // the dock toggles its sheet
+      else openSheet('more')
       break
     }
-    case 'closeMenu': {
-      menuOpen = false
-      render()
-      break
-    }
+    case 'closeMore': closeSheet(); break
     case 'openDeeds': {
-      // fresh defaults every open (table rows pass their player as owner)
+      // plain open (dock) starts from default filters; table rows pass
+      // their player as the owner filter
+      if (sheet === 'deeds' && !args.owner) {
+        closeSheet()
+        break
+      }
       deedFilters = { owner: args.owner ? String(args.owner) : 'ALL', kind: 'ALL' }
-      deedsOpen = true
-      menuOpen = false
-      render()
+      openSheet('deeds')
       break
     }
-    case 'closeDeeds': deedsOpen = false; render(); break
+    case 'closeDeeds': closeSheet(); break
     case 'deedOwner': {
       const owner = String(args.owner)
       deedFilters = { ...deedFilters, owner: deedFilters.owner === owner ? 'ALL' : owner }
-      render()
+      updateChrome(view)
       break
     }
     case 'deedKind': {
       const kind = String(args.kind)
       deedFilters = { ...deedFilters, kind: deedFilters.kind === kind ? 'ALL' : kind }
-      render()
+      updateChrome(view)
       break
     }
     case 'deedClearFilters':
       deedFilters = { owner: 'ALL', kind: 'ALL' }
-      render()
+      updateChrome(view)
       break
     case 'roll': send({ type: 'roll' }); break
     case 'drawCard': send({ type: 'drawCard' }); break
@@ -1126,18 +1302,24 @@ function onActionClick(ev: MouseEvent): void {
     case 'openTrade': {
       const v = view
       if (!v) return
-      const partners = v.players.filter((p) => !p.bankrupt && p.id !== v.you)
-      if (partners.length === 0) return toast('Nobody to trade with!')
-      composer = {
-        open: true,
-        partner: String(args.partner ?? partners[0]?.id ?? ''),
-        giveCash: 0, giveSpaces: [], giveJail: 0,
-        recvCash: 0, recvSpaces: [], recvJail: 0,
+      // the dock toggles its sheet; a half-built draft reopens intact
+      if (sheet === 'composer') {
+        closeSheet()
+        break
       }
-      render()
+      if (!composer) {
+        const partners = v.players.filter((p) => !p.bankrupt && p.id !== v.you)
+        if (partners.length === 0) return toast('Nobody to trade with!')
+        composer = {
+          partner: partners[0]?.id ?? '',
+          giveCash: 0, giveSpaces: [], giveJail: 0,
+          recvCash: 0, recvSpaces: [], recvJail: 0,
+        }
+      }
+      openSheet('composer')
       break
     }
-    case 'closeTrade': composer = null; render(); break
+    case 'closeTrade': closeSheet(); break // hide, never lose — the draft stays
     case 'sendTrade': {
       if (!composer) return
       const give: TradeSide = { cash: Math.max(0, Math.floor(composer.giveCash)), spaces: composer.giveSpaces, jailCards: composer.giveJail }
@@ -1145,9 +1327,28 @@ function onActionClick(ev: MouseEvent): void {
       if (give.cash === 0 && give.spaces.length === 0 && give.jailCards === 0 && receive.cash === 0 && receive.spaces.length === 0 && receive.jailCards === 0) {
         return toast('Offer something!')
       }
-      send({ type: 'proposeTrade', to: composer.partner, give, receive })
-      composer = null
-      render()
+      if (!ensureConnected()) return
+      // the draft is only spent when the server accepts it — a refusal
+      // (freeze, vanished partner) keeps the composer open, intact
+      socket.emit('game:action', { type: 'proposeTrade', to: composer.partner, give, receive }, (res: { ok: boolean; error?: string }) => {
+        if (!res.ok) return toast(res.error ?? 'Not allowed right now')
+        composer = null
+        if (sheet === 'composer') closeSheet()
+      })
+      break
+    }
+    case 'barJump': {
+      // the your-move bar's tap: close whatever covers the action card,
+      // then jump to it and pulse it (~600ms)
+      if (phoneBoard) closeBoard() // re-renders the main flow underneath
+      if (sheet) closeSheet()
+      requestAnimationFrame(() => {
+        const card = (document.querySelector('main .card.actions') ?? document.querySelector('main .card')) as HTMLElement | null
+        if (!card) return
+        card.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'center' })
+        card.classList.add('pulse-card')
+        setTimeout(() => card.classList.remove('pulse-card'), 650)
+      })
       break
     }
     case 'composerPartner': if (composer) { composer.partner = String(args.partner); render() } break
@@ -1353,6 +1554,17 @@ function debtChipRow(v: PlayerView, d: { debtor: string; amount: number; credito
   return `<div class="debt-chiprow">${deedChip(v, i, { value: `$${d.amount}`, flag: debtWhy(v, d) })}</div>`
 }
 
+// The spectator countdown tail: someone ELSE'S blocking decision with an
+// armed clock gets an honest live tail on the waiting banner (the
+// last-30s own-decision chip stays as is — that one is yours). An armed
+// clock you can still act on (auction bid/pass) is yours, not a tail.
+function spectatorTail(v: PlayerView): string {
+  if (v.deadline == null || !v.waitingOn) return ''
+  if (v.waitingOn.playerId === v.you) return ''
+  if (v.waitingOn.kind === 'auc' && (v.allowed.includes('bid') || v.allowed.includes('passBid'))) return ''
+  return `<span class="wt" id="waitTail" data-until="${v.deadline}"></span>`
+}
+
 function renderGame(v: PlayerView): void {
   const I = meOf(v)
   if (!I.id) {
@@ -1370,12 +1582,6 @@ function renderGame(v: PlayerView): void {
 
   let banner = ''
   let body = ''
-
-  // First game view on this browser: one promo teaches that the whole 3D
-  // board is in your pocket. Above the action cards, retired on first open.
-  if (!localStorage.getItem(BOARD_PROMO_FLAG)) {
-    body += `<button class="big wide boardpromo" data-act="showBoard">🎲 See the whole board — pinch to zoom, drag to pan</button>`
-  }
 
   // What the active player drew — a card face, NEVER a blocker: the action
   // cascade below must always render so the game can always advance. The
@@ -1479,11 +1685,11 @@ function renderGame(v: PlayerView): void {
       const mine = 1 + dq.filter((d) => d.creditor === I.id).length
       relay = ` — <b>${mine} of ${1 + dq.length} still to pay</b>`
     }
-    banner = `<div class="banner info">${avathumb(debtor)}${esc(debtor?.name ?? '')} is paying ${creditor ? `${avathumb(creditor)}${esc(creditor.name)}` : 'the bank'} <b>$${v.debt.amount}</b>${isRent ? '' : ` — ${esc(debtBlurb(v.debt))}`}${relay}</div>${debtChipRow(v, v.debt)}`
+    banner = `<div class="banner info">${avathumb(debtor)}${esc(debtor?.name ?? '')} is paying ${creditor ? `${avathumb(creditor)}${esc(creditor.name)}` : 'the bank'} <b>$${v.debt.amount}</b>${isRent ? '' : ` — ${esc(debtBlurb(v.debt))}`}${relay}${spectatorTail(v)}</div>${debtChipRow(v, v.debt)}`
   } else if (v.phase === 'AUCTION' && v.auction) {
     const bidder = v.players.find((p) => p.id === v.auction?.bidder)
     const mine = v.auction.bidder === I.id
-    banner = `<div class="banner auction">Auction: ${deedChip(v, v.auction.space, { value: `$${v.auction.bid}` })}${bidder ? ` — high bidder: <b>${esc(bidder.name)}</b>` : ' — no bids yet'}</div>`
+    banner = `<div class="banner auction">Auction: ${deedChip(v, v.auction.space, { value: `$${v.auction.bid}` })}${bidder ? ` — high bidder: <b>${esc(bidder.name)}</b>` : ' — no bids yet'}${spectatorTail(v)}</div>`
     if (mine) {
       body += `<div class="card"><h3>You're the high bidder</h3><p class="hint">Waiting for the others…</p></div>`
     } else if (acts.has('bid') || acts.has('passBid')) {
@@ -1516,7 +1722,7 @@ function renderGame(v: PlayerView): void {
       <button class="big primary" data-act="drawCard">${isChest ? 'Open the Community Chest' : 'Spin the wheel'}</button>
     </div>`
   } else if (v.pendingCardDraw) {
-    banner = `<div class="banner info">${cur ? esc(cur.name) : 'The active player'} landed on ${v.pendingCardDraw.deck === 'chest' ? 'Community Chest' : 'Chance'} — waiting for the reveal…</div>`
+    banner = `<div class="banner info">${cur ? esc(cur.name) : 'The active player'} landed on ${v.pendingCardDraw.deck === 'chest' ? 'Community Chest' : 'Chance'} — waiting for the reveal…${spectatorTail(v)}</div>`
   } else if (v.pendingJail && v.pendingJail.player === I.id) {
     const reason = v.pendingJail.reason === 'space'
       ? 'you landed on Go To Jail'
@@ -1530,7 +1736,7 @@ function renderGame(v: PlayerView): void {
     </div>`
   } else if (v.pendingJail) {
     const arrested = v.players.find((p) => p.id === v.pendingJail?.player)
-    banner = `<div class="banner info">${avathumb(arrested)}${esc(arrested?.name ?? '')} is under arrest — waiting for them to go to jail…</div>`
+    banner = `<div class="banner info">${avathumb(arrested)}${esc(arrested?.name ?? '')} is under arrest — waiting for them to go to jail…${spectatorTail(v)}</div>`
   } else if (v.phase === 'ROLL' && I.id === v.currentPlayerId) {
     banner = `<div class="banner good">Your turn${I.jail ? ` — you're in jail (${I.jailReason ?? 'sentenced earlier'})` : ''}</div>`
     body += `<div class="card actions">
@@ -1569,8 +1775,13 @@ function renderGame(v: PlayerView): void {
       banner = `<div class="banner info">You rolled — you can still build or trade before ending your turn.</div>`
       body += `<div class="card actions"><button class="big primary" data-act="endTurn">End turn</button></div>`
     }
+  } else if (I.bankrupt) {
+    // An eliminated seat spectates: allowedActions is empty, so no
+    // affordances render — never tell a bankrupt player they can still
+    // build or trade. The ledger, table and deeds stay as read-only views.
+    banner = `<div class="banner debt">💀 You're bankrupt — enjoy the show</div>`
   } else {
-    banner = `<div class="banner info">${cur ? `${avathumb(cur)}<b>${esc(cur.name)}</b>'s turn` : 'Waiting…'}</div>`
+    banner = `<div class="banner info">${cur ? `${avathumb(cur)}<b>${esc(cur.name)}</b>'s turn` : 'Waiting…'}${spectatorTail(v)}</div>`
     body += `<div class="card"><p class="hint">You can still build, mortgage, and trade.</p></div>`
   }
 
@@ -1584,8 +1795,8 @@ function renderGame(v: PlayerView): void {
     body += `<div class="trades"><h3>YOUR OFFERS</h3>${outgoing.map((t) => tradeCard(v, t, 'outgoing')).join('')}</div>`
   }
 
-  // ── My portfolio ──
-  body += renderPortfolio(v, I.id)
+  // ── My portfolio (a bankrupt seat owns nothing — the table tells the story) ──
+  if (!I.bankrupt) body += renderPortfolio(v, I.id)
 
   // ── New trade button — directly above the transaction history ──
   if (acts.has('proposeTrade')) {
@@ -1607,9 +1818,9 @@ function renderGame(v: PlayerView): void {
       <span class="me">${avathumb(I)}${esc(I.name)}</span>
       <span class="money" id="moneyChip">$${I.cash}</span>
       <span class="meta">worth $${worth}${I.jailCards > 0 ? ` · jail card ×${I.jailCards}` : ''}${I.jail ? ' · in jail' : ''}</span>
-      <button class="menubtn" data-act="menu" aria-label="Menu" aria-expanded="${menuOpen}">☰</button>
     </header>
     ${banner}
+    ${diceStrip && Date.now() < diceStrip.until ? diceStrip.html : ''}
     ${landedStrip}
     ${drawStrip}
     ${deadlineChip}
@@ -1823,6 +2034,14 @@ function composerRecvLabelHTML(v: PlayerView): string {
   return partner ? `${avathumb(partner)}${esc(partner.name)} gives` : 'They give'
 }
 
+// The send row renders exactly what allowedActions says: proposing is
+// the only thing a freeze takes away, so during one the button is
+// disabled with the freeze reason — the draft itself is never lost.
+function composerSendRowHTML(v: PlayerView): string {
+  if (v.allowed.includes('proposeTrade')) return `<button class="big primary" data-act="sendTrade">Send offer</button>`
+  return `<button class="big" disabled>Trades pause until this settles</button>`
+}
+
 function composerSheetHTML(v: PlayerView): string {
   const C = composer
   if (!C) return ''
@@ -1844,33 +2063,43 @@ function composerSheetHTML(v: PlayerView): string {
         <input data-k="recvCash" type="number" inputmode="numeric" min="0" value="${C.recvCash}" placeholder="cash up to $${partner?.cash ?? 0}" />
         ${(partner?.jailCards ?? 0) > 0 ? composerJailHTML('recv', C.recvJail > 0) : ''}
       </div>
-      <div class="row">
-        <button class="big primary" data-act="sendTrade">Send offer</button>
-        <button class="big" data-act="closeTrade">Cancel</button>
-      </div>`
+      <div class="row" data-cp="sendRow">${composerSendRowHTML(v)}<button class="big" data-act="closeTrade">Cancel</button></div>`
 }
 
-// ── the hamburger sheet (chrome-mounted) ──
-// The topbar's three utility buttons live behind one ☰. Sheet content
-// only — mountSheet wraps it; patchMenu patches just the theme label.
-function menuSheetHTML(): string {
+// ── the More sheet (chrome-mounted) ──
+// The dock's ⋯: the three phone utilities. Theme and the sound ding
+// toggle imperatively (a label patch in place, no render needed); Leave
+// is the one destructive row, styled var(--bad) — which passes AA; the
+// old #e15b5b is retired. Sheet content only — mountSheet wraps it.
+function moreSheetHTML(): string {
   return `
-        <button class="menu-item" data-act="showBoard">
-          <span class="mi-label">🎲 Pocket board</span>
-          <span class="mi-hint">Pinch to zoom · drag to pan (or orbit)</span>
-        </button>
-        <button class="menu-item" data-act="openDeeds">
-          <span class="mi-label">🏠 View properties</span>
-          <span class="mi-hint">Every title deed, all owners</span>
-        </button>
         <button class="menu-item" data-act="theme">
           <span class="mi-label" data-mi="theme">${theme === 'light' ? '🌙 Dark theme' : '☀️ Light theme'}</span>
           <span class="mi-hint">Switch the look of this phone</span>
         </button>
+        <button class="menu-item" data-act="dingToggle">
+          <span class="mi-label" data-mi="ding">${dingOn ? '🔔 Sound ding on' : '🔇 Sound ding off'}</span>
+          <span class="mi-hint">The chime when the game waits on you</span>
+        </button>
         <div class="menu-sep"></div>
         <button class="menu-item danger" data-act="leave">
           <span class="mi-label">Leave the game</span>
+          <span class="mi-hint">Two confirmations — your estate goes under the hammer</span>
         </button>`
+}
+
+// Fully static except the two toggle labels — patch exactly those.
+function patchMore(el: HTMLElement): void {
+  const themeLabel = el.querySelector('[data-mi="theme"]') as HTMLElement | null
+  if (themeLabel) {
+    const want = theme === 'light' ? '🌙 Dark theme' : '☀️ Light theme'
+    if (themeLabel.textContent !== want) themeLabel.textContent = want
+  }
+  const dingLabel = el.querySelector('[data-mi="ding"]') as HTMLElement | null
+  if (dingLabel) {
+    const want = dingOn ? '🔔 Sound ding on' : '🔇 Sound ding off'
+    if (dingLabel.textContent !== want) dingLabel.textContent = want
+  }
 }
 
 // ── the View-properties sheet (chrome-mounted) ──
@@ -1969,39 +2198,42 @@ function deedsSheetHTML(v: PlayerView): string {
 // ── chrome: the in-place patcher ──
 // renderGame rebuilds ALL of $app via innerHTML on every server push, so
 // everything that must survive those rebuilds lives in the #chrome
-// sibling: the three sheets. Each mounts once per open and is then
-// patched, never rebuilt with the main flow — a push mid-typing never
-// touches the composer's inputs (focus and contents survive), and the
-// deeds grid is left byte-identical (scroll intact) unless the board
-// actually changed. Transient momentary overlays (card reveal, dice,
-// confirms, GO, the pocket board, propinfo, toasts, the update pill) stay
-// body-level and untouched. Sheet visibility is still the existing module
-// flags (menuOpen / deedsOpen / composer.open): mount on open, unmount on
-// close. The single-sheet state machine is a later round — not built here.
+// sibling: the dock, the your-move bar and THE sheet (one at a time).
+// Each mounts once per open and is then patched, never rebuilt with the
+// main flow — a push mid-typing never touches the composer's inputs
+// (focus and contents survive), and the deeds grid is left byte-identical
+// (scroll intact) unless the board actually changed. Transient momentary
+// overlays (card reveal, dice, confirms, GO, the pocket board, propinfo,
+// toasts, the update pill) stay body-level and untouched.
 
 // Signatures of the last-applied patch, so unchanged pushes cost zero
 // DOM writes (and the deeds grid's scrollTop survives them untouched).
 let composerSigLast = ''
 let deedsSigLast = ''
 
-// Backdrop tap closes (data-act on .modal); the sheet swallows taps with
-// an empty data-act — the composer's shield, unchanged.
-function mountSheet(id: string, sheetClass: string, sheetHTML: string, backdropAct: string): HTMLElement {
+// Backdrop tap closes (data-act on .modal — every close act funnels into
+// closeSheet); the sheet swallows taps with an empty data-act — the
+// composer's shield, unchanged. Mount = the one open moment: dialog
+// semantics, focus capture, scroll lock and first-control focus happen
+// here and nowhere else.
+function mountSheet(id: string, sheetClass: string, sheetHTML: string, backdropAct: string, ariaLabel: string): HTMLElement {
   const modal = document.createElement('div')
   modal.className = 'modal'
   modal.id = id
   modal.dataset.act = backdropAct
-  modal.innerHTML = `<div class="sheet ${sheetClass}" data-act="">${sheetHTML}</div>`
+  modal.innerHTML = `<div class="sheet ${sheetClass}" role="dialog" aria-modal="true" aria-label="${ariaLabel}" data-act="">${sheetHTML}</div>`
   $chrome.appendChild(modal)
+  sheetFocusSaved = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  document.body.dataset.sheet = sheet ?? ''
+  const first = modal.querySelector<HTMLElement>('button:not([disabled]), input, select, textarea, [href]')
+  first?.focus()
   return modal
 }
 
-// ── menu: fully static except the theme label — patch exactly that ──
-function patchMenu(el: HTMLElement): void {
-  const label = el.querySelector('[data-mi="theme"]') as HTMLElement | null
-  if (!label) return
-  const want = theme === 'light' ? '🌙 Dark theme' : '☀️ Light theme'
-  if (label.textContent !== want) label.textContent = want
+function sheetHTMLFor(kind: SheetKind, v: PlayerView): string {
+  if (kind === 'deeds') return deedsSheetHTML(v)
+  if (kind === 'more') return moreSheetHTML()
+  return composer != null ? composerSheetHTML(v) : ''
 }
 
 // ── composer: what its chip regions depend on ──
@@ -2034,6 +2266,8 @@ function composerSig(v: PlayerView): string {
     // product, so a roll landing while the composer is open must re-patch
     // it (final council re-review of the deed component)
     dice: v.dice ? v.dice.join(',') : '',
+    // the send row follows allowedActions (freeze gray-out)
+    canTrade: v.allowed.includes('proposeTrade'),
   })
 }
 
@@ -2073,6 +2307,8 @@ function patchComposer(el: HTMLElement, v: PlayerView): void {
   if (recvLabel) recvLabel.innerHTML = composerRecvLabelHTML(v)
   patchJailButton(region('giveRow'), 'give', meOf(v).jailCards > 0, C.giveJail > 0)
   patchJailButton(region('recvRow'), 'recv', (partnerPlayer(v, C.partner)?.jailCards ?? 0) > 0, C.recvJail > 0)
+  const sendRow = region('sendRow')
+  if (sendRow) sendRow.innerHTML = `${composerSendRowHTML(v)}<button class="big" data-act="closeTrade">Cancel</button>`
 }
 
 // ── deeds: what the grid depends on ──
@@ -2093,54 +2329,201 @@ function deedsSig(v: PlayerView): string {
   return `${props}|${v.allowed.join(',')}|${v.players.map((p) => (p.bankrupt ? '1' : '0')).join('')}|${deedFilters.owner}~${deedFilters.kind}`
 }
 
+// ── the dock (chrome-mounted, game-only) ──
+// The hamburger's replacement: four permanent tools fixed to the bottom.
+// It sits ABOVE sheets (z30 over z20) so Board/Deeds stay tappable
+// mid-sheet — that is how you price a bid inside the 15-second window —
+// and under the opaque board overlay. Everything it shows about
+// affordances comes straight from allowedActions.
+function updateDock(v: PlayerView | null): void {
+  let el = document.getElementById('dock')
+  if (!v) {
+    el?.remove()
+    return
+  }
+  if (!el) {
+    const nav = document.createElement('nav')
+    nav.id = 'dock'
+    nav.setAttribute('aria-label', 'Game tools')
+    nav.innerHTML = `
+      <button class="dockbtn" data-act="showBoard" aria-label="Board">
+        <span class="db-ic">🎲</span><span class="db-t">Board</span>
+      </button>
+      <button class="dockbtn" data-dockbtn="deeds" data-act="openDeeds" aria-label="Deeds">
+        <span class="db-ic">🏠</span><span class="db-t">Deeds</span>
+        <span class="dock-badge" data-dock="deedBadge"></span>
+      </button>
+      <button class="dockbtn" data-dockbtn="trade" data-act="openTrade" aria-label="Trade">
+        <span class="db-ic">🔁</span><span class="db-t" data-dock="tradeLabel">Trade</span>
+        <span class="dock-badge" data-dock="tradeBadge"></span>
+      </button>
+      <button class="dockbtn" data-dockbtn="more" data-act="openMore" aria-label="More">
+        <span class="db-ic">⋯</span><span class="db-t">More</span>
+      </button>`
+    $chrome.appendChild(nav)
+    el = nav
+  }
+  const I = meOf(v)
+  const acts = new Set(v.allowed)
+
+  // Deeds badge = your owned count
+  const owned = Object.values(v.props).filter((st) => st.owner === I.id).length
+  const deedBadge = el.querySelector('[data-dock="deedBadge"]') as HTMLElement | null
+  if (deedBadge) {
+    deedBadge.textContent = owned > 0 ? String(owned) : ''
+    deedBadge.classList.toggle('zero', owned === 0)
+  }
+
+  // Trade badge = incoming offers to you
+  const incoming = v.trades.filter((t) => t.to === I.id).length
+  const tradeBadge = el.querySelector('[data-dock="tradeBadge"]') as HTMLElement | null
+  if (tradeBadge) {
+    tradeBadge.textContent = incoming > 0 ? String(incoming) : ''
+    tradeBadge.classList.toggle('zero', incoming === 0)
+  }
+
+  // The Trade affordance is exactly what allowedActions says: proposing
+  // is the only thing a freeze takes away, and decline/withdraw
+  // deliberately survive freezes — so the button grays (with the freeze
+  // reason) only while ALL THREE are off. A bankrupt seat never trades
+  // again; its caption says so honestly.
+  const frozenOut = !acts.has('proposeTrade') && !acts.has('respondTrade') && !acts.has('cancelTrade')
+  const tradeBtn = el.querySelector('[data-dockbtn="trade"]') as HTMLButtonElement | null
+  const tradeLabel = el.querySelector('[data-dock="tradeLabel"]') as HTMLElement | null
+  if (tradeBtn && tradeLabel) {
+    tradeBtn.disabled = frozenOut
+    tradeBtn.classList.toggle('frozen', frozenOut)
+    const want = frozenOut
+      ? I.bankrupt || v.phase === 'GAME_OVER'
+        ? 'Spectating'
+        : 'Trades pause until this settles'
+      : 'Trade'
+    if (tradeLabel.textContent !== want) tradeLabel.textContent = want
+  }
+
+  // the active sheet's button
+  const mark = (sel: string, on: boolean): void => {
+    const b = el!.querySelector(sel) as HTMLElement | null
+    b?.classList.toggle('on', on)
+  }
+  mark('[data-dockbtn="deeds"]', sheet === 'deeds')
+  mark('[data-dockbtn="trade"]', sheet === 'composer')
+  mark('[data-dockbtn="more"]', sheet === 'more')
+}
+
+// ── the your-move bar (chrome-mounted) ──
+// The escape hatch, never a second messenger: while a sheet or the pocket
+// board covers the action card AND the game waits on THIS phone, a gold
+// bar says exactly what the main flow would. Tap = close the cover,
+// scroll the action card into view, pulse it. The server reports exactly
+// one blocking decision, so the bar never arbitrates between waits; an
+// incoming trade is NOT a bar case — it rides the Trade badge.
+const BAR_COPY: Record<WaitingKind, string> = {
+  roll: 'YOUR MOVE — Roll the dice',
+  draw: 'Draw your card',
+  buy: 'Buy or send to auction',
+  tax: 'Choose your tax',
+  end: 'End your turn',
+  jail: 'Go to jail',
+  debt: 'Pay or raise the money',
+  auc: 'Bid or pass',
+}
+
+function barCase(v: PlayerView): string | null {
+  const w = v.waitingOn
+  if (!w) return null
+  const I = meOf(v)
+  if (I.bankrupt) return null
+  if (w.playerId === v.you) return BAR_COPY[w.kind]
+  // auctions wait on the whole table: the bar shows only while THIS phone
+  // can still bid or pass
+  if (w.kind === 'auc' && w.playerId === null && (v.allowed.includes('bid') || v.allowed.includes('passBid'))) {
+    return BAR_COPY.auc
+  }
+  return null
+}
+
+function updateMoveBar(v: PlayerView | null): void {
+  const copy = v ? barCase(v) : null
+  let el = document.getElementById('movebar') as HTMLButtonElement | null
+  if (!v || !copy || (sheet == null && phoneBoard == null)) {
+    el?.remove()
+    return
+  }
+  if (!el) {
+    const bar = document.createElement('button')
+    bar.id = 'movebar'
+    bar.dataset.act = 'barJump'
+    bar.innerHTML = `<span id="barCopy">${copy}</span>${v.deadline != null ? `<span id="barCount" data-until="${v.deadline}"></span>` : ''}`
+    $chrome.appendChild(bar)
+    return
+  }
+  // patch in place — a tap in flight on the bar must land
+  const copyEl = document.getElementById('barCopy') as HTMLElement | null
+  if (copyEl && copyEl.textContent !== copy) copyEl.textContent = copy
+  let tailEl = document.getElementById('barCount') as HTMLElement | null
+  if (v.deadline != null) {
+    if (!tailEl) copyEl?.insertAdjacentHTML('afterend', `<span id="barCount" data-until="${v.deadline}"></span>`)
+    else if (Number(tailEl.dataset.until ?? 0) !== v.deadline) tailEl.dataset.until = String(v.deadline)
+  } else if (tailEl) {
+    tailEl.remove()
+  }
+}
+
 // THE entry point renderGame calls after rebuilding $app. v == null (no
-// game view) tears every sheet down — the game-only sheets die with the
-// game view, exactly as they did when they lived inside $app.
+// game view) tears the dock, the bar and every sheet down — the game-only
+// chrome dies with the game view.
 function updateChrome(v: PlayerView | null): void {
-  // menu sheet
-  const menuEl = document.getElementById('chromeMenu')
-  if (v && menuOpen) {
-    if (!menuEl) mountSheet('chromeMenu', 'menu-sheet', menuSheetHTML(), 'closeMenu')
-    else patchMenu(menuEl)
-  } else if (menuEl) menuEl.remove()
+  // a dying game view must never leave a locked body or a stale sheet
+  if (v == null && sheet) {
+    sheet = null
+    sheetFocusSaved = null
+    delete document.body.dataset.sheet
+  }
+  // defensive: a composer sheet without draft data is nothing at all
+  if (v != null && sheet === 'composer' && composer == null) sheet = null
+  updateDock(v)
 
-  // trade composer
-  const composerEl = document.getElementById('chromeComposer')
-  if (v && composer && composer.open) {
-    const sig = composerSig(v)
-    if (!composerEl) {
-      mountSheet('chromeComposer', '', composerSheetHTML(v), 'closeTrade')
-      composerSigLast = sig
-    } else if (sig !== composerSigLast) {
-      patchComposer(composerEl, v)
-      composerSigLast = sig
+  for (const kind of SHEET_KINDS) {
+    const el = document.getElementById(SHEET_IDS[kind])
+    const wanted = v != null && sheet === kind && (kind !== 'composer' || composer != null)
+    if (!wanted) {
+      if (el) {
+        el.remove()
+        if (kind === 'composer') composerSigLast = ''
+        if (kind === 'deeds') deedsSigLast = ''
+      }
+      continue
     }
-    // sig unchanged → zero DOM writes: focus, caret and text untouched
-  } else if (composerEl) {
-    composerEl.remove()
-    composerSigLast = ''
+    const vv = v as PlayerView
+    if (!el) {
+      mountSheet(SHEET_IDS[kind], SHEET_CLASSES[kind], sheetHTMLFor(kind, vv), SHEET_CLOSE_ACTS[kind], SHEET_LABELS[kind])
+      if (kind === 'composer') composerSigLast = composerSig(vv)
+      if (kind === 'deeds') deedsSigLast = deedsSig(vv)
+    } else if (kind === 'deeds') {
+      const sig = deedsSig(vv)
+      if (sig !== deedsSigLast) {
+        // the board, the affordances or the filters actually changed: one
+        // re-emit of the sheet content (badges, owner labels and the head
+        // count are all derived from that same signature)
+        const sh = el.querySelector('.sheet') as HTMLElement
+        sh.innerHTML = deedsSheetHTML(vv)
+        deedsSigLast = sig
+      }
+      // sig unchanged → the grid (and its scroll) is left completely alone
+    } else if (kind === 'composer') {
+      const sig = composerSig(vv)
+      if (sig !== composerSigLast) {
+        patchComposer(el, vv)
+        composerSigLast = sig
+      }
+      // sig unchanged → zero DOM writes: focus, caret and text untouched
+    } else {
+      patchMore(el)
+    }
   }
 
-  // deeds library
-  const deedsEl = document.getElementById('chromeDeeds')
-  if (v && deedsOpen) {
-    const sig = deedsSig(v)
-    if (!deedsEl) {
-      mountSheet('chromeDeeds', 'deeds-sheet', deedsSheetHTML(v), 'closeDeeds')
-      deedsSigLast = sig
-    } else if (sig !== deedsSigLast) {
-      // the board, the affordances or the filters actually changed: one
-      // re-emit of the sheet content (badges, owner labels and the head
-      // count are all derived from that same signature)
-      const sheet = deedsEl.querySelector('.sheet') as HTMLElement
-      sheet.innerHTML = deedsSheetHTML(v)
-      deedsSigLast = sig
-    }
-    // sig unchanged → the grid (and its scroll) is left completely alone
-  } else if (deedsEl) {
-    deedsEl.remove()
-    deedsSigLast = ''
-  }
+  updateMoveBar(v)
 }
 
 // First paint: never leave the phone blank while the socket warms up.

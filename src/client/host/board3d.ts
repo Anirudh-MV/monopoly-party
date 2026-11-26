@@ -14,6 +14,13 @@ const TILE = 2
 const TILE_W = 1.84
 const RING_R = 11 / 2 // tiles from center
 
+// Reduced motion: the camera snaps to its goal instead of easing. This is
+// the SHARED TV/phone module — the TV never renders the phone path and
+// its browser doesn't carry the OS preference, so this is a no-op there;
+// a phone that asks for reduced motion gets instant camera cuts.
+const REDUCED_MOTION =
+  typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches
+
 // grid position (1..11) → world position on the XZ plane
 function gridRC(i: number): { r: number; c: number } {
   if (i === 0) return { r: 11, c: 11 }
@@ -782,8 +789,8 @@ export class Board3D {
         }
       }
     }
-    const ease = 1 - Math.pow(0.0012, dt)
-    const easeLook = 1 - Math.pow(0.0018, dt)
+    const ease = REDUCED_MOTION ? 1 : 1 - Math.pow(0.0012, dt)
+    const easeLook = REDUCED_MOTION ? 1 : 1 - Math.pow(0.0018, dt)
 
     // user inspection: while dragging (or easing back after release), the
     // camera is placed directly from the default offset + the user's orbit
@@ -794,7 +801,7 @@ export class Board3D {
       Math.abs(this.userZoom - 1) > 0.0005
     if (!this.dragging && inspecting && (this.returning || (this.wheelDeadline > 0 && now > this.wheelDeadline))) {
       // release (or wheel idle): glide the orbit back to the default view
-      const k = 1 - Math.pow(0.02, dt)
+      const k = REDUCED_MOTION ? 1 : 1 - Math.pow(0.02, dt)
       this.userYaw += (0 - this.userYaw) * k
       this.userPitch += (0 - this.userPitch) * k
       this.userZoom += (1 - this.userZoom) * k
