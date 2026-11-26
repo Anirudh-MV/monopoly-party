@@ -223,11 +223,12 @@ button:hover { filter: brightness(1.06); }
 .cardprompt.jailprompt { border-color: var(--bad); }
 .cardprompt.jailprompt .cp-title { color: var(--bad); }
 
-/* landed spotlight, inside the queue column */
+/* landed spotlight, inside the queue column. The shared deed chip carries
+   name + colour + the live number; keep it inside the panel's width. */
 .qlanded { margin-top: 1.2vh; border-top: 1px solid var(--line); padding-top: 1vh; }
 .ql-head { color: var(--dim); font-size: 2.2vh; font-weight: 700; letter-spacing: 0.22em; margin-bottom: 0.4vh; }
-.ql-name { font-weight: 800; font-size: 3vh; color: var(--ink); }
 .ql-info { color: var(--dim); font-size: 2.7vh; font-weight: 600; margin-top: 0.3vh; }
+.qlanded .deed--chip { max-width: 36vh; }
 
 /* holdings standings — left flank, bottom-anchored below the turn queue */
 .overlay.standings {
@@ -279,20 +280,8 @@ button:hover { filter: brightness(1.06); }
 .overlay.ticker .t.good { color: var(--good); }
 .overlay.ticker .t.bad { color: var(--bad); }
 .overlay.ticker .t.money { color: var(--money); }
-/* the landed-property chip inside the card ticker */
-.tk-prop {
-  display: inline-flex; align-items: center; gap: 0.8vh;
-  font-size: 3vh; font-weight: 800; color: var(--ink);
-  background: color-mix(in srgb, var(--c) 16%, var(--panel));
-  border: 1px solid color-mix(in srgb, var(--c) 55%, var(--line));
-  border-radius: 999px;
-  padding: 0.4vh 1.6vh 0.4vh 0.8vh;
-  white-space: nowrap;
-}
-.tk-prop .tk-swatch {
-  width: 1.6vh; height: 3.2vh; border-radius: 0.5vh;
-  background: var(--c); display: inline-block;
-}
+/* the landed-property chip inside the card ticker is the shared deed
+   chip (deed.css) — the .tv root scales it with the vh convention */
 
 /* center overlay inside the 2D grid board (simulator page) */
 .center {
@@ -333,7 +322,6 @@ button:hover { filter: brightness(1.06); }
 .center3d .banner { font-size: 3.4vh; font-weight: 800; padding: 1.2vh 2.4vw; border-radius: 1.2vh; background: color-mix(in srgb, var(--panel) 96%, transparent); border: 1px solid var(--line); }
 .center3d .banner.debt { background: color-mix(in srgb, #fde8e8 96%, transparent); color: #7f1d1d; border-color: #f5c6c6; }
 .center3d .auction .a-title { font-size: 3vh; letter-spacing: 0.4em; font-weight: 800; color: var(--money); }
-.center3d .auction .a-prop { font-size: 5.5vh; font-weight: 800; color: var(--ink); }
 .center3d .auction .a-bid { font-size: 8vh; font-weight: 800; color: var(--money); }
 .center3d .auction .a-bidder { font-size: 3vh; font-weight: 700; }
 .center3d .auction .a-count { color: var(--dim); font-size: 2.7vh; font-weight: 600; }
@@ -416,6 +404,8 @@ button:hover { filter: brightness(1.06); }
 }
 
 /* ── the landed-space spotlight (during reveals) ── */
+/* the landed spotlight card itself is the shared deed (deed.css); this
+   frame only serves the non-property one-liner (card spaces, tax, GO) */
 .landed {
   background: color-mix(in srgb, var(--panel) 96%, transparent);
   border: 2px solid var(--line);
@@ -426,10 +416,6 @@ button:hover { filter: brightness(1.06); }
   animation: pop 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 @keyframes pop { from { transform: scale(0.7); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-.l-strip { height: 0.9vh; border-radius: 0.6vh; margin-bottom: 1vh; }
-.l-name { font-size: 4.6vh; font-weight: 800; color: var(--ink); }
-.l-price { color: var(--money); font-weight: 800; font-size: 3.2vh; }
-.l-rent { color: var(--dim); font-size: 2.8vh; font-weight: 600; margin-top: 0.3vh; }
 .l-owner { margin-top: 0.8vh; font-size: 3vh; font-weight: 800; border-left: 4px solid var(--c); padding-left: 1vh; }
 .l-owner.unown { color: var(--dim); border-left-color: var(--line); }
 
@@ -448,18 +434,8 @@ button:hover { filter: brightness(1.06); }
 @keyframes bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-1vh); } }
 
 .cardbox3d { perspective: 800px; }
-.cardface {
-  background: #fffdf5;
-  color: #1a1a2e;
-  border-radius: 1.4vh;
-  padding: 2.6vh 2.4vw;
-  border: 2px solid #d8d2c4;
-  box-shadow: var(--shadow);
-}
-.cardface .c-deck { font-size: 2.8vh; font-weight: 800; letter-spacing: 0.3em; }
-.cardface.chance .c-deck { color: #c2410c; }
-.cardface.chest .c-deck { color: #0e7490; }
-.cardface .c-text { font-size: 3.6vh; font-weight: 800; margin-top: 1.2vh; }
+/* the reveal card itself is the shared card face (deed.css); the
+   revealcard/wheelcard wrappers only time the rise animation */
 
 /* chest animation */
 .chestwrap { position: relative; width: 14vh; height: 10vh; margin: 0 auto 1.2vh; }

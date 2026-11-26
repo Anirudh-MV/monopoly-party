@@ -10,8 +10,10 @@ import QRCode from 'qrcode'
 import { BOARD, GROUP_COLORS, isStreet } from '../../shared/board.js'
 import { TOKENS } from '../../shared/tokens.js'
 import { avatarThumbnail } from '../tokens3d.js'
-import { debtBlurb, rentFor, rentPreview } from '../../shared/rules.js'
-import type { ColorGroup, HostView, LobbyInfo, PlayerState, Space } from '../../shared/types.js'
+import { debtBlurb, rentFor } from '../../shared/rules.js'
+import { cardEffectLine } from '../../shared/card-effect.js'
+import { cardFace, deedChip, deedFull } from '../deed-card.js'
+import type { ColorGroup, HostView, LobbyInfo, PlayerState } from '../../shared/types.js'
 import { Board3D } from './board3d.js'
 import { announce, bruh, doublesStreak, heeHee, setVoiceEnabled, unlockAudio, voiceEnabled } from './voice.js'
 import { startUpdater } from '../version-check.js'
@@ -121,6 +123,12 @@ function setWatcher(on: boolean): void {
 let lastDiceKey = ''
 let lastCardSeq = 0
 let revealUntil = 0
+// the frozen card-effect line: computed ONCE per cardDrawSeq at draw time
+// and reused for the whole reveal window — a repairs bill can never shrink
+// mid-reveal while a 90s raise-funds freeze and autoSettle mutate the
+// estate. Static lines are immune by construction.
+let tvEffectSeq = -1
+let tvEffectLine = ''
 
 // god console
 let godOpen = false
@@ -517,6 +525,13 @@ function renderGame(v: HostView): void {
   }
   lastCardSeq = v.cardDrawSeq
 
+  // freeze the effect line at draw time, before any surface renders it
+  if (v.pendingCard && v.cardDrawSeq !== tvEffectSeq) {
+    tvEffectSeq = v.cardDrawSeq
+    tvEffectLine = cardEffectLine(v.pendingCard, v, v.currentPlayerId) ?? ''
+  }
+  if (!v.pendingCard) tvEffectLine = ''
+
   // the piece waits for the full reveal before doing its thing:
   // spin (2.1s) → card readable (~2.4s) → prompt clears → stroll begins
   if (freshReveal) board3d.delayHops(freshCard.deck === 'chest' ? 3000 : 3600)
@@ -574,30 +589,35 @@ function updateTopbar(v: HostView): void {
 }
 
 // Compact landed spotlight — lives in the queue column so the screen center
-// belongs to the 3D action.
+// belongs to the 3D action. The chip carries the number: price when
+// unowned, the live rent due when owned (a mortgaged deed never prints a
+// rent — the MORTGAGED marker plus the info line say why).
 function landedCompact(v: HostView): string {
   if (!v.lastLanded || v.lastLanded.playerId !== v.currentPlayerId) return ''
   const i = v.lastLanded.space
   const sp = BOARD[i]
   const st = v.props[i]
   let info = ''
+  let value: string | undefined
   if ('price' in sp && st) {
     const owner = st.owner ? v.players.find((p) => p.id === st.owner) : null
     if (owner) {
       const badges =
-        (st.mortgaged ? ' · mortgaged' : '') +
         (st.houses > 0 ? ` · ${st.houses === 5 ? 'hotel' : `${st.houses} house${st.houses > 1 ? 's' : ''}`}` : '')
-      info = `${avathumb(owner)}${esc(owner.name)}${badges}`
+      const mtg = st.mortgaged && owner.id === v.currentPlayerId ? ' · mortgaged' : ''
+      info = `${avathumb(owner)}${esc(owner.name)}${mtg}${badges}`
       if (owner.id !== v.currentPlayerId) {
-        const diceSum = v.dice ? v.dice[0] + v.dice[1] : 7
-        info += ` — rent $${rentFor(v, i, diceSum)}`
+        // the rent line is gated on the mortgage — the engine collects
+        // nothing on a mortgaged deed, so it never prints a rent due
+        info += st.mortgaged ? ' — no rent - mortgaged' : ''
+        if (!st.mortgaged) {
+          const diceSum = v.dice ? v.dice[0] + v.dice[1] : 7
+          value = `$${rentFor(v, i, diceSum)}`
+        }
       }
     } else {
-      const rp = rentPreview(v, i)
-      const rentNote = sp.kind === 'utility' ? ` (${rp.note})` : ''
-      info = v.pendingPurchase === i
-        ? `unowned — rent $${rp.current}${rentNote} when owned`
-        : 'unowned'
+      value = `$${sp.price}`
+      info = v.pendingPurchase === i ? 'buy or auction?' : 'unowned'
     }
   } else if (sp.kind === 'chance' || sp.kind === 'chest') {
     info = 'card space'
@@ -610,7 +630,7 @@ function landedCompact(v: HostView): string {
   }
   return `<div class="qlanded">
     <div class="ql-head">LANDED</div>
-    <div class="ql-name" style="border-left: 4px solid ${stripColor(sp)}; padding-left: 6px;">${esc(sp.name)}${'price' in sp ? ` · $${sp.price}` : ''}</div>
+    ${deedChip(v, i, { value })}
     <div class="ql-info">${info}</div>
   </div>`
 }
@@ -695,14 +715,21 @@ function updateTicker(v: HostView): void {
   const el = document.getElementById('ticker')
   if (!el) return
   // While a drawn card is in play, the bottom bar carries the whole story:
-  // "Chance said: …" plus the landed property, price, and its group colour.
+  // "Chance said: …" plus the landed property as a chip — price when
+  // unowned, the live rent due when owned (never on a mortgaged deed).
   if (v.pendingCard) {
     const isChest = v.pendingCard.deck === 'chest'
     let propHTML = ''
     if (v.lastLanded && v.lastLanded.playerId === v.currentPlayerId) {
-      const sp = BOARD[v.lastLanded.space]
-      const col = stripColor(sp)
-      propHTML = `<span class="tk-prop" style="--c:${col}"><i class="tk-swatch"></i>${esc(sp.name)}${'price' in sp ? ` · $${sp.price}` : ''}</span>`
+      const i = v.lastLanded.space
+      const sp = BOARD[i]
+      const st = v.props[i]
+      let value: string | undefined
+      if ('price' in sp && st) {
+        if (st.owner) value = st.mortgaged || st.owner === v.currentPlayerId ? undefined : `$${rentFor(v, i, v.dice ? v.dice[0] + v.dice[1] : 7)}`
+        else value = `$${sp.price}`
+      }
+      propHTML = deedChip(v, i, { value })
     }
     el.innerHTML = `<span class="t">${isChest ? 'Community Chest' : 'Chance'} said: ${esc(v.pendingCard.text)}</span>${propHTML}`
     return
@@ -711,55 +738,22 @@ function updateTicker(v: HostView): void {
   el.innerHTML = last ? `<span class="t ${last.kind}">${esc(last.text)}</span>` : ''
 }
 
-function stripColor(sp: Space): string {
-  if (isStreet(sp)) return GROUP_COLORS[sp.group]
-  if (sp.kind === 'rail') return '#4b5563'
-  if (sp.kind === 'utility') return '#6b7280'
-  if (sp.kind === 'chance') return '#c2410c'
-  if (sp.kind === 'chest') return '#0e7490'
-  return '#64748b'
-}
-
-// Spotlight: what the active piece just landed on, with price and rent.
+// Spotlight: what the active piece just landed on — the full deed with
+// only the live row (an owned-and-mortgaged deed shows the full dimmed,
+// hatched ladder under the MORTGAGED stamp; an unowned one shows its one
+// marked Rent row). Non-property spaces keep a one-line card.
 function landedCard(v: HostView): string {
   if (!v.lastLanded || v.lastLanded.playerId !== v.currentPlayerId) return ''
   const i = v.lastLanded.space
   const sp = BOARD[i]
-  const st = v.props[i]
-  const mover = v.players.find((p) => p.id === v.lastLanded?.playerId)
+  if ('price' in sp) return deedFull(v, i, avathumb, 'live')
   let info = ''
-  let rentLine = ''
-  if ('price' in sp && st) {
-    const owner = st.owner ? v.players.find((p) => p.id === st.owner) : null
-    const badges =
-      (st.mortgaged ? ' · mortgaged' : '') +
-      (st.houses > 0 ? ` · ${st.houses === 5 ? 'hotel' : `${st.houses} house${st.houses > 1 ? 's' : ''}`}` : '')
-    if (owner) {
-      info = `<div class="l-owner" style="--c:${owner.color}">${avathumb(owner)}${esc(owner.name)}${badges}</div>`
-      if (owner.id !== v.currentPlayerId) {
-        const diceSum = v.dice ? v.dice[0] + v.dice[1] : 7
-        rentLine = `<div class="l-rent">Rent due: $${rentFor(v, i, diceSum)}</div>`
-      } else {
-        rentLine = `<div class="l-rent">Your property — no rent</div>`
-      }
-    } else {
-      info = `<div class="l-owner unown">${v.pendingPurchase === i ? 'Unowned — buy or auction?' : 'unowned'}</div>`
-      rentLine = `<div class="l-rent">Price: $${'price' in sp ? sp.price : ''}</div>`
-    }
-  } else if (sp.kind === 'chance') {
-    info = `<div class="l-owner unown">card space</div>`
-  } else if (sp.kind === 'chest') {
-    info = `<div class="l-owner unown">card space</div>`
-  } else if (sp.kind === 'tax') {
-    info = `<div class="l-owner unown">${sp.percent ? 'pay $200 or 10% of worth' : `pay $${sp.flat}`}</div>`
-  }
-  return `
-    <div class="landed">
-      <div class="l-strip" style="background:${stripColor(sp)}"></div>
-      <div class="l-name">${mover ? avathumb(mover) : ''}${esc(sp.name)}${'price' in sp ? ` <span class="l-price">$${sp.price}</span>` : ''}</div>
-      ${rentLine}
-      ${info}
-    </div>`
+  if (sp.kind === 'chance' || sp.kind === 'chest') info = 'card space'
+  else if (sp.kind === 'tax') info = sp.percent ? 'pay $200 or 10% of worth' : `pay $${sp.flat}`
+  else if (sp.kind === 'go') info = 'collect $200'
+  else if (sp.kind === 'jail') info = 'just visiting'
+  if (!info) return ''
+  return `<div class="landed"><div class="l-owner unown">${info}</div></div>`
 }
 
 // ── 3D dice cubes ──
@@ -858,14 +852,13 @@ function updateCenter(v: HostView): void {
   }
 
   if (v.phase === 'AUCTION' && v.auction) {
-    const sp = BOARD[v.auction.space]
     const bidder = v.players.find((p) => p.id === v.auction?.bidder)
     const passing = v.auction.passed.length
     const total = v.players.filter((p) => !p.bankrupt).length
     el.innerHTML = `
       <div class="auction">
         <div class="a-title">AUCTION</div>
-        <div class="a-prop">${esc(sp.name)}${'price' in sp ? ` · $${sp.price}` : ''}</div>
+        ${deedFull(v, v.auction.space, avathumb, 'live')}
         <div class="a-bid">$${v.auction.bid}</div>
         <div class="a-bidder">${v.auction.bidder ? `high bidder: ${avathumb(bidder)}${esc(bidder?.name ?? '')}` : 'no bids yet'}</div>
         <div class="a-count">${passing}/${total - 1} players passed</div>
@@ -904,10 +897,7 @@ function updateCenter(v: HostView): void {
           ${isChest
             ? '<div class="chestwrap"><div class="chestlid"></div><div class="chestlock"></div><div class="chestbase"></div></div>'
             : '<div class="wheelwrap"><div class="wheeldisc"></div><div class="wheelhub"></div><div class="wheelpointer"></div></div>'}
-          <div class="cardface ${v.pendingCard.deck} ${anim}">
-            <div class="c-deck">${isChest ? 'COMMUNITY CHEST' : 'CHANCE'}</div>
-            <div class="c-text">${esc(v.pendingCard.text)}</div>
-          </div>
+          <div class="${anim}">${cardFace(v.pendingCard, tvEffectLine || undefined)}</div>
         </div>
         ${landedCard(v)}`
       return

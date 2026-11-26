@@ -79,6 +79,22 @@ export function groupIndices(group: ColorGroup): number[] {
   return GROUP_INDEX_MAP[group]
 }
 
+// Human labels for the colour groups (band pills, filter chips, copy) and
+// the band colours for the non-street kinds. ONE source for phone + TV so
+// the two decks can never drift (moved out of the controller, deed-card.ts
+// imports these).
+export const GROUP_LABEL: Record<ColorGroup, string> = {
+  brown: 'Brown', lightblue: 'Light blue', pink: 'Pink', orange: 'Orange',
+  red: 'Red', yellow: 'Yellow', green: 'Green', blue: 'Blue',
+}
+
+export const KIND_COLORS = {
+  rail: '#4b5563',
+  utility: '#6b7280',
+  chance: '#c2410c',
+  chest: '#0e7490',
+} as const
+
 export const RAIL_INDICES = [5, 15, 25, 35]
 export const UTILITY_INDICES = [12, 28]
 

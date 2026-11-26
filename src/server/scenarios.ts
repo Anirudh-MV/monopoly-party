@@ -16,6 +16,8 @@ import {
 import { auctionGraceActions, commit, debtAutoActions, decisionFor, forfeitSeat, type Room } from './rooms.js'
 import { allowedActions, blockingDecision, debtBlurb, rentFor, rentPreview } from '../shared/rules.js'
 import { hostView } from '../shared/views.js'
+import { ALL_CARDS, cardById } from '../shared/cards.js'
+import { cardEffectLine, debtWhy } from '../shared/card-effect.js'
 import type { Action, DebtState, GameState, PlayerState, PropertyState } from '../shared/types.js'
 
 const NAMES = ['Asha', 'Ben', 'Cho', 'Dara']
@@ -1475,6 +1477,118 @@ scenario('waitingOn names who and what blocks, with or without a clock', 4, (h) 
   )
   h.eq(hostView(h.s, 'TEST', null, 0).waitingOn, blockingDecision(h.s), 'the view field is the shared projection')
   h.assert(!('waitingOn' in h.s), 'waitingOn is never stored in GameState')
+})
+
+// ── cardEffectLine: the Chance/Chest result-line contract ──
+// The copy strings ARE the contract (phone + TV render them verbatim);
+// these assertions are byte-exact on purpose.
+
+scenario('cardEffectLine: money and pay cards name the bank amount', 4, (h) => {
+  h.eq(cardEffectLine(cardById('ch7'), h.s, h.id(0)), '+$50 from the bank', 'ch7 dividend')
+  h.eq(cardEffectLine(cardById('ch16'), h.s, h.id(0)), '+$150 from the bank', 'ch16 building loan')
+  h.eq(cardEffectLine(cardById('cc2'), h.s, h.id(0)), '+$200 from the bank', 'cc2 bank error')
+  h.eq(cardEffectLine(cardById('cc14'), h.s, h.id(0)), '+$25 from the bank', 'cc14 consultancy fee')
+  h.eq(cardEffectLine(cardById('ch12'), h.s, h.id(0)), '-$15 to the bank', 'ch12 speeding fine')
+  h.eq(cardEffectLine(cardById('cc3'), h.s, h.id(0)), '-$50 to the bank', 'cc3 doctor fee')
+  h.eq(cardEffectLine(cardById('cc12'), h.s, h.id(0)), '-$100 to the bank', 'cc12 hospital fees')
+})
+
+scenario('cardEffectLine: payEach and collectEach count the other living players', 4, (h) => {
+  h.eq(cardEffectLine(cardById('ch15'), h.s, h.id(0)), '-$50 x 3 players = -$150', 'chairman pays each of the 3 others')
+  h.eq(cardEffectLine(cardById('cc7'), h.s, h.id(0)), '+$50 x 3 players = +$150', 'opera night collects from 3')
+  h.eq(cardEffectLine(cardById('cc10'), h.s, h.id(0)), '+$10 x 3 players = +$30', 'birthday collects from 3')
+  // a bankrupt seat is not part of the table any more
+  h.p(3).bankrupt = true
+  h.eq(cardEffectLine(cardById('ch15'), h.s, h.id(0)), '-$50 x 2 players = -$100', 'bankrupt seats are not charged')
+  h.eq(cardEffectLine(cardById('cc7'), h.s, h.id(0)), '+$50 x 2 players = +$100', 'and do not pay into collections')
+})
+
+scenario('cardEffectLine: payEach and collectEach with one opponent read singular', 2, (h) => {
+  h.eq(cardEffectLine(cardById('ch15'), h.s, h.id(0)), '-$50 x 1 player = -$50', 'one opponent, singular')
+  h.eq(cardEffectLine(cardById('cc10'), h.s, h.id(0)), '+$10 x 1 player = +$10', 'one opponent, singular')
+})
+
+scenario('cardEffectLine: repairs bills compute the drawer real holdings', 4, (h) => {
+  // ch11: $25/house, $100/hotel. The drawer holds Mediterranean (2 houses),
+  // Baltic (a hotel) and one railroad (ignored — repairs count buildings only).
+  h.give(0, [1, 3, 5])
+  h.prop(1, { houses: 2 })
+  h.prop(3, { houses: 5 })
+  h.eq(cardEffectLine(cardById('ch11'), h.s, h.id(0)), 'Bill: $150 ($25 per house, $100 per hotel)', '2 houses + 1 hotel, the rail ignored')
+  // cc15 ($40/house, $115/hotel) on the same estate
+  h.eq(cardEffectLine(cardById('cc15'), h.s, h.id(0)), 'Bill: $195 ($40 per house, $115 per hotel)', 'the same estate on the chest card')
+  // a drawer with no buildings owes nothing
+  h.give(1, [6])
+  h.eq(cardEffectLine(cardById('ch11'), h.s, h.id(1)), 'Bill: $0 ($25 per house, $100 per hotel)', 'an empty estate owes $0')
+})
+
+scenario('cardEffectLine: goto copies are static, ch13 never doubles', 4, (h) => {
+  h.eq(cardEffectLine(cardById('ch1'), h.s, h.id(0)), '-> GO - collect $200', 'advance to GO (chance)')
+  h.eq(cardEffectLine(cardById('cc1'), h.s, h.id(0)), '-> GO - collect $200', 'advance to GO (chest)')
+  h.eq(cardEffectLine(cardById('ch2'), h.s, h.id(0)), '-> Illinois Ave - collect $200 if you pass GO', 'advance to Illinois')
+  h.eq(cardEffectLine(cardById('ch3'), h.s, h.id(0)), '-> St. Charles Place - collect $200 if you pass GO', 'the card text omits the GO clause; the copy carries it')
+  h.eq(cardEffectLine(cardById('ch13'), h.s, h.id(0)), '-> JR East - Yamanote Line - collect $200 if you pass GO', 'the railroad TRIP charges normal rent: no doubling copy')
+  h.eq(cardEffectLine(cardById('ch14'), h.s, h.id(0)), '-> Boardwalk - collect $200 if you pass GO', 'walk on the Boardwalk')
+})
+
+scenario('cardEffectLine: move, nearest, jailcard, gotojail', 4, (h) => {
+  h.eq(cardEffectLine(cardById('ch9'), h.s, h.id(0)), '-> 3 spaces back', 'go back 3')
+  h.eq(cardEffectLine(cardById('ch4'), h.s, h.id(0)), '-> nearest railroad - pay double rent if owned', 'nearest rail: the doubling is real and now stated')
+  h.eq(cardEffectLine(cardById('ch5'), h.s, h.id(0)), '-> nearest railroad - pay double rent if owned', 'the second nearest-rail card says the same')
+  h.eq(cardEffectLine(cardById('ch6'), h.s, h.id(0)), '-> nearest utility - 10x a fresh dice roll if owned', 'nearest utility reads 10x, never "if both owned"')
+  h.eq(cardEffectLine(cardById('ch10'), h.s, h.id(0)), '-> straight to Jail - no $200 for passing GO', 'go directly to jail (chance)')
+  h.eq(cardEffectLine(cardById('cc6'), h.s, h.id(0)), '-> straight to Jail - no $200 for passing GO', 'go directly to jail (chest)')
+  h.eq(cardEffectLine(cardById('ch8'), h.s, h.id(0)), undefined, 'a jail card carries no effect line')
+  h.eq(cardEffectLine(cardById('cc5'), h.s, h.id(0)), undefined, 'the chest jail card neither')
+})
+
+scenario('cardEffectLine: every card in both decks is enumerated', 4, (h) => {
+  for (const c of ALL_CARDS) {
+    const line = cardEffectLine(c, h.s, h.id(0))
+    if (c.effect.kind === 'jailcard') h.eq(line, undefined, `${c.id} (jail card) has no effect line`)
+    else h.assert(typeof line === 'string' && line.length > 0, `${c.id} produced an effect line`)
+  }
+})
+
+// ── debtWhy: the recomputed why on the debt chip ──
+
+scenario('debtWhy: houses tier, full set and rail count, recomputed from state', 4, (h) => {
+  // 3 houses on Boardwalk (rent $600 at that tier)
+  h.give(1, [39])
+  h.prop(39, { houses: 3 })
+  h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 600, creditor: h.id(1), memo: 'Rent: Boardwalk' }), '3 houses', 'the houses tier is the why')
+  // a hotel ($2000)
+  h.prop(39, { houses: 5 })
+  h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 2000, creditor: h.id(1), memo: 'Rent: Boardwalk' }), 'hotel', 'hotel reads as hotel')
+  // the full blue set doubles base rent ($50 -> $100)
+  h.give(1, [37])
+  h.prop(39, { houses: 0 })
+  h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 100, creditor: h.id(1), memo: 'Rent: Boardwalk' }), 'full set', 'full-set doubling')
+  // a lone deed charges base rent ($50)
+  h.prop(37, { owner: null })
+  h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 50, creditor: h.id(1), memo: 'Rent: Boardwalk' }), 'base rent', 'a lone deed charges base rent')
+  // railroads: the count is the why (3 owned -> $100)
+  h.give(1, [5, 15, 35])
+  h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 100, creditor: h.id(1), memo: 'Rent: Namma Metro' }), '3 railroads owned', 'the railroad count is the why')
+})
+
+scenario('debtWhy: the utility dice product, 4x and the Chance 10x', 4, (h) => {
+  h.give(1, [12]) // BESCOM only
+  h.s.dice = [3, 6]
+  h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 36, creditor: h.id(1), memo: 'Rent: BESCOM' }), '4x your 9 = $36', 'one utility: 4x the dice')
+  // the Chance nearest-utility charge reads 10x even with one owned —
+  // utilMult bypasses the ownership count, and the amount betrays it
+  h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 90, creditor: h.id(1), memo: 'Rent: BESCOM' }), '10x your 9 = $90', 'the nearest-utility charge reads 10x with one owned')
+  // both owned: state itself says 10x, and the two agree
+  h.give(1, [28])
+  h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 90, creditor: h.id(1), memo: 'Rent: BESCOM' }), '10x your 9 = $90', 'both utilities: 10x either way')
+})
+
+scenario('debtWhy: card debts keep the debtBlurb text', 4, (h) => {
+  h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 100, creditor: null, memo: 'Card: Hospital fees. Pay $100.' }), 'Hospital fees', 'card memos drop the instruction tail')
+  h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 50, creditor: null, memo: 'Jail release fine' }), 'jail fine', 'the jail fine keeps its blurb')
+  h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 200, creditor: null, memo: 'Luxury tax' }), 'Luxury Tax', 'taxes keep their blurb')
+  h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 10, creditor: null }), 'a debt', 'a memo-less debt stays generic')
 })
 
 // ── summary ──

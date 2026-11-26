@@ -5,9 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Monopoly Party — TV</title>
   <link rel="stylesheet" href="/host.css" />
+  <link rel="stylesheet" href="/deed.css" />
   <script>document.documentElement.dataset.theme = localStorage.getItem('mp-theme') || 'light'</script>
 </head>
-<body>
+<!-- class="tv": the hook the shared deed stylesheet scales from (2.6vh root) -->
+<body class="tv">
   <div id="app"></div>
   <script type="module" src="/host.js"></script>
 </body>

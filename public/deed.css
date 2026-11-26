@@ -1,0 +1,86 @@
+/* public/deed.css: ONE title-deed component, shared by controller + host.
+   Band colour comes in as --g / --gi. Sized in em so the phone's 15px and
+   the TV's vh-scale both work off one root; the host's <body class="tv">
+   hook sets that root. */
+
+.deed { --deed-paper: var(--panel); --deed-ink: var(--ink); --deed-dim: var(--dim); font-variant-numeric: tabular-nums; }
+.deed--full, .deed--card {
+  position: relative; overflow: hidden; width: 100%; max-width: 340px;
+  background: var(--deed-paper); color: var(--deed-ink);
+  border: 1.5px solid var(--line); border-radius: 12px; font-size: 15px;
+}
+.deed-band {
+  display: grid; grid-template-columns: 1fr minmax(0, auto) 1fr; align-items: center; gap: 2px 8px;
+  background: var(--g); color: var(--gi); padding: 10px 12px; text-align: center;
+  border-bottom: 1.5px solid color-mix(in srgb, var(--g) 70%, #000);
+}
+.deed-tag {   /* white pill = 17:1 on every band; the colour-blind label */
+  grid-column: 1 / -1; justify-self: center;
+  background: #fff; color: #111827; border-radius: 99px; padding: 1px 8px;
+  font: 800 11px/1.5 system-ui, sans-serif; letter-spacing: 0.08em; text-transform: uppercase;
+}
+.deed-icon { grid-row: 2; grid-column: 1; justify-self: start; font-size: 1.4em; line-height: 1; }
+.deed-name { grid-column: 2; grid-row: 2; font-size: 19px; font-weight: 800; line-height: 1.15; margin: 0; } /* 19px bold = WCAG large */
+.deed-pips { display: inline-flex; gap: 2px; } .deed-band .deed-pips { grid-column: 3; grid-row: 2; justify-self: end; }
+.deed-pips i { width: 0.6em; height: 0.6em; background: #16a34a; border: 0.1em solid #fff; border-radius: 0.15em; }
+.deed-pips i.hotel { width: 1.2em; background: #dc2626; }
+.deed-price { text-align: center; padding: 8px 12px 2px; color: var(--deed-dim); }
+.deed-price b { color: var(--deed-ink); font-size: 1.13em; }
+.deed-rows { margin: 0; padding: 4px 12px 10px; }
+.deed-row { display: flex; justify-content: space-between; gap: 8px; padding: 3px 8px; border-left: 3px solid transparent; }
+.deed-row dt { color: var(--deed-dim); } .deed-row dd { margin: 0; font-weight: 700; text-align: right; }
+.deed-row.is-now { border-left-color: var(--deed-ink); background: color-mix(in srgb, var(--g) 18%, var(--deed-paper)); font-weight: 800; }
+.deed-row.is-now dt { color: var(--deed-ink); }
+.deed-row.is-now dt::before { content: '> '; }      /* shape cue, not colour alone */
+.deed-note { margin: 0; font-size: 0.87em; color: var(--deed-dim); font-weight: 500; }
+.deed-foot { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--line); background: var(--panel2); }
+.deed-foot b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.deed-set { margin-left: auto; letter-spacing: 0.05em; white-space: nowrap; }
+.deed.is-set .deed-set { font-weight: 800; }
+.deed-bank { color: var(--deed-dim); }
+.deed.is-mortgaged .deed-band { filter: saturate(0.3); }
+/* the ladder dims + hatches under a mortgage, but the terms rows stay
+   fully readable — the Unmortgage number is the one you need */
+.deed.is-mortgaged .deed-rows { background: repeating-linear-gradient(-45deg, transparent 0 8px, color-mix(in srgb, var(--deed-dim) 18%, transparent) 8px 10px); }
+.deed.is-mortgaged .deed-row { opacity: 0.7; }
+.deed.is-mortgaged .deed-row--terms { opacity: 1; background: var(--deed-paper); }
+.deed-stamp {
+  position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%) rotate(-12deg);
+  border: 3px solid var(--bad); color: var(--bad); background: var(--deed-paper);
+  font-weight: 900; letter-spacing: 0.12em; padding: 2px 10px; border-radius: 6px;
+}
+
+/* ── chip ── */
+.deed--chip {
+  display: inline-flex; align-items: center; gap: 6px; min-height: 36px; max-width: 100%;
+  padding: 4px 10px 4px 4px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--panel); color: var(--ink); font: inherit; font-size: 14px;
+}
+.deed--chip.sel { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.deed-sw { align-self: stretch; width: 10px; min-height: 26px; border-radius: 6px; background: var(--g); }
+.deed-cn { font-weight: 700; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.deed-ct { font-size: 11px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; color: var(--dim); white-space: nowrap; }
+.deed--chip .deed-pips i { border-color: var(--panel); }
+.deed-mtg {
+  font-size: 9px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--bad); border: 1px solid currentColor; border-radius: 6px; padding: 0 5px;
+  white-space: nowrap;
+}
+.deed-flag { font-size: 11px; font-weight: 800; color: var(--good); border: 1px solid currentColor; border-radius: 6px; padding: 0 5px; white-space: nowrap; }
+.deed-cv { margin-left: auto; padding-left: 6px; white-space: nowrap; }
+.deed--chip.is-mortgaged { opacity: 0.6; }
+.deed--chip.is-mortgaged .deed-sw { background: repeating-linear-gradient(-45deg, var(--g) 0 3px, var(--panel) 3px 5px); }
+
+/* ── card face ── */
+.deed--card .deed-band { grid-template-columns: auto 1fr; }
+.deed-text { padding: 14px 14px 6px; font-size: 1.13em; font-weight: 600; text-align: center; margin: 0; }
+.deed-effect { margin: 4px 14px 14px; padding: 6px 10px; border-radius: 8px; text-align: center; font-weight: 800; background: color-mix(in srgb, var(--g) 14%, var(--deed-paper)); }
+.deed-cardnote { padding: 0 14px 14px; text-align: center; }
+
+/* ── TV: everything in em, the root scales with the host's vh convention —
+   the smallest text stays >= 24px at 1080p (2.6vh = 28px there) and the
+   24px floor holds on short viewports ── */
+.tv .deed { font-size: max(24px, 2.6vh); } .tv .deed--full, .tv .deed--card { max-width: 560px; }
+.tv .deed-name { font-size: 1.35em; } .tv .deed-tag, .tv .deed-ct, .tv .deed-flag, .tv .deed-mtg { font-size: 0.86em; }
+
+@media (prefers-reduced-motion: no-preference) { .deed-row.is-now { transition: background 0.3s; } }
