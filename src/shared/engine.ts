@@ -363,21 +363,23 @@ function handleProperty(s: GameState, p: PlayerState, i: number, opts: { railMul
 
 // ── Cards ──
 
-function rebuildDeck(s: GameState, deck: 'chance' | 'chest'): void {
+function rebuildDeck(s: GameState, deck: 'chance' | 'chest', rng: () => number): void {
   // Only jail cards ever leave a deck (held by a player), so exclude them here.
+  // The caller's rng threads through — a Math.random here would break
+  // SEED-replay determinism the moment a deck ran dry mid-game.
   const jailId = deck === 'chance' ? CHANCE_JAIL_CARD_ID : CHEST_JAIL_CARD_ID
   const ids = ALL_CARDS.filter((c) => c.deck === deck)
     .map((c) => c.id)
     .filter((id) => id !== jailId)
-  if (deck === 'chance') s.chanceDeck = shuffle(ids, Math.random)
-  else s.chestDeck = shuffle(ids, Math.random)
+  if (deck === 'chance') s.chanceDeck = shuffle(ids, rng)
+  else s.chestDeck = shuffle(ids, rng)
 }
 
 function drawCard(s: GameState, deck: 'chance' | 'chest', p: PlayerState, rng: () => number): void {
   const key = deck === 'chance' ? 'chanceDeck' : 'chestDeck'
   let id = s[key].shift()
   if (!id) {
-    rebuildDeck(s, deck)
+    rebuildDeck(s, deck, rng)
     id = s[key].shift()
   }
   if (!id) return
@@ -570,7 +572,7 @@ function checkGameOver(s: GameState, lastStanding = false): boolean {
   return true
 }
 
-export function declareBankruptcy(s: GameState, p: PlayerState, lastStanding = false): Result {
+export function declareBankruptcy(s: GameState, p: PlayerState, lastStanding = false, rng: () => number = Math.random): Result {
   const d = s.debt
   if (!d || d.debtor !== p.id) return fail('No debt to declare bankruptcy over')
   if (s.phase !== 'DEBT') return fail('Not in debt resolution')
@@ -664,7 +666,7 @@ export function declareBankruptcy(s: GameState, p: PlayerState, lastStanding = f
   if (s.pendingJail != null && s.pendingJail.player === p.id) s.pendingJail = null
 
   if (checkGameOver(s, lastStanding)) return OK
-  resumeAfterDebt(s, Math.random)
+  resumeAfterDebt(s, rng)
   return OK
 }
 
@@ -676,7 +678,7 @@ export function declareBankruptcy(s: GameState, p: PlayerState, lastStanding = f
 // automatically if nobody else is left. (A leaver with a pending
 // PLAYER-debt is routed here by the rooms layer through declareBankruptcy
 // instead, so the lender gets paid per the tested rules.)
-export function forfeitEstate(s: GameState, pid: string, headline?: string): Result {
+export function forfeitEstate(s: GameState, pid: string, headline?: string, rng: () => number = Math.random): Result {
   const p = R.byId(s, pid)
   if (!p || p.bankrupt) return fail('Nothing to forfeit')
 
@@ -729,7 +731,7 @@ export function forfeitEstate(s: GameState, pid: string, headline?: string): Res
   if (hadOwnDebt) {
     // Debt machinery was mid-flight for the leaver — hand the flow to the
     // standard resume: queued debts first, then the liquidation auctions.
-    resumeAfterDebt(s, Math.random)
+    resumeAfterDebt(s, rng)
     return OK
   }
   const au = s.auction
@@ -752,6 +754,80 @@ export function forfeitEstate(s: GameState, pid: string, headline?: string): Res
   }
   if (s.currentPlayerId === pid) nextPlayer(s)
   return OK
+}
+
+// ── autoSettle: the debt-clock liquidation plan ──
+// When an unaffordable debt's decision clock expires, the seat is settled
+// minimally instead of going straight to the bankruptcy hammer. Two phases
+// alternate, each step re-checked against the wallet, stopping the moment
+// the bill is covered:
+//   Phase 1 — sell a house on the dearest house-cost street that
+//   canSellHouseOn allows: dearest-first raises the sum with the fewest
+//   buildings destroyed (canSellHouseOn already enforces even selling
+//   within the group, so the estate is never stripped unevenly).
+//   Phase 2 — mortgage the next property canMortgageOn allows, ordered
+//   unmonopolized groups first at the cheapest printed price, monopolized
+//   groups last, cheapest first: double-rent sets stay alive as long as
+//   any single can still cover the gap. (canMortgageOn demands a
+//   house-free group — which is why houses go first.)
+// Pure: planning runs against a scratch copy (JSON round-trip, es2020-safe
+// for the browser bundle) with every step applied there, so each returned
+// action is individually legal against the state its predecessors leave
+// behind — replaying the list through the reducer reproduces exactly this
+// plan. Ties break on the lower space index for determinism.
+export function liquidationPlan(s: GameState, pid: string, amount: number): Array<[string, Action]> {
+  const plan: Array<[string, Action]> = []
+  const p = R.byId(s, pid)
+  if (!p || p.bankrupt || amount <= 0 || p.cash >= amount) return plan
+  const work = JSON.parse(JSON.stringify(s)) as GameState
+  const cash = (): number => R.byId(work, pid)?.cash ?? 0
+  // A step the reducer refuses (a rules-combination bug, never in practice)
+  // is banned for the rest of the plan so the loop always terminates.
+  const banned = new Set<number>()
+  const priceOf = (i: number): number => {
+    const sp = BOARD[i]
+    return 'price' in sp ? sp.price : 0
+  }
+  while (cash() < amount) {
+    let stepped = false
+    // ── Phase 1: sell one house, dearest house-cost first ──
+    const sellable = R.ownedSpaces(work, pid).filter((i) => !banned.has(i) && R.canSellHouseOn(work, pid, i))
+    if (sellable.length > 0) {
+      const best = sellable.reduce((a, b) => {
+        const sa = BOARD[a]
+        const sb = BOARD[b]
+        if (!isStreet(sa) || !isStreet(sb)) return a
+        return sb.houseCost > sa.houseCost ? b : a
+      })
+      const res = applyAction(work, { type: 'sellHouse', space: best }, pid)
+      if (res.ok) {
+        plan.push([pid, { type: 'sellHouse', space: best }])
+        stepped = true
+        if (cash() >= amount) break
+      } else banned.add(best)
+    }
+    // ── Phase 2: mortgage one property, singles before monopolies ──
+    const mortgageable = R.ownedSpaces(work, pid).filter((i) => !banned.has(i) && R.canMortgageOn(work, pid, i))
+    if (mortgageable.length > 0) {
+      const tierOf = (i: number): number => {
+        const sp = BOARD[i]
+        return isStreet(sp) && R.ownsGroup(work, pid, sp.group) ? 1 : 0
+      }
+      const best = mortgageable.reduce((a, b) => {
+        const [tb, pb] = [tierOf(b), priceOf(b)]
+        const [ta, pa] = [tierOf(a), priceOf(a)]
+        return tb < ta || (tb === ta && pb < pa) ? b : a
+      })
+      const res = applyAction(work, { type: 'mortgage', space: best }, pid)
+      if (res.ok) {
+        plan.push([pid, { type: 'mortgage', space: best }])
+        stepped = true
+        if (cash() >= amount) break
+      } else banned.add(best)
+    }
+    if (!stepped) break // no legal step remains — the estate is fully liquid
+  }
+  return plan
 }
 
 // ── Trades ──
@@ -1007,7 +1083,7 @@ export function applyAction(s: GameState, a: Action, by: string, rng: () => numb
     }
 
     case 'bankrupt': {
-      return declareBankruptcy(s, p)
+      return declareBankruptcy(s, p, false, rng)
     }
 
     case 'proposeTrade': {

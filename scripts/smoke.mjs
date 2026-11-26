@@ -3,7 +3,7 @@
 // proves reconnect works. Run: npm run smoke
 
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs'
 import { io } from 'socket.io-client'
 
 const PORT = 3123
@@ -34,13 +34,47 @@ function emitAck(sock, event, ...args) {
   return new Promise((resolve) => sock.emit(event, ...args, resolve))
 }
 
+// ── boot-restore fixture ──
+// One valid snapshot, one corrupt file (parse failure), one that parses
+// but fails validation. The boot must restore the first — through the same
+// validateSnapshot + restoreRoomFromSnapshot the god import uses — and
+// QUARANTINE the broken two (renamed .bad, never deleted), then continue.
+const SNAPFIX = 'snapshots-test'
+mkdirSync(SNAPFIX, { recursive: true })
+const FIXTURES = [
+  ['ZZZQ.json', JSON.stringify({
+    v: 1,
+    code: 'ZZZQ',
+    hostToken: 'fixture-host-token-000000',
+    hostPlayerId: 'fix0',
+    turnTimeoutMs: 0,
+    players: [
+      { meta: { id: 'fix0', name: 'FixA', color: '#8b5cf6', token: '🚢' }, token: 'fixture-seat-token-a' },
+      { meta: { id: 'fix1', name: 'FixB', color: '#f43f5e', token: '🚗' }, token: 'fixture-seat-token-b' },
+    ],
+    state: null,
+  })],
+  ['ZZZX.json', '{corrupt json,,'],
+  ['ZZZY.json', JSON.stringify({ players: 'nope' })],
+]
+for (const [name, body] of FIXTURES) writeFileSync(`${SNAPFIX}/${name}`, body)
+
 console.log('booting server …')
 const server = spawn(process.execPath, ['dist/server/index.js'], {
   env: { ...process.env, PORT: String(PORT), SNAP_DIR: 'snapshots-test' },
   stdio: ['ignore', 'pipe', 'pipe'],
 })
-server.stdout.on('data', (d) => process.stdout.write(d))
-server.stderr.on('data', (d) => process.stderr.write(d))
+let bootLog = ''
+server.stdout.on('data', (d) => {
+  bootLog += String(d)
+  process.stdout.write(d)
+})
+// The quarantine/restore diagnostics log through console.error — the boot
+// assertions need them too.
+server.stderr.on('data', (d) => {
+  bootLog += String(d)
+  process.stderr.write(d)
+})
 
 // Wait for the child to actually bind before dialing it — dialing early
 // races the listen() and, with reconnection disabled, wedges the client.
@@ -61,6 +95,22 @@ await new Promise((resolve, reject) => {
 })
 
 try {
+  // ── boot restore: quarantine + valid-file restore, boot completes ──
+  // (The whole rest of this suite running IS the proof the boot continued
+  // past the broken files.)
+  assert(bootLog.includes('restored room ZZZQ'), 'boot restored the valid snapshot room')
+  assert(bootLog.includes('quarantined ZZZX.json'), 'the corrupt JSON file was quarantined')
+  assert(bootLog.includes('quarantined ZZZY.json'), 'the invalid snapshot file was quarantined')
+  assert(existsSync(`${SNAPFIX}/ZZZX.json.bad`), 'quarantine renames, never deletes (.bad present)')
+  assert(existsSync(`${SNAPFIX}/ZZZY.json.bad`), 'the invalid snapshot was renamed out of the boot path too')
+  assert(!existsSync(`${SNAPFIX}/ZZZX.json`), 'the broken file is out of the boot path')
+  {
+    const fixTv = connect()
+    const fh = await emitAck(fixTv, 'room:hostJoin', { code: 'ZZZQ', hostToken: 'fixture-host-token-000000' })
+    assert(fh.ok, 'a boot-restored room reclaims via its persisted host token')
+    fixTv.disconnect()
+  }
+
   // ── room + lobby ──
   const host = connect()
   const created = await emitAck(host, 'room:create')
@@ -692,6 +742,75 @@ try {
     pa.disconnect()
     pb.disconnect()
     tv3.disconnect()
+  }
+
+  // ── per-socket rate limit: burst → error acks; sustained → disconnect ──
+  {
+    const tvr = connect()
+    const cr = await emitAck(tvr, 'room:create')
+    assert(cr.ok, 'rate-limit room created')
+    // 'Oth' joins first → the current player; the flood socket is a bystander
+    const other = connect()
+    const oj = await emitAck(other, 'room:join', { code: cr.code, name: 'Oth' })
+    const flood = connect()
+    const fj = await emitAck(flood, 'room:join', { code: cr.code, name: 'Fln' })
+    assert(oj.ok && fj.ok, 'two phones joined the rate-limit room')
+    let ov = null
+    let fv = null
+    other.on('view', (v) => {
+      ov = v
+    })
+    flood.on('view', (v) => {
+      fv = v
+    })
+    const sk = await emitAck(tvr, 'game:start', {})
+    assert(sk.ok, 'rate-limit game started')
+    await waitFor(() => ov != null && fv != null, 8000, 'rate-limit views')
+
+    // A burst past the bucket (capacity 30 + 10/s refill): the over-limit
+    // events get error acks — never silence — while another player's
+    // action still lands.
+    const acks = [new Promise((res) => other.emit('game:action', { type: 'roll' }, res))]
+    for (let i = 0; i < 45; i++) acks.push(new Promise((res) => flood.emit('game:action', { type: 'roll' }, res)))
+    const rs = await Promise.all(acks)
+    assert(rs[0] && rs[0].ok === true, `the other player's roll still landed (${rs[0] && rs[0].error})`)
+    const served = rs.slice(1).filter((r) => r && r.ok === false && !/slow/i.test(r.error || ''))
+    const denied = rs.slice(1).filter((r) => r && r.ok === false && /slow/i.test(r.error || ''))
+    assert(denied.length > 0, `over-limit events get rate error acks (${denied.length} of 45)`)
+    assert(served.length > 0, `the first ${served.length} burst events were served their normal rejection`)
+    assert(ov && ov.dice != null, 'the game state moved despite the flood')
+
+    // Sustained exhaustion: the bucket continuously empty past the 10s
+    // rule disconnects the socket — and disconnects are never punished:
+    // the SAME seat rejoins cleanly with its stored token.
+    let disconnected = false
+    flood.on('disconnect', () => {
+      disconnected = true
+    })
+    const t0 = Date.now()
+    let sent = 0
+    while (Date.now() - t0 < 12_000 && !disconnected) {
+      flood.emit('game:action', { type: 'roll' })
+      sent++
+      await sleep(10)
+    }
+    assert(disconnected, `sustained flood disconnected the socket after ~${((Date.now() - t0) / 1000).toFixed(1)}s (${sent} events)`)
+    const back = connect()
+    const bres = await emitAck(back, 'room:rejoin', { token: fj.token })
+    assert(bres.ok && bres.playerId === fj.playerId, 'the same seat rejoins cleanly after the rate disconnect')
+    back.disconnect()
+    other.disconnect()
+    tvr.disconnect()
+  }
+
+  // boot-restore fixture cleanup (quarantine keeps party records; the
+  // fixtures are ours, so they go)
+  for (const f of ['ZZZQ.json', 'ZZZX.json.bad', 'ZZZY.json.bad']) {
+    try {
+      unlinkSync(`${SNAPFIX}/${f}`)
+    } catch {
+      /* already gone */
+    }
   }
 } catch (err) {
   failed++

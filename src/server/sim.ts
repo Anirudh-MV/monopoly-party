@@ -6,6 +6,7 @@
 import { createGame, applyAction, type PlayerMeta } from '../shared/engine.js'
 import { alivePlayers, netWorth } from '../shared/rules.js'
 import { botAction, botActor } from '../shared/bot.js'
+import { createHash } from 'node:crypto'
 import type { GameState } from '../shared/types.js'
 
 const METAS: PlayerMeta[] = [
@@ -51,6 +52,10 @@ const MAX_TURNS = 600
 let completed = 0
 let timeouts = 0
 let totalSteps = 0
+// A running digest of every applied action — with the rng fully threaded,
+// two runs on the same SEED must print the same hash (deck rebuilds and
+// bankruptcy resumes included). This is the determinism contract.
+let transcript = ''
 
 for (let g = 0; g < GAMES; g++) {
   const s = createGame(METAS, rng)
@@ -66,6 +71,7 @@ for (let g = 0; g < GAMES; g++) {
     const action = botAction(s, actor, rng)
     if (action) {
       const res = applyAction(s, action, actor, rng)
+      transcript += `${g}:${actor}|${JSON.stringify(action)}|${res.ok ? 1 : 0};`
       // Bot payloads can be invalid (that's fine — a party guest clicking
       // nonsense is normal life). What must never happen: an exception.
       if (!res.ok && action.type !== 'proposeTrade' && action.type !== 'respondTrade') {
@@ -92,4 +98,5 @@ for (let g = 0; g < GAMES; g++) {
 console.log('')
 console.log(`✔ ${GAMES} games: ${completed} finished, ${timeouts} hit the ${MAX_TURNS}-turn cap, ${totalSteps} total actions, ~${Math.round(totalSteps / GAMES)} actions/game`)
 console.log(SEED > 0 ? `seed: ${SEED} (replay with SEED=${SEED})` : 'seed: random (set SEED=n for reproducible runs)')
+console.log(`transcript: ${createHash('sha256').update(transcript).digest('hex').slice(0, 16)}`)
 console.log('Engine survived: no exceptions, no deadlocks, invariants held.')

@@ -31,7 +31,45 @@ function assert(cond, msg) {
 function connect() {
   return io(URL, { reconnection: false, auth: { key: PARTY_KEY } })
 }
-function emitAck(sock, event, ...args) {
+
+// ── Per-socket pacing ──
+// The server enforces a token bucket per socket (capacity 30, refill 10/s)
+// on every inbound event. This battery fires dozens of hostile payloads in
+// tight loops, which would trip the bucket and turn real handler
+// rejections into rate rejections — so model the bucket client-side and
+// wait for a token before each send. The LIMIT itself is not weakened:
+// every payload reaches its real handler.
+const BUCKET_CAP = 30
+const REFILL_PER_SEC = 10
+// 5% margin per send: unmodelled events (handshake echoes, the odd direct
+// emit) spend server tokens the model never sees — err on the safe side.
+const TOKEN_COST = 1.05
+// Keyed by the socket OBJECT: sock.id is undefined until the connect
+// handshake completes, and keying by it would fuse fresh sockets into one
+// shared bucket.
+const buckets = new WeakMap()
+function waitMsForToken(sock) {
+  const now = Date.now()
+  let b = buckets.get(sock)
+  if (!b) {
+    b = { tokens: BUCKET_CAP, at: now }
+    buckets.set(sock, b)
+  }
+  b.tokens = Math.min(BUCKET_CAP, b.tokens + ((now - b.at) / 1000) * REFILL_PER_SEC)
+  b.at = now
+  if (b.tokens >= TOKEN_COST) {
+    b.tokens -= TOKEN_COST
+    return 0
+  }
+  return Math.ceil(((TOKEN_COST - b.tokens) / REFILL_PER_SEC) * 1000)
+}
+
+async function emitAck(sock, event, ...args) {
+  for (;;) {
+    const wait = waitMsForToken(sock)
+    if (wait <= 0) break
+    await sleep(wait)
+  }
   return new Promise((resolve) => {
     const t = setTimeout(() => resolve({ ok: false, error: 'no ack' }), 5000)
     sock.emit(event, ...args, (res) => {
@@ -591,6 +629,35 @@ try {
     assert(capped && !capped.ok && /too many rooms/i.test(capped.error || ''), 'the mint cap counts resets')
     tvc.close()
     assert(alive(), 'server alive after the reset cap probe')
+  }
+
+  // ── rate limit: the error ack shape (throwaway socket) ──
+  // A short burst past the bucket (well under the 10s disconnect rule)
+  // must be dropped with the standard {ok:false, error} ack — never
+  // silence — and the server must stay up.
+  {
+    const fl = connect()
+    const flCreate = await emitAck(fl, 'room:create')
+    assert(flCreate.ok, 'flood socket attached')
+    const acks = []
+    for (let i = 0; i < 45; i++) {
+      acks.push(
+        new Promise((res) => {
+          const t = setTimeout(() => res(null), 4000)
+          fl.emit('room:watch', { code: 'OIOI' }, (r) => {
+            clearTimeout(t)
+            res(r)
+          })
+        }),
+      )
+    }
+    const rs = (await Promise.all(acks)).filter(Boolean)
+    const rateAcks = rs.filter((r) => r.ok === false && typeof r.error === 'string' && /slow/i.test(r.error))
+    assert(rateAcks.length > 0, `rate-limit acks carry the standard {ok:false,error} shape (${rateAcks.length} of ${rs.length})`)
+    assert(rs.every((r) => r.ok === false), 'every flood ack is a refusal')
+    assert(alive(), 'server alive after the flood (short of the disconnect rule)')
+    fl.disconnect()
+    await sleep(300)
   }
 
   // ── the game must still be fully playable ──

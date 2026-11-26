@@ -4,13 +4,54 @@
 // plays rigged dice through the real reducer, and asserts exact outcomes.
 // Run: npm run scenarios
 
-import { applyAction, createGame, forfeitEstate, MAX_GAME_LOG, type PlayerMeta, type Result } from '../shared/engine.js'
-import { decisionFor, forfeitSeat } from './rooms.js'
+import {
+  applyAction,
+  createGame,
+  forfeitEstate,
+  liquidationPlan,
+  MAX_GAME_LOG,
+  type PlayerMeta,
+  type Result,
+} from '../shared/engine.js'
+import { auctionGraceActions, commit, debtAutoActions, decisionFor, forfeitSeat, type Room } from './rooms.js'
 import { allowedActions, debtBlurb, rentFor, rentPreview } from '../shared/rules.js'
 import type { Action, DebtState, GameState, PlayerState, PropertyState } from '../shared/types.js'
 
 const NAMES = ['Asha', 'Ben', 'Cho', 'Dara']
 const TOKENS = ['🎩', '🚗', '🐕', '🚢']
+
+// Deterministic rng for replay scenarios (the same generator the
+// simulator uses) — the backbone of the rng-threading checks.
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0
+  return () => {
+    a |= 0
+    a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+// A stub room around an engine state: io null means commit() runs its core
+// (clone, apply, commit) with no broadcast, no timers, no disk writes.
+function stubRoom(s: GameState): Room {
+  return {
+    code: 'TEST',
+    hostToken: 't',
+    hostPlayerId: null,
+    turnTimeoutMs: 0,
+    state: structuredClone(s),
+    hostSockets: new Set(),
+    players: [],
+    lastActive: Date.now(),
+    timer: null,
+    timerKey: null,
+    watchdogBusy: false,
+    graceTimer: null,
+    graceKey: null,
+  }
+}
 
 // A rigged rng: each pair is one die roll, consumed in order.
 function rig(...pairs: number[][]): () => number {
@@ -1054,6 +1095,315 @@ scenario('the game log is capped so a god export always re-imports', 4, (h) => {
   h.eq(h.s.log.length, MAX_GAME_LOG, 'the log never grows past the cap')
   h.eq(h.s.log[h.s.log.length - 1].text.includes('landed on unowned'), true, 'the newest line survived the trim')
   h.eq(h.s.log[0].text.startsWith('filler'), true, 'the oldest lines were the ones dropped')
+})
+
+// ── autoSettle: the debt-clock liquidation (rooms + engine) ──
+
+scenario('autoSettle sells the dearest house, mortgages the cheap single, then the next house', 4, (h) => {
+  // A $180 bank debt against $10 cash: the two phases alternate, each step
+  // re-checked against the wallet, stopping the moment the bill is covered.
+  // Dearest-first selling keeps the buildings destroyed to a minimum; the
+  // cheap single mortgaged before the monopoly (keeps double-rent alive).
+  h.cash(0, 10)
+  h.give(0, [37, 39, 3]) // blue monopoly with houses + single Baltic
+  h.prop(37, { houses: 2 })
+  h.prop(39, { houses: 2 })
+  h.s.debt = { debtor: h.id(0), amount: 180, creditor: null }
+  h.s.phase = 'DEBT'
+  const built = debtAutoActions(h.s, h.id(0))
+  h.eq(built.autos.length, 4, 'the settle is the plan plus the payment')
+  h.eq(built.autos[built.autos.length - 1], [h.id(0), { type: 'payDebt' }], 'it ends in payDebt')
+  h.eq(
+    built.headline != null && built.headline.includes('the bank liquidates Asha') && built.headline.includes('$180'),
+    true,
+    'the liquidation headline rides the same commit',
+  )
+  const plan = liquidationPlan(h.s, h.id(0), 180)
+  const step = (a: Action): string => (a.type === 'sellHouse' || a.type === 'mortgage' ? `${a.type}:${a.space}` : a.type)
+  h.eq(
+    plan.map(([, a]) => step(a)),
+    ['sellHouse:37', 'mortgage:3', 'sellHouse:39'],
+    'exact order: dearest house (tie → lower index), cheap single, next house',
+  )
+  // replaying the plan through the real reducer reproduces it step for step
+  for (const [, a] of plan) h.ok(h.act(0, a), 'each planned step is legal against its predecessors')
+  h.eq(h.p(0).cash, 240, '10 + 100 + 30 + 100 raised')
+  h.ok(h.act(0, { type: 'payDebt' }), 'the settle pays on the same list')
+  h.eq(h.p(0).cash, 60, 'the debt left the wallet')
+  h.eq(h.s.props[3].mortgaged, true, 'the single is mortgaged')
+  h.eq(h.s.props[37].mortgaged, false, 'the monopoly is untouched by mortgages')
+  h.eq(h.s.props[37].houses, 1, 'even selling preserved: one house left on Park Place')
+  h.eq(h.s.props[39].houses, 1, 'and one on Boardwalk')
+  h.eq(h.s.debt, null, 'debt settled')
+})
+
+scenario('autoSettle pays with mortgages alone when no houses stand', 4, (h) => {
+  h.cash(0, 10)
+  h.give(0, [1, 11]) // singles in two different groups, no houses anywhere
+  h.s.debt = { debtor: h.id(0), amount: 60, creditor: null }
+  h.s.phase = 'DEBT'
+  const built = debtAutoActions(h.s, h.id(0))
+  const plan = liquidationPlan(h.s, h.id(0), 60)
+  const step = (a: Action): string => (a.type === 'sellHouse' || a.type === 'mortgage' ? `${a.type}:${a.space}` : a.type)
+  h.eq(plan.map(([, a]) => step(a)), ['mortgage:1', 'mortgage:11'], 'cheapest unmonopolized single first, then the next')
+  h.eq(built.autos.length, plan.length + 1, 'autos are exactly the plan plus payDebt')
+  for (const [, a] of plan) h.ok(h.act(0, a), 'each step replays clean')
+  h.eq(h.p(0).cash, 10 + 30 + 75, 'mortgage proceeds raised the funds')
+  h.ok(h.act(0, { type: 'payDebt' }), 'and the payment settles it')
+  h.eq(h.p(0).cash, 55, 'settled: 10 + 30 + 75 − 60')
+  h.eq(h.s.props[1].mortgaged && h.s.props[11].mortgaged, true, 'both singles mortgaged')
+})
+
+scenario('autoSettle falls to true bankruptcy when the estate cannot cover it', 4, (h) => {
+  // A $500 player-debt against a $40 estate: even full liquidation cannot
+  // cover the bill, so the existing bankruptcy cascade fires — with NO
+  // pre-bankruptcy liquidation committed. Creditor estate transfer first
+  // (the assertions the existing bankruptcy scenario pins), then the
+  // bank variant: deeds under the hammer.
+  h.give(0, [3])
+  h.cash(0, 10)
+  h.cash(1, 100)
+  h.s.debt = { debtor: h.id(0), amount: 500, creditor: h.id(1) }
+  h.s.phase = 'DEBT'
+  const built = debtAutoActions(h.s, h.id(0))
+  h.eq(built.autos, [[h.id(0), { type: 'bankrupt' }]], 'bankruptcy is the play when liquidation cannot cover')
+  h.eq(
+    built.headline != null && built.headline.includes("Asha can't cover the $500"),
+    true,
+    'the bankruptcy-despite-liquidation headline',
+  )
+  h.eq(h.s.props[3].mortgaged, false, 'no liquidation was committed ahead of the bankruptcy')
+  h.ok(h.act(0, { type: 'bankrupt' }), 'the existing cascade, untouched')
+  h.eq(h.p(0).bankrupt, true, 'bankrupt')
+  h.eq(h.p(1).cash, 110, 'the creditor got the estate ($10 cash + the deed, unmortgaged → no interest)')
+  h.eq(h.s.props[3].owner, h.id(1), 'the deed transferred')
+  h.eq(h.s.props[3].mortgaged, false, 'unmortgaged — no interest due')
+  h.eq(h.s.phase, 'ROLL', 'play continues')
+
+  // bank variant: the hammer, exactly like the existing bank-bankruptcy scenario
+  h.give(2, [6, 11])
+  h.cash(2, 10)
+  h.s.debt = { debtor: h.id(2), amount: 999, creditor: null }
+  h.s.phase = 'DEBT'
+  const built2 = debtAutoActions(h.s, h.id(2))
+  h.eq(built2.autos, [[h.id(2), { type: 'bankrupt' }]], 'bank debts go bankrupt the same way')
+  h.ok(h.act(2, { type: 'bankrupt' }), 'bankrupt to the bank')
+  h.eq(h.s.props[6].owner, null, 'property back with the bank')
+  h.eq(h.s.auction != null && (h.s.auction.space === 6 || h.s.auction.space === 11), true, 'one deed under the hammer')
+  h.eq(
+    h.s.auctionQueue.includes(h.s.auction != null && h.s.auction.space === 6 ? 11 : 6),
+    true,
+    'the second deed queued behind it',
+  )
+  h.eq(h.s.phase, 'AUCTION', 'liquidation auction running')
+})
+
+scenario('autoSettle never strips monopolies while singles remain', 4, (h) => {
+  h.cash(0, 0)
+  h.give(0, [31, 32, 34]) // the full green monopoly
+  h.give(0, [6, 5]) // a single street and a railroad
+  h.s.debt = { debtor: h.id(0), amount: 100, creditor: null }
+  h.s.phase = 'DEBT'
+  const plan = liquidationPlan(h.s, h.id(0), 100)
+  const step = (a: Action): string => (a.type === 'sellHouse' || a.type === 'mortgage' ? `${a.type}:${a.space}` : a.type)
+  h.eq(plan.map(([, a]) => step(a)), ['mortgage:6', 'mortgage:5'], 'singles first — cheapest printed price first')
+  h.eq(h.s.props[31].mortgaged, false, 'the monopoly is intact (the plan is pure — nothing applied to the real state)')
+  // a deeper bill: only when the singles are gone do the monopoly streets
+  // go, cheapest first
+  const deep = liquidationPlan(h.s, h.id(0), 400)
+  h.eq(
+    deep.map(([, a]) => step(a)),
+    ['mortgage:6', 'mortgage:5', 'mortgage:31', 'mortgage:32'],
+    'monopolized groups go last, cheapest street first',
+  )
+})
+
+scenario('an unaffordable debt arms the 90s autoSettle clock at timer-off', 4, (h) => {
+  h.cash(0, 10)
+  h.give(0, [3])
+  h.s.debt = { debtor: h.id(0), amount: 500, creditor: null }
+  h.s.phase = 'DEBT'
+  const d = decisionFor(h.s, 0)
+  h.assert(d != null, 'the raise-funds window is armed even at timer-off')
+  h.eq(d != null ? d.ms : -1, 90_000, '90 seconds to raise funds before the bank auto-settles')
+  h.eq(d != null ? d.playerId : '', h.id(0), 'the clock belongs to the debtor alone — nobody else is clocked in the freeze')
+})
+
+scenario('autoSettle on a chairman relay pays only the ACTIVE row', 4, (h) => {
+  const memo = 'Card: Elected Chairman of the Board. Pay each player $50.'
+  h.cash(0, 10)
+  h.give(0, [3, 6])
+  h.s.debt = { debtor: h.id(0), amount: 50, creditor: h.id(1), memo }
+  h.s.debtQueue = [
+    { debtor: h.id(0), amount: 50, creditor: h.id(2), memo },
+    { debtor: h.id(0), amount: 50, creditor: h.id(3), memo },
+  ]
+  h.s.phase = 'DEBT'
+  const key1 = decisionFor(h.s, 0)?.key ?? ''
+  const built = debtAutoActions(h.s, h.id(0))
+  h.eq(built.autos[built.autos.length - 1], [h.id(0), { type: 'payDebt' }], 'the settle ends in payDebt')
+  for (const [, a] of built.autos) h.ok(h.act(0, a), 'the whole list runs clean on one commit')
+  h.eq(h.p(1).cash, 1550, 'row 1 collected')
+  h.eq(h.p(2).cash, 1500, 'row 2 has not been touched')
+  h.eq(h.s.debt != null && h.s.debt.creditor, h.id(2), 'row 2 is the active debt now')
+  h.eq(h.s.debtQueue.length, 1, 'row 3 still queued behind it')
+  const key2 = decisionFor(h.s, 0)?.key ?? ''
+  h.assert(key2 !== key1, 'row 2 re-arms with a fresh clock key — no inherited expiry')
+})
+
+scenario('one idle phone cannot stall a timer-off table: per-key defaults', 4, (h) => {
+  const ms = (key: string): number | null => {
+    const d = decisionFor(h.s, 0)
+    if (d == null) return null
+    h.assert(d.key.startsWith(`${key}:`), `the clocked decision is ${key}`)
+    return d.ms
+  }
+  h.eq(ms('roll'), 60_000, 'roll defaults to 60s at timer-off (expiry auto-rolls)')
+  h.s.phase = 'ACTION'
+  h.s.pendingCardDraw = { player: h.id(0), deck: 'chest', space: 17 }
+  h.eq(ms('draw'), 30_000, 'a pending draw defaults to 30s')
+  h.s.pendingCardDraw = null
+  h.s.pendingPurchase = 6
+  h.eq(ms('buy'), 60_000, 'a pending buy defaults to 60s (expiry declines → auction)')
+  h.s.pendingPurchase = null
+  h.s.pendingTax = { player: h.id(0), space: 4 }
+  h.eq(ms('tax'), 60_000, 'a pending tax defaults to 60s (expiry pays the cheaper option)')
+  h.s.pendingTax = null
+  h.s.pendingJail = { player: h.id(0), reason: 'card' }
+  h.eq(ms('jail'), 30_000, 'an arrest keeps its fixed 30s')
+  h.s.pendingJail = null
+  h.eq(ms('end'), 30_000, 'end-of-turn keeps its fixed 30s')
+  h.s.debt = { debtor: h.id(0), amount: 50, creditor: null }
+  h.s.phase = 'DEBT'
+  h.eq(ms('debt'), 30_000, 'an affordable debt keeps its fixed 30s tap clock')
+  h.cash(0, 10)
+  h.eq(ms('debt'), 90_000, 'an unaffordable debt gets the 90s raise-funds window')
+  h.s.debt = null
+  h.s.phase = 'AUCTION'
+  h.s.auction = { space: 6, bid: 0, bidder: null, passed: [] }
+  h.eq(ms('auc'), 30_000, 'auction opening window (30s)')
+  h.s.auction = { space: 6, bid: 40, bidder: h.id(1), passed: [] }
+  h.eq(ms('auc'), 15_000, 'auction after-a-bid fuse (15s)')
+})
+
+// ── the one commit path + the socket pre-gate (rooms) ──
+
+scenario('commit: every path commits only on success and rejects cleanly', 4, (h) => {
+  // a legal action commits
+  {
+    const room = stubRoom(h.s)
+    const res = commit(room, null, h.id(0), { type: 'roll' })
+    h.ok(res, 'a legal action commits')
+    h.eq(room.state != null && room.state.dice != null, true, 'the roll landed in the committed state')
+  }
+  // an illegal one rejects cleanly and mutates nothing
+  {
+    const room = stubRoom(h.s)
+    const before = JSON.stringify(room.state)
+    const res = commit(room, null, h.id(1), { type: 'roll' })
+    h.bad(res, "another player's roll is refused")
+    h.eq(JSON.stringify(room.state), before, 'a rejected action mutates nothing')
+  }
+  // a god-style mutate commits (the tamper-proof console is ungated)
+  {
+    const room = stubRoom(h.s)
+    const res = commit(room, null, '', (n) => {
+      n.players[1].cash += 7
+    })
+    h.ok(res, 'a god mutate commits')
+    h.eq(room.state != null && room.state.players[1].cash, 1507, 'the mutation landed')
+  }
+  // a forfeit commits on success — and refuses cleanly the second time
+  h.give(1, [6])
+  {
+    const room = stubRoom(h.s)
+    const res = commit(room, null, h.id(1), (n) => forfeitSeat(n, h.id(1), 'Ben left the party'))
+    h.ok(res, 'a forfeit commits')
+    h.eq(room.state != null && room.state.players[1].bankrupt, true, 'the seat is bankrupt in the committed state')
+    const before = JSON.stringify(room.state)
+    const again = commit(room, null, h.id(1), (n) => forfeitSeat(n, h.id(1), 'again'))
+    h.bad(again, 'forfeiting an already-bankrupt seat refuses cleanly')
+    h.eq(JSON.stringify(room.state), before, 'nothing changed the second time')
+  }
+})
+
+scenario('the pre-gate: a gated-out action mutates nothing and acks the standard error', 4, (h) => {
+  const room = stubRoom(h.s)
+  const before = JSON.stringify(room.state)
+  const gated = commit(room, null, h.id(1), { type: 'roll' }, { gate: true })
+  h.bad(gated, "the gate refuses a non-current player's roll before any clone")
+  h.eq(gated.ok === false ? gated.error : 'ok', "You can't do that right now (roll)", 'the standard error ack, byte-identical to the reducer\u2019s')
+  h.eq(JSON.stringify(room.state), before, 'an illegal socket action never costs a state copy')
+  // what the engine allows passes the gate and commits
+  const allowed = commit(room, null, h.id(0), { type: 'roll' }, { gate: true })
+  h.ok(allowed, 'a legal action passes the gate through to the reducer')
+  h.eq(room.state != null && room.state.dice != null, true, 'and commits')
+})
+
+// ── rng threading: SEED-replay determinism (engine) ──
+
+scenario('rng determinism: same seed, identical game — deck rebuilds included', 4, (h) => {
+  // Drive a scripted game with a seeded rng, twice, forcing deck rebuilds
+  // (empty deck → rebuildDeck) and a bankruptcy (→ resumeAfterDebt).
+  // Before the rng threading, the rebuild reshuffled with Math.random and
+  // the two runs diverged.
+  const run = (): string => {
+    const rng = mulberry32(20261126)
+    const metas: PlayerMeta[] = Array.from({ length: 4 }, (_, i) => ({
+      id: `q${i}`,
+      name: NAMES[i],
+      color: '#000000',
+      token: TOKENS[i],
+    }))
+    const s = createGame(metas, rng)
+    const draw = (pid: string): void => {
+      s.phase = 'ACTION'
+      s.currentPlayerId = pid
+      s.pendingCardDraw = { player: pid, deck: 'chance', space: 7 }
+      applyAction(s, { type: 'drawCard' }, pid, rng)
+    }
+    s.chanceDeck = [] // force a rebuild on the very first draw
+    draw('q0') // rebuildDeck fires with the threaded rng
+    s.chanceDeck = []
+    draw('q1') // and again
+    s.pendingCardDraw = null
+    s.phase = 'ROLL'
+    s.currentPlayerId = 'q2'
+    applyAction(s, { type: 'roll' }, 'q2', rng)
+    // a bankruptcy exercises resumeAfterDebt with the threaded rng
+    s.debt = { debtor: 'q3', amount: 10_000, creditor: 'q1' }
+    s.phase = 'DEBT'
+    applyAction(s, { type: 'bankrupt' }, 'q3', rng)
+    return JSON.stringify(s)
+  }
+  const a = run()
+  const b = run()
+  h.eq(a === b, true, 'same seed → byte-identical end state, reshuffles in play')
+  h.assert(a.length > 500, 'the scripted run produced real state')
+})
+
+// ── auction grace predicate parity (rooms) ──
+
+scenario('auctionGraceActions passes exactly the seats the old inline check did', 4, (h) => {
+  h.s.phase = 'AUCTION'
+  h.s.auction = { space: 6, bid: 40, bidder: h.id(1), passed: [h.id(2)] }
+  h.p(3).bankrupt = true
+  const seat = (i: number, socketId: string | null, goneFor: number) => ({
+    meta: { id: h.id(i), name: NAMES[i], color: '#000000', token: TOKENS[i] },
+    token: `t${i}`,
+    socketId,
+    disconnectedAt: socketId == null ? Date.now() - goneFor : null,
+  })
+  const room = stubRoom(h.s)
+  room.players = [
+    seat(0, null, 20_000), // gone 20s → due
+    seat(1, 'sock-1', 0), // connected + high bidder → not due
+    seat(2, null, 20_000), // gone, but already passed → not due
+    seat(3, null, 20_000), // gone, but bankrupt → not due
+  ]
+  h.eq(auctionGraceActions(room), [[h.id(0), { type: 'passBid' }]], 'exactly one seat due, same as the piggybacked check')
+  room.players[0].disconnectedAt = Date.now() - 5_000
+  h.eq(auctionGraceActions(room), [], 'a seat still inside the grace window is left to the fuse')
 })
 
 // ── summary ──

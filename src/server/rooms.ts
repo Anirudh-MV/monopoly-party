@@ -7,11 +7,20 @@
 // Every applied action triggers a full view push (state is tiny — party scale).
 
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync } from 'node:fs'
 import * as fsp from 'node:fs/promises'
 import path from 'node:path'
 import type { Server as IOServer, Socket } from 'socket.io'
-import { applyAction, createGame, declareBankruptcy, forfeitEstate, MAX_GAME_LOG, type PlayerMeta, type Result } from '../shared/engine.js'
+import {
+  applyAction,
+  createGame,
+  declareBankruptcy,
+  forfeitEstate,
+  liquidationPlan,
+  MAX_GAME_LOG,
+  type PlayerMeta,
+  type Result,
+} from '../shared/engine.js'
 import { ALL_CARDS } from '../shared/cards.js'
 import { hostView, playerView } from '../shared/views.js'
 import { allowedActions, alivePlayers, netWorth } from '../shared/rules.js'
@@ -56,6 +65,17 @@ const AUCTION_IDLE_MS = 15_000
 // that one lost device can't stall the table.
 const AUCTION_DISCONNECT_GRACE_MS = 15_000
 
+// ── Per-socket rate limit ──
+// A token bucket per connection applied to every inbound event: a hostile
+// or runaway client must not eat the event loop or trigger clone storms.
+// Capacity 30 with 10 tokens/second refill comfortably clears fast human
+// play (and the test suites); only SUSTAINED exhaustion — the bucket
+// continuously empty for 10 seconds — disconnects the socket, which is
+// auto-rejoinable: disconnects are never punished, the seat waits.
+const RATE_CAPACITY = 30
+const RATE_REFILL_PER_SEC = 10
+const RATE_EXHAUSTION_MS = 10_000
+
 interface PlayerEntry {
   meta: PlayerMeta
   token: string // rejoin secret, stored in the phone's localStorage
@@ -63,7 +83,7 @@ interface PlayerEntry {
   disconnectedAt: number | null // when the live socket went away (grace timers)
 }
 
-interface Room {
+export interface Room {
   code: string
   hostToken: string // TV rejoin secret
   hostPlayerId: string | null // the player who is "party host" (crown)
@@ -75,6 +95,10 @@ interface Room {
   timer: ReturnType<typeof setTimeout> | null
   timerKey: string | null
   watchdogBusy: boolean
+  // One-shot auction disconnect-grace fuse (see scheduleAuctionGrace) —
+  // separate from the decision clock so the two never fight over `timer`.
+  graceTimer: ReturnType<typeof setTimeout> | null
+  graceKey: string | null
 }
 
 interface SocketData {
@@ -121,6 +145,8 @@ function mintRoom(turnTimeoutMs: number = DEFAULT_TURN_TIMEOUT_MS): Room {
     timer: null,
     timerKey: null,
     watchdogBusy: false,
+    graceTimer: null,
+    graceKey: null,
   }
 }
 
@@ -207,6 +233,66 @@ function safe(label: string, ack: unknown, fn: () => void): void {
   }
 }
 
+// ── The one commit path ──
+// Every state change funnels through here: clone, apply, commit only on
+// success, then ONE broadcast (which re-schedules the decision clock and
+// flushes the snapshot). A refused mutation never leaves half-applied state
+// behind, and no mid-state is ever emitted.
+//
+// `mutate` is one of:
+//   - an Action            → applied for `actor` (the socket player path)
+//   - a [by, Action] list   → applied in order (timer/auto paths); the
+//                            commit carries every step the reducer accepted
+//   - a function           → raw engine mutation (god console, forfeit);
+//                            returning {ok:false} vetoes the commit
+//
+// The `gate` option is the socket player-action path ONLY: it asks the
+// engine's own allowedActions list BEFORE the state is even cloned, so an
+// illegal action from a phone costs no state copy. God (the tamper-proof TV
+// console), forfeits, decision-clock auto-actions and imports deliberately
+// bypass the gate — the reducer still enforces legality on every path, so
+// the gate is an optimization, not a second source of truth.
+export function commit(
+  room: Room,
+  io: IOServer | null,
+  actor: string,
+  mutate: Action | Array<[string, Action]> | ((s: GameState) => Result | void),
+  opts: { broadcast?: boolean; gate?: boolean } = {},
+): Result {
+  const cur = room.state
+  if (!cur) return { ok: false, error: 'No game running' }
+  if (opts.gate && !Array.isArray(mutate) && typeof mutate !== 'function') {
+    if (!allowedActions(cur, actor).includes(mutate.type)) {
+      return { ok: false, error: `You can't do that right now (${mutate.type})` }
+    }
+  }
+  const next = structuredClone(cur)
+  let res: Result = { ok: true }
+  if (typeof mutate === 'function') {
+    const r = mutate(next)
+    if (r != null && !r.ok) res = r
+  } else if (Array.isArray(mutate)) {
+    // Timer/auto path: apply in order against one clone; a failed step
+    // just means the state moved on — exactly what the per-action commit
+    // loop did before, minus the intermediate (never-emitted) copies.
+    let any = false
+    let firstError = 'rejected'
+    for (const [by, action] of mutate) {
+      const r = applyAction(next, action, by)
+      if (r.ok) any = true
+      else if (!any) firstError = r.error
+    }
+    if (!any) res = { ok: false, error: firstError }
+  } else {
+    const r = applyAction(next, mutate, actor)
+    if (!r.ok) res = r
+  }
+  if (!res.ok) return res
+  room.state = next
+  if (opts.broadcast !== false && io) broadcastGame(io, room)
+  return { ok: true }
+}
+
 // A connection belongs to exactly one room. Attaching (create, hostJoin,
 // watch, join, rejoin) detaches from any previous room first, so a TV that
 // mints a second room can never receive two rooms' events mixed together,
@@ -245,29 +331,15 @@ function broadcastGame(io: IOServer, room: Room): void {
 
   // Safety: a phone that has been gone for a while mid-auction is auto-passed
   // so a missing device can never stall the table — but a screen-lock blip
-  // gets a grace period first. Copy-and-commit, like every other state
-  // change: a failed pass never leaves half-applied state behind.
+  // gets a grace period first. Copy-and-commit through the one commit path —
+  // no broadcast here, THIS call is the broadcast: a failed pass never
+  // leaves half-applied state behind, and the pass below rides the same
+  // clone-apply-commit rules as every other state change.
   if (s.phase === 'AUCTION' && s.auction) {
-    const due: Array<[string, Action]> = []
-    for (const e of room.players) {
-      const p = s.players.find((q) => q.id === e.meta.id)
-      if (
-        p &&
-        !p.bankrupt &&
-        e.socketId == null &&
-        e.disconnectedAt != null &&
-        Date.now() - e.disconnectedAt >= AUCTION_DISCONNECT_GRACE_MS &&
-        !s.auction.passed.includes(p.id) &&
-        s.auction.bidder !== p.id
-      ) {
-        due.push([p.id, { type: 'passBid' }])
-      }
-    }
+    const due = auctionGraceActions(room)
     if (due.length > 0) {
-      const next = structuredClone(s)
-      for (const [by, act] of due) applyAction(next, act, by)
-      room.state = next
-      s = next
+      commit(room, io, '', due, { broadcast: false })
+      if (room.state) s = room.state
     }
   }
 
@@ -306,12 +378,93 @@ function broadcastGame(io: IOServer, room: Room): void {
 
   // The deadline lives on the state so every view carries it.
   scheduleDeadline(room)
+  // …and a missing phone mid-auction gets its own guaranteed fuse, so the
+  // grace pass happens even when nothing else re-broadcasts the room.
+  scheduleAuctionGrace(room)
 
   io.to(hostRoom(room.code)).emit('view', hostView(s, room.code, room.hostPlayerId, room.turnTimeoutMs))
   for (const e of room.players) {
     io.to(playerRoom(room.code, e.meta.id)).emit('view', playerView(s, room.code, e.meta.id, room.hostPlayerId, room.turnTimeoutMs))
   }
   void saveRoom(room)
+}
+
+// The seats a live auction is waiting on that have been gone past the
+// grace window: alive, not yet passed, not the high bidder, and
+// disconnected. Extracted verbatim from the old inline broadcastGame check
+// (same seats it passed today) — exported so the remedy checks can pin
+// predicate parity.
+export function auctionGraceActions(room: Room): Array<[string, Action]> {
+  const s = room.state
+  const due: Array<[string, Action]> = []
+  if (!s || s.phase !== 'AUCTION' || !s.auction) return due
+  for (const e of room.players) {
+    const p = s.players.find((q) => q.id === e.meta.id)
+    if (
+      p &&
+      !p.bankrupt &&
+      e.socketId == null &&
+      e.disconnectedAt != null &&
+      Date.now() - e.disconnectedAt >= AUCTION_DISCONNECT_GRACE_MS &&
+      !s.auction.passed.includes(p.id) &&
+      s.auction.bidder !== p.id
+    ) {
+      due.push([p.id, { type: 'passBid' }])
+    }
+  }
+  return due
+}
+
+// ── Auction disconnect grace: a guaranteed one-shot fuse ──
+// The piggybacked check above only fires when something else re-broadcasts;
+// this timer makes the pass happen even when the room is otherwise quiet.
+// Every rejoin/re-broadcast re-evaluates it (fresh disconnectedAt, a new
+// bidder, the auction over) — the same clear-and-re-arm pattern the
+// decision clock's timerKey machinery uses. One-shot: when it fires, the
+// commit's own broadcast re-arms whatever fuse (if any) comes next.
+function scheduleAuctionGrace(room: Room): void {
+  const clear = (): void => {
+    if (room.graceTimer) clearTimeout(room.graceTimer)
+    room.graceTimer = null
+    room.graceKey = null
+  }
+  const s = room.state
+  if (!s || s.phase !== 'AUCTION' || !s.auction) {
+    clear()
+    return
+  }
+  // The earliest moment an eligible seat crosses the grace line.
+  let dueAt: number | null = null
+  let seat = ''
+  for (const e of room.players) {
+    const p = s.players.find((q) => q.id === e.meta.id)
+    if (!p || p.bankrupt || e.socketId != null || e.disconnectedAt == null) continue
+    if (s.auction.passed.includes(p.id) || s.auction.bidder === p.id) continue
+    const at = e.disconnectedAt + AUCTION_DISCONNECT_GRACE_MS
+    if (dueAt == null || at < dueAt) {
+      dueAt = at
+      seat = p.id
+    }
+  }
+  if (dueAt == null) {
+    clear()
+    return
+  }
+  const key = `aucgrace:${s.auction.space}:${seat}:${dueAt}`
+  if (room.graceKey === key) return // already ticking for this seat/moment
+  if (room.graceTimer) clearTimeout(room.graceTimer)
+  room.graceKey = key
+  room.graceTimer = setTimeout(() => {
+    safe('auction grace', undefined, () => {
+      room.graceTimer = null
+      room.graceKey = null
+      const st = room.state
+      if (!st || st.phase !== 'AUCTION' || !ioRef) return
+      const due = auctionGraceActions(room)
+      if (due.length === 0) return
+      commit(room, ioRef, '', due) // the commit's broadcast re-arms the next fuse
+    })
+  }, Math.max(0, dueAt - Date.now()))
 }
 
 // The rescue the watchdog plays for a stuck state, by phase and pendings:
@@ -402,6 +555,39 @@ function currentDecision(s: GameState): Decision | null {
   return null
 }
 
+// The debt-clock expiry play. An affordable debt is one tap away — pay it.
+// An unaffordable one liquidates minimally (liquidationPlan) and pays on the
+// same single commit; only when even a full liquidation cannot cover the
+// bill does the existing bankruptcy cascade fire. The headline (rooms layer,
+// same pattern as forfeitSeat) logs on that same commit. Pure on the state —
+// exported for the scenario suite.
+export function debtAutoActions(s: GameState, playerId: string): { autos: Array<[string, Action]>; headline: string | null } {
+  const d = s.debt
+  const p = s.players.find((q) => q.id === playerId)
+  const amount = d?.amount ?? 0
+  if (!d || d.debtor !== playerId || !p) return { autos: [], headline: null }
+  if (p.cash >= amount) return { autos: [[playerId, { type: 'payDebt' }]], headline: null }
+  const plan = liquidationPlan(s, playerId, amount)
+  if (plan.length > 0) {
+    // The plan is only used when replaying it actually covers the bill — a
+    // partial liquidation must never commit ahead of a bankruptcy. Replay
+    // on a scratch copy: each step was planned against exactly this state.
+    const sim = structuredClone(s)
+    for (const [by, act] of plan) applyAction(sim, act, by)
+    const simP = sim.players.find((q) => q.id === playerId)
+    if (simP && simP.cash >= amount) {
+      return {
+        autos: [...plan, [playerId, { type: 'payDebt' }]],
+        headline: `⏰ Time's up — the bank liquidates ${p.name}'s estate to cover the $${amount} debt`,
+      }
+    }
+  }
+  return {
+    autos: [[playerId, { type: 'bankrupt' }]],
+    headline: `⏰ Time's up — even fully liquidated, ${p.name} can't cover the $${amount}`,
+  }
+}
+
 // The sensible default each deadline plays on expiry.
 function autoActionsFor(room: Room, d: Decision): Array<[string, Action]> {
   const s = room.state
@@ -417,49 +603,59 @@ function autoActionsFor(room: Room, d: Decision): Array<[string, Action]> {
   }
   if (d.key.startsWith('end:')) return [[d.playerId, { type: 'endTurn' }]]
   if (d.key.startsWith('debt:')) {
-    const p = s.players.find((q) => q.id === d.playerId)
-    const amount = s.debt?.amount ?? 0
-    return p && p.cash >= amount
-      ? [[d.playerId, { type: 'payDebt' }]]
-      : [[d.playerId, { type: 'bankrupt' }]]
+    // autoSettle: liquidate minimally, then pay — bankruptcy only when even
+    // a full liquidation cannot cover the bill.
+    return debtAutoActions(s, d.playerId).autos
   }
   return []
 }
 
 // The single source of truth for the decision clock, pure so the remedy
 // checks can test it directly: which decision is ticking, whose hands are
-// tied, and how long it gets. null = no clock (nothing is blocking play, or
-// the host turned the timer off for a decision that isn't on a fixed clock).
+// tied, and how long it gets. null = no clock (nothing is blocking play).
 //
-// Two-tier debt clocks: an AFFORDABLE debt arms a fixed 30 seconds even when
-// the host clock is off — the money is sitting in the wallet, one tap away,
-// and a stalled phone must not stall the table. An UNAFFORDABLE debt stays
-// on the host clock and unarmed when the timer is off — the debtor can always
-// sell, mortgage or bankrupt themselves, and the watchdog remains
-// "nobody-can-act"-based rather than a debt-specific hammer.
+// With the host timer ON, the host clock governs byte-identically to the
+// classic behaviour (auctions keep their min() shape). With the timer OFF,
+// every blocking decision still arms a FIXED default — one idle phone can
+// never stall a timer-off table, the expiry plays the sensible default:
+//   roll 60s (auto-roll) · draw 30s · buy 60s (decline → auction) ·
+//   tax 60s (cheaper of flat/percent) · jail/end 30s ·
+//   debt 30s affordable / 90s raise-funds (expiry auto-settles) ·
+//   auction 30s open / 15s after a bid (the hammer path).
+// Trades and portfolio taps are never clocked at any setting, and during a
+// DEBT freeze the clock belongs to exactly one blocking owner: the debtor.
 export function decisionFor(s: GameState, turnTimeoutMs: number): { key: string; playerId: string | null; ms: number } | null {
   const decision = currentDecision(s)
   if (!decision) return null
   const key = decision.key
-  // Arrests and end-of-turn waits run on a fixed 30-second clock even when
-  // the host has disabled the general decision timer — they must never strand.
+  // Arrests and end-of-turn waits run on a fixed 30-second clock at any
+  // host setting — they must never strand.
   if (key.startsWith('jail:') || key.startsWith('end:')) return { ...decision, ms: 30_000 }
   if (key.startsWith('debt:')) {
     const d = s.debt
     if (!d) return null
     const debtor = s.players.find((q) => q.id === d.debtor)
     if (debtor && debtor.cash >= d.amount) return { ...decision, ms: 30_000 }
-    if (turnTimeoutMs <= 0) return null
-    return { ...decision, ms: turnTimeoutMs }
+    // Unaffordable: the host clock when it's on; a fixed 90-second
+    // raise-funds window when it's off — on expiry the bank auto-settles
+    // the estate (liquidationPlan) instead of bankrupting a recoverable seat.
+    return { ...decision, ms: turnTimeoutMs > 0 ? turnTimeoutMs : 90_000 }
   }
-  if (turnTimeoutMs <= 0) return null
   if (key.startsWith('auc:')) {
     // Auctions: a generous opening window, then a short fuse that every bid
-    // resets.
+    // resets. The host fuse shortens it when set below the fixed windows.
     const auctionIdle = s.auction != null && (s.auction.bidder != null || s.auction.bid > 0)
-    return { ...decision, ms: Math.min(turnTimeoutMs, auctionIdle ? AUCTION_IDLE_MS : AUCTION_OPEN_MS) }
+    const ms = auctionIdle ? AUCTION_IDLE_MS : AUCTION_OPEN_MS
+    return { ...decision, ms: turnTimeoutMs > 0 ? Math.min(turnTimeoutMs, ms) : ms }
   }
-  return { ...decision, ms: turnTimeoutMs }
+  if (turnTimeoutMs > 0) return { ...decision, ms: turnTimeoutMs }
+  // Timer-off defaults: the phase names the wait, the wait names the clock.
+  const fixed = key.startsWith('roll:') ? 60_000
+    : key.startsWith('draw:') ? 30_000
+    : key.startsWith('buy:') ? 60_000
+    : key.startsWith('tax:') ? 60_000
+    : 0
+  return fixed > 0 ? { ...decision, ms: fixed } : null
 }
 
 function scheduleDeadline(room: Room): void {
@@ -491,7 +687,7 @@ function scheduleDeadline(room: Room): void {
       if (!st || key !== decision.key) return // decision already resolved
       let committed = false
       if (decision.playerId != null) {
-        committed = applyServerAction(room, autoActionsFor(room, decision))
+        committed = autoCommit(room, decision)
       } else {      // Auction silence: pass everyone who could still bid — the hammer falls.
         const au = st.auction
         if (!au) return
@@ -510,26 +706,37 @@ function scheduleDeadline(room: Room): void {
   }, duration)
 }
 
+// The deadline expiry play, committed through the one commit path. The
+// autoSettle headline rides on the same single commit as the liquidation
+// steps and the payment — no mid-state is ever emitted, a reconnecting
+// player sees the debt either still pending or fully settled, and the
+// per-step reducer log lines (every sellHouse/mortgage carries a ledger
+// entry) provide the paper trail right behind the headline.
+function autoCommit(room: Room, decision: Decision): boolean {
+  const s = room.state
+  if (!s || decision.playerId == null) return false
+  if (decision.key.startsWith('debt:')) {
+    const { autos, headline } = debtAutoActions(s, decision.playerId)
+    if (autos.length === 0) return false
+    if (headline == null) return applyServerAction(room, autos)
+    const res = commit(room, ioRef, decision.playerId, (n) => {
+      n.log.push({ text: headline, kind: 'bad' })
+      if (n.log.length > MAX_LOG) n.log.splice(0, n.log.length - MAX_LOG)
+      let any = false
+      for (const [by, act] of autos) if (applyAction(n, act, by).ok) any = true
+      if (!any) return { ok: false, error: 'auto-action rejected' }
+    })
+    return res.ok
+  }
+  return applyServerAction(room, autoActionsFor(room, decision))
+}
+
 // Timer-side commit path: same clone-apply-commit rules as player actions,
 // but no socket to ack to. Auto-actions are NOT human activity — they must
 // never extend the room's idle TTL, or an abandoned auto-playing game
 // lives forever.
 function applyServerAction(room: Room, autos: Array<[string, Action]>): boolean {
-  let committed = false
-  for (const [by, action] of autos) {
-    const cur = room.state
-    if (!cur) break
-    const next = structuredClone(cur)
-    const res = applyAction(next, action, by)
-    if (res.ok) {
-      room.state = next
-      committed = true
-    }
-    // A failed auto-action just means the state moved on; the broadcast
-    // that follows schedules whatever decision comes next.
-  }
-  if (committed && ioRef) broadcastGame(ioRef, room)
-  return committed
+  return commit(room, ioRef, '', autos).ok
 }
 
 // ── Room snapshots ──
@@ -625,30 +832,51 @@ function loadSnapshots(): void {
     }
     for (const f of readdirSync(SNAP_DIR).filter((x) => x.endsWith('.json'))) {
       try {
-        const raw = JSON.parse(readFileSync(path.join(SNAP_DIR, f), 'utf8')) as RoomSnapshot
-        if (typeof raw.code !== 'string' || !Array.isArray(raw.players)) continue
+        const raw: unknown = JSON.parse(readFileSync(path.join(SNAP_DIR, f), 'utf8'))
+        // Boot restore gets the same treatment as a god import: every
+        // renderable field is validated and normalized BEFORE anything
+        // reaches a room, a client, or the disk. The one relaxation: a
+        // live party's lobby may hold a single waiting phone, so the boot
+        // accepts 1-seat lobbies (a 0-seat record is create-spam junk —
+        // the TTL's own definition — and still quarantines).
+        const snap = validateSnapshot(raw, { minSeats: 1 })
+        if (!snap) throw new Error('failed snapshot validation')
+        if (!validCode(snap.code)) throw new Error('snapshot carries no usable room code')
         const room: Room = {
-          code: raw.code,
-          hostToken: String(raw.hostToken ?? ''),
-          hostPlayerId: raw.hostPlayerId ?? null,
-          turnTimeoutMs: Number.isFinite(Number(raw.turnTimeoutMs))
-            ? Math.max(0, Math.min(3_600_000, Math.floor(Number(raw.turnTimeoutMs))))
-            : DEFAULT_TURN_TIMEOUT_MS,
-          state: raw.state ?? null,
+          code: snap.code,
+          hostToken: '', // restoreRoomFromSnapshot never touches the host
+          // token (a same-room god import keeps the live TV's), so the
+          // boot applies the snapshot's own identity here.
+          hostPlayerId: null,
+          turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS,
+          state: null,
           hostSockets: new Set(),
-          players: raw.players.map((e) => ({ meta: e.meta, token: e.token, socketId: null, disconnectedAt: null })),
+          players: [],
           lastActive: Date.now(),
           timer: null,
           timerKey: null,
           watchdogBusy: false,
+          graceTimer: null,
+          graceKey: null,
         }
+        restoreRoomFromSnapshot(room, snap)
+        room.hostToken = snap.hostToken
         rooms.set(room.code, room)
-        for (const e of room.players) playerTokens.set(e.token, { code: room.code, playerId: e.meta.id })
         console.log(
           `[snapshots] restored room ${room.code} (${room.players.length} players, ${room.state ? `turn ${room.state.turn}` : 'lobby'})`,
         )
       } catch (e) {
-        console.error(`[snapshots] failed to restore ${f}:`, e)
+        // QUARANTINE, never delete — these are party records. The file is
+        // renamed out of the boot path with a .bad suffix (a crashed
+        // half-write, a corrupt or tampered JSON — all the same here) and
+        // the boot continues with the rest.
+        const why = e instanceof Error ? e.message : String(e)
+        try {
+          renameSync(path.join(SNAP_DIR, f), path.join(SNAP_DIR, `${f}.bad`))
+          console.error(`[snapshots] quarantined ${f} (${why}) — boot continues`)
+        } catch {
+          console.error(`[snapshots] failed to restore ${f} and could not quarantine it:`, why)
+        }
       }
     }
   } catch {
@@ -702,8 +930,11 @@ function snapDeck(raw: unknown, what: string): string[] | null {
 }
 
 // Returns a normalized snapshot whose every renderable field is known-safe,
-// or null if anything about the input is off.
-function validateSnapshot(raw: unknown): RoomSnapshot | null {
+// or null if anything about the input is off. `minSeats` relaxes the seat
+// floor for the boot restore (a live party's lobby may legitimately hold a
+// single waiting phone — a restart must bring it back); the god import
+// keeps the full 2-seat quorum.
+function validateSnapshot(raw: unknown, opts: { minSeats?: number } = {}): RoomSnapshot | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   let bytes: number
   try {
@@ -714,8 +945,9 @@ function validateSnapshot(raw: unknown): RoomSnapshot | null {
   if (bytes > SNAPSHOT_MAX_BYTES) return null
   const d = raw as Record<string, unknown>
 
-  // ── seats: 2..8, clean metas, unique ids and pieces ──
-  if (!Array.isArray(d.players) || d.players.length < MIN_PLAYERS || d.players.length > MAX_PLAYERS) return null
+  // ── seats: clean metas, unique ids and pieces ──
+  const minSeats = opts.minSeats ?? MIN_PLAYERS
+  if (!Array.isArray(d.players) || d.players.length < minSeats || d.players.length > MAX_PLAYERS) return null
   const players: Array<{ meta: PlayerMeta; token: string }> = []
   const metas = new Map<string, PlayerMeta>()
   const usedPieces = new Set<string>()
@@ -940,14 +1172,12 @@ function godLog(next: GameState, note: string): void {
 }
 
 function godMutate(io: IOServer, room: Room, note: string, fn: (s: GameState) => void): boolean {
-  const s = room.state
-  if (!s) return false
-  const next = structuredClone(s)
-  fn(next)
-  godLog(next, note)
-  room.state = next
-  broadcastGame(io, room)
-  return true
+  // The tamper-proof TV console: clone, mutate, log, commit — the same one
+  // commit path everything else uses (ungated by design: god is trusted).
+  return commit(room, io, '', (n: GameState) => {
+    fn(n)
+    godLog(n, note)
+  }).ok
 }
 
 // Consumes a snapshot that validateSnapshot already accepted — every field
@@ -973,6 +1203,9 @@ function restoreRoomFromSnapshot(room: Room, snap: RoomSnapshot): boolean {
   if (room.timer) clearTimeout(room.timer)
   room.timer = null
   room.timerKey = null
+  if (room.graceTimer) clearTimeout(room.graceTimer)
+  room.graceTimer = null
+  room.graceKey = null
   return true
 }
 
@@ -1010,9 +1243,49 @@ export function attach(io: IOServer, getJoinUrls: (code: string) => string[], sn
     // any throw into a logged error plus a {ok:false} ack. The ack is
     // whichever argument arrived as a function — most events are
     // (payload, ack), a few are (ack) only.
+    //
+    // Every inbound event first passes this socket's token bucket
+    // (capacity 30, refill 10/s). Over-limit events are dropped with an
+    // error ack — never silently — and logged with room + socket id; only
+    // sustained exhaustion (bucket continuously empty ≥10s) disconnects
+    // the socket, which is auto-rejoinable: the seat waits.
+    const bucket = { tokens: RATE_CAPACITY, at: Date.now(), emptySince: null as number | null, dropped: 0 }
+    const rateTake = (ack?: (res: unknown) => void): boolean => {
+      const now = Date.now()
+      bucket.tokens = Math.min(RATE_CAPACITY, bucket.tokens + ((now - bucket.at) / 1000) * RATE_REFILL_PER_SEC)
+      bucket.at = now
+      if (bucket.tokens < 1) {
+        if (bucket.emptySince == null) bucket.emptySince = now
+        if (now - bucket.emptySince >= RATE_EXHAUSTION_MS) {
+          console.error(`[rate] room ${data.code ?? '-'} socket ${socket.id}: sustained exhaustion — disconnecting (${bucket.dropped} dropped)`)
+          ack?.({ ok: false, error: 'Slow down — you are sending too fast' })
+          socket.disconnect(true)
+          return false
+        }
+        // Never silent to the CLIENT (error ack always goes out), but the
+        // journal only sees the first drops and then a heartbeat — a flood
+        // must not turn the log into its second victim.
+        bucket.dropped++
+        if (bucket.dropped <= 5 || bucket.dropped % 100 === 0) {
+          console.error(`[rate] room ${data.code ?? '-'} socket ${socket.id}: event dropped (rate limit) (${bucket.dropped})`)
+        }
+        ack?.({ ok: false, error: 'Slow down — you are sending too fast' })
+        return false
+      }
+      bucket.tokens -= 1
+      // Only a serve from a mostly-refilled bucket clears the exhaustion
+      // clock — the client genuinely stopped hammering. A lucky 1-token
+      // refill mid-flood (batched arrivals) must never reset it.
+      if (bucket.tokens >= RATE_CAPACITY / 2) {
+        bucket.emptySince = null
+        bucket.dropped = 0
+      }
+      return true
+    }
     const on = (ev: string, handler: (raw: unknown, ack?: (res: unknown) => void) => void): void => {
       socket.on(ev, (...args: unknown[]) => {
         const ack = args.find((a): a is (res: unknown) => void => typeof a === 'function')
+        if (!rateTake(ack)) return
         safe(ev, ack, () => handler(args[0], ack))
       })
     }
@@ -1193,10 +1466,19 @@ export function attach(io: IOServer, getJoinUrls: (code: string) => string[], sn
         // protect — the recorded winner stands.
         if (room.state.phase !== 'GAME_OVER') {
           const s = room.state
-          const name = s.players.find((q) => q.id === data.playerId)?.name ?? entry.meta.name
-          const next = structuredClone(s)
-          const res = forfeitSeat(next, data.playerId, `${name} left the party — their properties go under the hammer`)
-          if (res.ok) room.state = next
+          const pid = data.playerId
+          const name = s.players.find((q) => q.id === pid)?.name ?? entry.meta.name
+          // Clone-apply-commit through the one commit path, no broadcast
+          // yet — the eviction bookkeeping below must land first. A refused
+          // mutation (already bankrupt) commits nothing. A finished game
+          // has nothing left to protect — the recorded winner stands.
+          commit(
+            room,
+            io,
+            pid,
+            (n) => forfeitSeat(n, pid, `${name} left the party — their properties go under the hammer`),
+            { broadcast: false },
+          )
         }
         // this phone is out for good: its rejoin token is destroyed, so it
         // can never wander back.
@@ -1449,14 +1731,14 @@ export function attach(io: IOServer, getJoinUrls: (code: string) => string[], sn
       }
 
       // Clone, apply, and only commit on success — a failed action never
-      // leaves half-applied state behind.
-      const next = structuredClone(room.state)
-      const res = applyAction(next, action, data.playerId)
+      // leaves half-applied state behind. The gate asks the engine's own
+      // allowed list BEFORE any clone (an illegal socket action costs no
+      // state copy); the reducer still enforces legality behind it, so the
+      // phone sees byte-identical rejections either way.
+      room.lastActive = Date.now()
+      const res = commit(room, io, data.playerId, action, { gate: true })
       if (!res.ok) return ack?.({ ok: false, error: res.error })
 
-      room.state = next
-      room.lastActive = Date.now()
-      broadcastGame(io, room)
       ack?.({ ok: true })
     })
 
@@ -1706,10 +1988,16 @@ export function attach(io: IOServer, getJoinUrls: (code: string) => string[], sn
           // Same estate rule as a voluntary exit: player-debt → the lender
           // inherits via declareBankruptcy; anything else → bank forfeit
           // with the deeds under the hammer. forfeitSeat logs the headline.
-          const next = structuredClone(s)
-          const res = forfeitSeat(next, payload.playerId, `The host removed ${target.name} — their properties go under the hammer`)
+          // Commit without broadcast first — the eviction below lands
+          // before the one broadcast ships the new state.
+          const res = commit(
+            room,
+            io,
+            payload.playerId,
+            (n) => forfeitSeat(n, payload.playerId, `The host removed ${target.name} — their properties go under the hammer`),
+            { broadcast: false },
+          )
           if (!res.ok) return ack?.({ ok: false, error: res.error })
-          room.state = next
           // Evict the phone exactly like the lobby kick: identity dies
           // with the seat, the rejoin token is destroyed.
           const entry = room.players.find((e) => e.meta.id === payload.playerId)
