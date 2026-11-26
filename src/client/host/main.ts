@@ -356,7 +356,11 @@ function announceView(v: HostView): void {
 
   // game over
   if (v.phase === 'GAME_OVER' && v.winner && prev.phase !== 'GAME_OVER') {
-    announce(`${nameOf(v.winner)} wins the game!`)
+    // a worth tie can share the win - the announce must match the screens'
+    // "share the win" copy rather than naming a single winner (final audit
+    // of the round-caps round)
+    const shared = (v.winners ?? []).filter((id) => v.players.some((p) => p.id === id && !p.bankrupt))
+    announce(shared.length > 1 ? `${shared.map((id) => nameOf(id)).join(' and ')} share the win!` : `${nameOf(v.winner)} wins the game!`)
   }
 }
 

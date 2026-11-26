@@ -282,7 +282,7 @@ main { display: block; }
    Four permanent tools, fixed bottom, 56px + safe-area, 44px+ taps. */
 #dock {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
-  display: flex; gap: 8px; max-width: 540px; margin: 0 auto;
+  display: flex; gap: 8px; max-width: 520px; margin: 0 auto;
   padding: 6px 10px calc(6px + env(safe-area-inset-bottom));
 }
 .dockbtn {
