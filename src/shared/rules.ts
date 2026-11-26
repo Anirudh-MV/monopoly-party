@@ -3,7 +3,7 @@
 // same functions — one source of truth for "what can I do right now".
 
 import { BOARD, JAIL_FINE, groupIndices, isStreet, RAIL_INDICES, UTILITY_INDICES } from './board.js'
-import type { ActionType, ColorGroup, PlayerState, RulesState, TradeOffer } from './types.js'
+import type { ActionType, ColorGroup, GameState, PlayerState, RulesState, TradeOffer, WaitingOn } from './types.js'
 
 export function byId(s: RulesState, id: string): PlayerState | undefined {
   return s.players.find((p) => p.id === id)
@@ -261,4 +261,55 @@ export function allowedActions(s: RulesState, pid: string): ActionType[] {
   }
 
   return [...out]
+}
+
+// What single decision is currently blocking play, if any: WHO it belongs
+// to and WHAT kind it is. Pure on the state — the ONE source of truth for
+// both the view projection (HostView.waitingOn, built here at view time)
+// and the server's decision clock (rooms.ts decisionFor delegates to
+// this). The key strings are load-bearing: the room layer's auto-play
+// table matches their prefixes, so a format change is a behaviour change —
+// the remedy checks pin them.
+//
+// Semantics (byte-identical to the room-local logic this replaced):
+//   ROLL    → the current player's roll attempt (kind 'roll', even from
+//             jail — the owed decision there is still the roll; the
+//             separate 'jail' kind is the two-step arrest tap below)
+//   ACTION  → pendingJail → the arrest tap ('jail', owned by the arrested
+//             player), else pendingCardDraw ('draw'), pendingPurchase
+//             ('buy'), pendingTax ('tax'), else the end-of-turn wait ('end')
+//   DEBT    → the debtor's payment ('debt')
+//   AUCTION → the whole table ('auc', playerId null — auctions wait on
+//             everyone, which is exactly why deadlineFor's null overload
+//             can't serve this role)
+export function blockingDecision(s: GameState): WaitingOn | null {
+  if (s.phase === 'ROLL') {
+    // dice+doubles in the key so a doubles bonus roll gets a fresh identity
+    const d = s.dice ? `${s.dice[0] + s.dice[1]}` : '0'
+    return { key: `roll:${s.turn}:${s.currentPlayerId}:${d}:${s.doubles}`, playerId: s.currentPlayerId, kind: 'roll' }
+  }
+  if (s.phase === 'ACTION') {
+    if (s.pendingJail) return { key: `jail:${s.turn}:${s.pendingJail.player}`, playerId: s.pendingJail.player, kind: 'jail' }
+    if (s.pendingCardDraw) return { key: `draw:${s.turn}:${s.pendingCardDraw.deck}:${s.pendingCardDraw.space}`, playerId: s.currentPlayerId, kind: 'draw' }
+    if (s.pendingPurchase != null) return { key: `buy:${s.turn}:${s.pendingPurchase}`, playerId: s.currentPlayerId, kind: 'buy' }
+    if (s.pendingTax) return { key: `tax:${s.turn}`, playerId: s.currentPlayerId, kind: 'tax' }
+    return { key: `end:${s.turn}:${s.currentPlayerId}`, playerId: s.currentPlayerId, kind: 'end' }
+  }
+  if (s.phase === 'DEBT' && s.debt) {
+    const d = s.debt
+    // debtor AND creditor AND amount AND queue-depth in the key: a same-debtor
+    // relay (chairman paying each player) reuses one debtor+turn — with only
+    // those fields every relay row looked like the SAME decision.
+    return {
+      key: `debt:${s.turn}:${d.debtor}:${d.creditor ?? 'bank'}:${d.amount}:${s.debtQueue.length}`,
+      playerId: d.debtor,
+      kind: 'debt',
+    }
+  }
+  if (s.phase === 'AUCTION' && s.auction) {
+    // The bid and bidder are in the key so every new bid is a fresh decision
+    // — the hammer falls only after real silence, never mid-bidding-war.
+    return { key: `auc:${s.turn}:${s.auction.space}:${s.auction.bid}:${s.auction.bidder ?? '-'}`, playerId: null, kind: 'auc' }
+  }
+  return null
 }

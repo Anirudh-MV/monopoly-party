@@ -240,6 +240,20 @@ try {
   assert(phones[0].view.you === phones[0].id, 'phone view is personalised')
   const curPhone = phones.find((p) => p.id === lastHostView.currentPlayerId)
   assert(curPhone.view.allowed.includes('roll'), "current player's phone offers ROLL")
+  assert(
+    curPhone.view.waitingOn != null &&
+      curPhone.view.waitingOn.kind === 'roll' &&
+      curPhone.view.waitingOn.playerId === lastHostView.currentPlayerId &&
+      typeof curPhone.view.waitingOn.key === 'string' &&
+      curPhone.view.waitingOn.key.startsWith('roll:'),
+    "current player's phone view carries waitingOn (kind roll, owned by the roller)",
+  )
+  assert(
+    lastHostView.waitingOn != null &&
+      lastHostView.waitingOn.kind === 'roll' &&
+      lastHostView.waitingOn.playerId === lastHostView.currentPlayerId,
+    'the TV view carries the same waitingOn projection',
+  )
 
   // rename is a lobby-only power: the started game locks names
   const lateRename = await emitAck(phones[0].sock, 'room:rename', { name: 'Maya3' })
@@ -299,6 +313,13 @@ try {
         continue
       }
       if (lastHostView.auction) {
+        // every live auction must name the whole table as the blocker
+        assert(
+          lastHostView.waitingOn != null &&
+            lastHostView.waitingOn.kind === 'auc' &&
+            lastHostView.waitingOn.playerId === null,
+          'view during an auction: waitingOn is auc with playerId null (everyone)',
+        )
         await settleAuction()
         await sleep(120)
         continue
@@ -432,6 +453,12 @@ try {
     assert(
       curPhone.view.pendingCardDraw && curPhone.view.pendingCardDraw.deck === 'chest',
       "drawer's phone shows the Open prompt",
+    )
+    assert(
+      curPhone.view.waitingOn != null &&
+        curPhone.view.waitingOn.kind === 'draw' &&
+        curPhone.view.waitingOn.playerId === curPhone.view.currentPlayerId,
+      "drawer's phone view carries waitingOn (kind draw, owned by the drawer)",
     )
     const dres = await emitAck(curPhone.sock, 'game:action', { type: 'drawCard' })
     assert(dres.ok, 'drawer opens the chest from their phone')
@@ -651,6 +678,19 @@ try {
 
     // the deed went under the hammer immediately
     assert(lastHostView.auction != null, 'their deed is under the hammer')
+    assert(
+      lastHostView.waitingOn != null &&
+        lastHostView.waitingOn.kind === 'auc' &&
+        lastHostView.waitingOn.playerId === null,
+      'the liquidation auction blocks the whole table (waitingOn auc, playerId null)',
+    )
+    const survivor = phones.find((p) => p.id !== gone.id && p.view != null)
+    assert(
+      survivor && survivor.view.waitingOn != null &&
+        survivor.view.waitingOn.kind === 'auc' &&
+        survivor.view.waitingOn.playerId === null,
+      "a seated phone's view carries waitingOn during the auction (auc, playerId null)",
+    )
 
     // the rejoin token is destroyed — this phone can't wander back
     const back = connect()

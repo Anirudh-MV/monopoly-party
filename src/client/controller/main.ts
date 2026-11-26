@@ -40,6 +40,10 @@ interface RejoinAck {
 }
 
 const $app = document.getElementById('app') as HTMLElement
+// The patch-managed layer: a SIBLING of $app (renderGame rebuilds all of
+// $app via innerHTML on every server push; the sheets that must survive
+// those rebuilds mount here and are patched in place).
+const $chrome = document.getElementById('chrome') as HTMLElement
 
 // ── theme ──
 type Theme = 'light' | 'dark'
@@ -885,7 +889,11 @@ function send(a: Action): void {
   })
 }
 
-$app.addEventListener('click', (ev) => {
+// One delegated handler serves BOTH roots: $app (the rebuilt main flow)
+// and $chrome (the patch-managed sheets) are siblings, so a tap inside a
+// sheet never bubbles through $app's listener — the same handler must be
+// registered on each root.
+function onActionClick(ev: MouseEvent): void {
   const el = (ev.target as HTMLElement).closest('[data-act]') as HTMLElement | null
   if (!el) return
   const act = el.dataset.act
@@ -1195,9 +1203,15 @@ $app.addEventListener('click', (ev) => {
       break
     }
   }
-})
+}
 
-$app.addEventListener('input', (ev) => {
+$app.addEventListener('click', onActionClick)
+$chrome.addEventListener('click', onActionClick)
+
+// The composer's cash inputs live in #chrome now; the same delegated
+// input handler covers both roots. Writes only the composer STATE — the
+// input element itself is never touched by a patch (focus/contents ride).
+function onComposerInput(ev: Event): void {
   const el = ev.target as HTMLInputElement
   if (!el.dataset.k || !composer) return
   const v = view
@@ -1205,7 +1219,10 @@ $app.addEventListener('input', (ev) => {
   const n = Math.max(0, Math.floor(Number(el.value) || 0))
   if (el.dataset.k === 'giveCash') composer.giveCash = Math.min(n, meOf(v).cash)
   if (el.dataset.k === 'recvCash') composer.recvCash = Math.min(n, partnerPlayer(v, composer.partner)?.cash ?? 0)
-})
+}
+
+$app.addEventListener('input', onComposerInput)
+$chrome.addEventListener('input', onComposerInput)
 
 function meOf(v: PlayerView | null) {
   return v?.players.find((p) => p.id === v.you) ?? { id: '', name: '', color: '', token: '', cash: 0, pos: 0, jail: false, jailRolls: 0, jailCards: 0, jailReason: null, bankrupt: false, connected: false }
@@ -1222,6 +1239,9 @@ function render(): void {
     renderGame(view)
     return
   }
+  // No game view (join screen, lobby, reconnecting): the game-only sheets
+  // die with the game view, exactly as they did when they lived in $app.
+  updateChrome(null)
   if (lobby) {
     renderLobby(lobby)
     return
@@ -1355,6 +1375,7 @@ function renderGame(v: PlayerView): void {
   const I = meOf(v)
   if (!I.id) {
     $app.innerHTML = `<div class="card"><h2>Spectating</h2><p class="hint">This room's game is already running.</p></div>`
+    updateChrome(v)
     return
   }
   const cur = v.players.find((p) => p.id === v.currentPlayerId)
@@ -1601,10 +1622,13 @@ function renderGame(v: PlayerView): void {
     ${landedStrip}
     ${drawStrip}
     ${deadlineChip}
-    <main>${body}</main>
-    ${composer && composer.open ? renderComposer(v) : ''}
-    ${menuOpen ? renderMenu() : ''}
-    ${deedsOpen ? renderDeeds(v) : ''}`
+    <main>${body}</main>`
+
+  // The sheets no longer ride in $app's innerHTML: they live in #chrome
+  // and are patched in place, so this wholesale rebuild never destroys an
+  // open sheet (the composer's inputs keep focus mid-typing, the deeds
+  // grid keeps its scroll).
+  updateChrome(v)
 
   // the wallet counts to its new balance, with a floating delta
   if (prevCash != null && prevCash !== I.cash) animateMoney(prevCash, I.cash)
@@ -1763,55 +1787,72 @@ function renderLedger(v: PlayerView, meId: string): string {
   </div>`
 }
 
-function renderComposer(v: PlayerView): string {
+// ── the trade composer sheet (chrome-mounted) ──
+// Region builders shared by mount and patch, so the two can never drift.
+// The cash INPUTS appear only in composerSheetHTML — the patcher has no
+// write path to them at all (focus and typed text survive every push).
+function composerPartnersRowHTML(v: PlayerView): string {
+  const C = composer
+  if (!C) return ''
+  return v.players
+    .filter((p) => !p.bankrupt && p.id !== v.you)
+    .map((p) => `<button class="chip ${C.partner === p.id ? 'sel' : ''}" data-act="composerPartner" data-args='{"partner":"${p.id}"}'>${avathumb(p)}${esc(p.name)}</button>`)
+    .join('')
+}
+
+function composerChipsHTML(v: PlayerView, forPid: string, selected: number[], which: 'give' | 'recv'): string {
+  const spaces = Object.entries(v.props).filter(([, st]) => st.owner === forPid)
+  const chip = (i: number, sel: boolean): string => {
+    const sp = BOARD[i]
+    const col = isStreet(sp) ? GROUP_COLORS[sp.group] : '#9aa1ad'
+    return `<button class="chip ${sel ? 'sel' : ''}" style="border-color:${col}" data-act="${which === 'give' ? 'toggleGiveSpace' : 'toggleRecvSpace'}" data-args='{"space":${i}}'>${esc(sp.name)}</button>`
+  }
+  const html = spaces.map(([iStr]) => chip(Number(iStr), selected.includes(Number(iStr)))).join('')
+  // the recv side keeps its empty-state hint; the give side never had one
+  return which === 'recv' ? html || '<span class="hint">they own nothing</span>' : html
+}
+
+function composerJailHTML(side: 'give' | 'recv', sel: boolean): string {
+  return `<button class="chip ${sel ? 'sel' : ''}" data-act="composerJail" data-args='{"side":"${side}"}'>Jail card</button>`
+}
+
+function composerRecvLabelHTML(v: PlayerView): string {
+  const partner = composer ? partnerPlayer(v, composer.partner) : null
+  return partner ? `${avathumb(partner)}${esc(partner.name)} gives` : 'They give'
+}
+
+function composerSheetHTML(v: PlayerView): string {
   const C = composer
   if (!C) return ''
   const I = meOf(v)
-  const partners = v.players.filter((p) => !p.bankrupt && p.id !== I.id)
   const partner = partnerPlayer(v, C.partner)
-  const mySpaces = Object.entries(v.props).filter(([, st]) => st.owner === I.id)
-  const theirSpaces = Object.entries(v.props).filter(([, st]) => st.owner === C.partner)
-  const chip = (i: number, selected: boolean, which: 'give' | 'recv'): string => {
-    const sp = BOARD[i]
-    const col = isStreet(sp) ? GROUP_COLORS[sp.group] : '#9aa1ad'
-    return `<button class="chip ${selected ? 'sel' : ''}" style="border-color:${col}" data-act="${which === 'give' ? 'toggleGiveSpace' : 'toggleRecvSpace'}" data-args='{"space":${i}}'>${esc(sp.name)}</button>`
-  }
   return `
-    <div class="modal" data-act="closeTrade">
-      <div class="sheet" data-act="">
-        <h3>Propose a trade</h3>
-        <label>Trade with</label>
-        <div class="row">
-          ${partners.map((p) => `<button class="chip ${C.partner === p.id ? 'sel' : ''}" data-act="composerPartner" data-args='{"partner":"${p.id}"}'>${avathumb(p)}${esc(p.name)}</button>`).join('')}
-        </div>
-        <label>You give</label>
-        <div class="chips">${mySpaces.map(([iStr]) => chip(Number(iStr), C.giveSpaces.includes(Number(iStr)), 'give')).join('')}</div>
-        <div class="row">
-          <input data-k="giveCash" type="number" inputmode="numeric" min="0" value="${C.giveCash}" placeholder="cash up to $${I.cash}" />
-          ${I.jailCards > 0 ? `<button class="chip ${C.giveJail > 0 ? 'sel' : ''}" data-act="composerJail" data-args='{"side":"give"}'>Jail card</button>` : ''}
-        </div>
-        <label>${partner ? `${avathumb(partner)}${esc(partner.name)} gives` : 'They give'}</label>
-        <div class="chips">${theirSpaces.map(([iStr]) => chip(Number(iStr), C.recvSpaces.includes(Number(iStr)), 'recv')).join('') || '<span class="hint">they own nothing</span>'}</div>
-        <div class="row">
-          <input data-k="recvCash" type="number" inputmode="numeric" min="0" value="${C.recvCash}" placeholder="cash up to $${partner?.cash ?? 0}" />
-          ${(partner?.jailCards ?? 0) > 0 ? `<button class="chip ${C.recvJail > 0 ? 'sel' : ''}" data-act="composerJail" data-args='{"side":"recv"}'>Jail card</button>` : ''}
-        </div>
-        <div class="row">
-          <button class="big primary" data-act="sendTrade">Send offer</button>
-          <button class="big" data-act="closeTrade">Cancel</button>
-        </div>
+      <h3>Propose a trade</h3>
+      <label>Trade with</label>
+      <div class="row" data-cp="partners">${composerPartnersRowHTML(v)}</div>
+      <label>You give</label>
+      <div class="chips" data-cp="giveChips">${composerChipsHTML(v, I.id, C.giveSpaces, 'give')}</div>
+      <div class="row" data-cp="giveRow">
+        <input data-k="giveCash" type="number" inputmode="numeric" min="0" value="${C.giveCash}" placeholder="cash up to $${I.cash}" />
+        ${I.jailCards > 0 ? composerJailHTML('give', C.giveJail > 0) : ''}
       </div>
-    </div>`
+      <label data-cp="recvLabel">${composerRecvLabelHTML(v)}</label>
+      <div class="chips" data-cp="recvChips">${composerChipsHTML(v, C.partner, C.recvSpaces, 'recv')}</div>
+      <div class="row" data-cp="recvRow">
+        <input data-k="recvCash" type="number" inputmode="numeric" min="0" value="${C.recvCash}" placeholder="cash up to $${partner?.cash ?? 0}" />
+        ${(partner?.jailCards ?? 0) > 0 ? composerJailHTML('recv', C.recvJail > 0) : ''}
+      </div>
+      <div class="row">
+        <button class="big primary" data-act="sendTrade">Send offer</button>
+        <button class="big" data-act="closeTrade">Cancel</button>
+      </div>`
 }
 
-// ── the hamburger sheet ──
-// The topbar's three utility buttons moved behind one ☰: the sheet reuses
-// the composer's shield (.modal backdrop closes, .sheet swallows taps with
-// an empty data-act). Rendered inside $app, so it survives view pushes.
-function renderMenu(): string {
+// ── the hamburger sheet (chrome-mounted) ──
+// The topbar's three utility buttons live behind one ☰. Sheet content
+// only — mountSheet wraps it; patchMenu patches just the theme label.
+function menuSheetHTML(): string {
   return `
-    <div class="modal" data-act="closeMenu">
-      <div class="sheet menu-sheet" data-act="">
         <button class="menu-item" data-act="showBoard">
           <span class="mi-label">🎲 Pocket board</span>
           <span class="mi-hint">Pinch to zoom · drag to pan (or orbit)</span>
@@ -1821,24 +1862,24 @@ function renderMenu(): string {
           <span class="mi-hint">Every title deed, all owners</span>
         </button>
         <button class="menu-item" data-act="theme">
-          <span class="mi-label">${theme === 'light' ? '🌙 Dark theme' : '☀️ Light theme'}</span>
+          <span class="mi-label" data-mi="theme">${theme === 'light' ? '🌙 Dark theme' : '☀️ Light theme'}</span>
           <span class="mi-hint">Switch the look of this phone</span>
         </button>
         <div class="menu-sep"></div>
         <button class="menu-item danger" data-act="leave">
           <span class="mi-label">Leave the game</span>
-        </button>
-      </div>
-    </div>`
+        </button>`
 }
 
-// ── the View-properties screen ──
+// ── the View-properties sheet (chrome-mounted) ──
 // Every title deed in the game as one grid of full cards, filtered by owner
 // and by kind (two chip rows, single-select each, AND-combined; re-tapping
 // the selected chip clears it). Unfiltered it groups by board order under
 // colour-run headings; filtered it's one flat grid. Cards show everything
 // inline — only your own deeds carry the (server-gated) action buttons.
-function renderDeeds(v: PlayerView): string {
+// Sheet content only — mountSheet wraps it; the chrome patcher re-emits
+// it solely when the deedsSig board signature actually changes.
+function deedsSheetHTML(v: PlayerView): string {
   const ownable = Object.keys(v.props).length
   const ownedTotal = Object.values(v.props).filter((st) => st.owner != null).length
   const alive = v.players.filter((p) => !p.bankrupt)
@@ -1909,17 +1950,180 @@ function renderDeeds(v: PlayerView): string {
   }
 
   return `
-    <div class="modal" data-act="closeDeeds">
-      <div class="sheet deeds-sheet" data-act="">
-        <div class="deeds-head">
-          <h3>PROPERTIES · ${ownedTotal}/${ownable}</h3>
-          <button class="deeds-x" data-act="closeDeeds" aria-label="Close">✕</button>
-        </div>
-        <div class="chips">${ownerChips}</div>
-        <div class="chips kind-chips">${kindChips}</div>
-        ${grid}
+      <div class="deeds-head">
+        <h3>PROPERTIES · ${ownedTotal}/${ownable}</h3>
+        <button class="deeds-x" data-act="closeDeeds" aria-label="Close">✕</button>
       </div>
-    </div>`
+      <div class="chips">${ownerChips}</div>
+      <div class="chips kind-chips">${kindChips}</div>
+      ${grid}`
+}
+
+// ── chrome: the in-place patcher ──
+// renderGame rebuilds ALL of $app via innerHTML on every server push, so
+// everything that must survive those rebuilds lives in the #chrome
+// sibling: the three sheets. Each mounts once per open and is then
+// patched, never rebuilt with the main flow — a push mid-typing never
+// touches the composer's inputs (focus and contents survive), and the
+// deeds grid is left byte-identical (scroll intact) unless the board
+// actually changed. Transient momentary overlays (card reveal, dice,
+// confirms, GO, the pocket board, propinfo, toasts, the update pill) stay
+// body-level and untouched. Sheet visibility is still the existing module
+// flags (menuOpen / deedsOpen / composer.open): mount on open, unmount on
+// close. The single-sheet state machine is a later round — not built here.
+
+// Signatures of the last-applied patch, so unchanged pushes cost zero
+// DOM writes (and the deeds grid's scrollTop survives them untouched).
+let composerSigLast = ''
+let deedsSigLast = ''
+
+// Backdrop tap closes (data-act on .modal); the sheet swallows taps with
+// an empty data-act — the composer's shield, unchanged.
+function mountSheet(id: string, sheetClass: string, sheetHTML: string, backdropAct: string): HTMLElement {
+  const modal = document.createElement('div')
+  modal.className = 'modal'
+  modal.id = id
+  modal.dataset.act = backdropAct
+  modal.innerHTML = `<div class="sheet ${sheetClass}" data-act="">${sheetHTML}</div>`
+  $chrome.appendChild(modal)
+  return modal
+}
+
+// ── menu: fully static except the theme label — patch exactly that ──
+function patchMenu(el: HTMLElement): void {
+  const label = el.querySelector('[data-mi="theme"]') as HTMLElement | null
+  if (!label) return
+  const want = theme === 'light' ? '🌙 Dark theme' : '☀️ Light theme'
+  if (label.textContent !== want) label.textContent = want
+}
+
+// ── composer: what its chip regions depend on ──
+// The cash INPUTS are deliberately absent from this signature — typing
+// changes composer.giveCash/recvCash only, so a push mid-typing finds the
+// signature unchanged and performs ZERO DOM writes on the sheet.
+function composerSig(v: PlayerView): string {
+  const C = composer
+  if (!C) return ''
+  const partner = partnerPlayer(v, C.partner)
+  const spacesOf = (pid: string): number[] => Object.entries(v.props).filter(([, st]) => st.owner === pid).map(([i]) => Number(i))
+  return JSON.stringify({
+    partners: v.players.filter((p) => !p.bankrupt && p.id !== v.you).map((p) => `${p.id}:${p.jailCards}`),
+    partner: C.partner,
+    my: spacesOf(v.you),
+    their: spacesOf(C.partner),
+    give: C.giveSpaces,
+    recv: C.recvSpaces,
+    myJail: meOf(v).jailCards,
+    theirJail: partner?.jailCards ?? 0,
+    giveJail: C.giveJail,
+    recvJail: C.recvJail,
+  })
+}
+
+// A jail-card chip sits BESIDE an input inside its row: toggle the class
+// in place when only the selection changed, insert/remove when presence
+// changed — the input node next to it is never recreated.
+function patchJailButton(row: HTMLElement | null, side: 'give' | 'recv', present: boolean, sel: boolean): void {
+  if (!row) return
+  const btn = row.querySelector('[data-act="composerJail"]') as HTMLElement | null
+  if (btn && present) {
+    btn.classList.toggle('sel', sel)
+    return
+  }
+  if (btn && !present) {
+    btn.remove()
+    return
+  }
+  const input = row.querySelector('input[data-k]') as HTMLElement | null
+  if (!btn && present && input) input.insertAdjacentHTML('afterend', composerJailHTML(side, sel))
+}
+
+// Patch every mutable region EXCEPT the inputs: chip rows and the recv
+// label get innerHTML swaps, the jail buttons are re-pointed around the
+// untouched input nodes. No code path here writes to an <input> — that
+// is the acceptance headline, structurally.
+function patchComposer(el: HTMLElement, v: PlayerView): void {
+  const C = composer
+  if (!C) return
+  const region = (name: string): HTMLElement | null => el.querySelector(`[data-cp="${name}"]`)
+  const partners = region('partners')
+  if (partners) partners.innerHTML = composerPartnersRowHTML(v)
+  const giveChips = region('giveChips')
+  if (giveChips) giveChips.innerHTML = composerChipsHTML(v, v.you, C.giveSpaces, 'give')
+  const recvChips = region('recvChips')
+  if (recvChips) recvChips.innerHTML = composerChipsHTML(v, C.partner, C.recvSpaces, 'recv')
+  const recvLabel = region('recvLabel')
+  if (recvLabel) recvLabel.innerHTML = composerRecvLabelHTML(v)
+  patchJailButton(region('giveRow'), 'give', meOf(v).jailCards > 0, C.giveJail > 0)
+  patchJailButton(region('recvRow'), 'recv', (partnerPlayer(v, C.partner)?.jailCards ?? 0) > 0, C.recvJail > 0)
+}
+
+// ── deeds: what the grid depends on ──
+// The board (owner+houses+mortgaged per space), the viewer's affordances
+// (the per-card manage buttons are server-gated via allowed), the alive
+// seats (owner chips), and the active filters. Anything else — a roll, a
+// bid, a cash move — leaves the sheet completely untouched: scroll and
+// any in-flight tap survive as-is.
+function deedsSig(v: PlayerView): string {
+  const props = Object.keys(v.props)
+    .map(Number)
+    .sort((a, b) => a - b)
+    .map((i) => {
+      const st = v.props[i]
+      return `${i}:${st.owner ?? '-'}:${st.houses}:${st.mortgaged ? 1 : 0}`
+    })
+    .join(',')
+  return `${props}|${v.allowed.join(',')}|${v.players.map((p) => (p.bankrupt ? '1' : '0')).join('')}|${deedFilters.owner}~${deedFilters.kind}`
+}
+
+// THE entry point renderGame calls after rebuilding $app. v == null (no
+// game view) tears every sheet down — the game-only sheets die with the
+// game view, exactly as they did when they lived inside $app.
+function updateChrome(v: PlayerView | null): void {
+  // menu sheet
+  const menuEl = document.getElementById('chromeMenu')
+  if (v && menuOpen) {
+    if (!menuEl) mountSheet('chromeMenu', 'menu-sheet', menuSheetHTML(), 'closeMenu')
+    else patchMenu(menuEl)
+  } else if (menuEl) menuEl.remove()
+
+  // trade composer
+  const composerEl = document.getElementById('chromeComposer')
+  if (v && composer && composer.open) {
+    const sig = composerSig(v)
+    if (!composerEl) {
+      mountSheet('chromeComposer', '', composerSheetHTML(v), 'closeTrade')
+      composerSigLast = sig
+    } else if (sig !== composerSigLast) {
+      patchComposer(composerEl, v)
+      composerSigLast = sig
+    }
+    // sig unchanged → zero DOM writes: focus, caret and text untouched
+  } else if (composerEl) {
+    composerEl.remove()
+    composerSigLast = ''
+  }
+
+  // deeds library
+  const deedsEl = document.getElementById('chromeDeeds')
+  if (v && deedsOpen) {
+    const sig = deedsSig(v)
+    if (!deedsEl) {
+      mountSheet('chromeDeeds', 'deeds-sheet', deedsSheetHTML(v), 'closeDeeds')
+      deedsSigLast = sig
+    } else if (sig !== deedsSigLast) {
+      // the board, the affordances or the filters actually changed: one
+      // re-emit of the sheet content (badges, owner labels and the head
+      // count are all derived from that same signature)
+      const sheet = deedsEl.querySelector('.sheet') as HTMLElement
+      sheet.innerHTML = deedsSheetHTML(v)
+      deedsSigLast = sig
+    }
+    // sig unchanged → the grid (and its scroll) is left completely alone
+  } else if (deedsEl) {
+    deedsEl.remove()
+    deedsSigLast = ''
+  }
 }
 
 // First paint: never leave the phone blank while the socket warms up.

@@ -254,13 +254,15 @@ button.boardpromo {
 .ledger-list .memo { flex: 1; }
 .ledger-list .lturn { color: var(--dim); font-size: 12px; white-space: nowrap; }
 
-/* modal sheet */
-.modal {
+/* modal sheet — scoped to #chrome (the patch-managed layer, a sibling of
+   #app): the sheets mount there and survive renderGame's wholesale
+   innerHTML rebuilds of $app. Sheets stay at z 20, same layer as ever. */
+#chrome .modal {
   position: fixed; inset: 0; z-index: 20;
   background: rgba(10, 12, 20, 0.55); backdrop-filter: blur(3px);
   display: flex; align-items: flex-end; justify-content: center;
 }
-.sheet {
+#chrome .sheet {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 20px 20px 0 0;

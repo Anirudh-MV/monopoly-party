@@ -5,6 +5,7 @@
 // phone from stalling the table. Run: npm run remedy
 
 import { createGame, type PlayerMeta } from '../shared/engine.js'
+import { blockingDecision } from '../shared/rules.js'
 import { auctionGraceActions, decisionFor, remedyActionsFor, type Room } from './rooms.js'
 import type { DebtState, GameState } from '../shared/types.js'
 
@@ -232,6 +233,33 @@ function fresh(): GameState {
   s.phase = 'ACTION'
   s.pendingJail = { player: 'p0', reason: 'card' }
   eq(decisionFor(s, 0)?.ms, 30_000, 'the arrest clock survives the timer switch')
+}
+
+// ── blockingDecision: projection parity ──
+// The room layer now DELEGATES to this shared helper (it also fills every
+// view's waitingOn), so key parity is by construction — these pins guard
+// the FORMAT: the auto-play table (autoActionsFor) matches these exact
+// prefixes to pick each deadline's expiry play, and scheduleDeadline uses
+// the key as the timer identity. A silent key-format drift would break
+// the expiry behaviour while everything still typechecks.
+{
+  const s = fresh()
+  eq(blockingDecision(s), { key: `roll:1:p0:0:0`, playerId: 'p0', kind: 'roll' }, 'fresh game: the roll decision, classic key format')
+  s.phase = 'ACTION'
+  s.pendingPurchase = 6
+  eq(blockingDecision(s), { key: 'buy:1:6', playerId: 'p0', kind: 'buy' }, 'pending purchase keeps the buy: prefix')
+  s.pendingPurchase = null
+  s.pendingTax = { player: 'p0', space: 4 }
+  eq(blockingDecision(s), { key: 'tax:1', playerId: 'p0', kind: 'tax' }, 'pending tax keeps the tax: prefix')
+  s.pendingTax = null
+  eq(blockingDecision(s), { key: 'end:1:p0', playerId: 'p0', kind: 'end' }, 'plain ACTION keeps the end: prefix')
+  s.phase = 'DEBT'
+  s.debt = { debtor: 'p0', amount: 50, creditor: 'p1' }
+  eq(blockingDecision(s), { key: 'debt:1:p0:p1:50:0', playerId: 'p0', kind: 'debt' }, 'a player debt keeps the debt: prefix')
+  s.phase = 'AUCTION'
+  s.debt = null
+  s.auction = { space: 6, bid: 40, bidder: 'p1', passed: [] }
+  eq(blockingDecision(s), { key: 'auc:1:6:40:p1', playerId: null, kind: 'auc' }, 'an auction keeps the auc: prefix and null owner')
 }
 
 if (failures.length > 0) {

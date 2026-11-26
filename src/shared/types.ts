@@ -191,6 +191,21 @@ export type Action =
 
 export type ActionType = Action['type']
 
+// ── The blocking decision ──
+// WHO the game is waiting on and WHAT kind of decision blocks, projected
+// into every view (HostView.waitingOn). Derived at view-build time by the
+// shared blockingDecision() helper — never stored in GameState, never in
+// snapshots. Timer-independent by construction: it reports who/what blocks
+// regardless of any deadline (deadlineFor is nulled at timer-off and null
+// is overloaded for auctions, so it cannot drive this).
+export type WaitingKind = 'roll' | 'jail' | 'draw' | 'buy' | 'tax' | 'end' | 'debt' | 'auc'
+
+export interface WaitingOn {
+  key: string // stable identity of the decision (same key = same decision)
+  playerId: string | null // null = the whole table (auctions)
+  kind: WaitingKind
+}
+
 // ── Views (server → screens) ──
 
 // Monopoly is a full-information game, so the host view is the whole public state.
@@ -227,6 +242,9 @@ export interface HostView {
   deadline: number | null
   deadlineFor: string | null
   turnTimeoutMs: number
+  /** Who/what the game is waiting on right now — the shared
+   *  blockingDecision() projection, identical with the clock on or off. */
+  waitingOn: WaitingOn | null
 }
 
 export interface PlayerView extends HostView {

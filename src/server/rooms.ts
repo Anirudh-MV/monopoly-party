@@ -23,7 +23,7 @@ import {
 } from '../shared/engine.js'
 import { ALL_CARDS } from '../shared/cards.js'
 import { hostView, playerView } from '../shared/views.js'
-import { allowedActions, alivePlayers, netWorth } from '../shared/rules.js'
+import { allowedActions, alivePlayers, blockingDecision, netWorth } from '../shared/rules.js'
 import { TOKENS, stripEmoji } from '../shared/tokens.js'
 import { COLORS } from '../shared/colors.js'
 import type {
@@ -35,6 +35,7 @@ import type {
   LobbyPlayer,
   TradeOffer,
   TradeSide,
+  WaitingOn,
 } from '../shared/types.js'
 import { validAction, validCode, validGodCommand, validToken } from '../shared/validate.js'
 
@@ -356,7 +357,7 @@ function broadcastGame(io: IOServer, room: Room): void {
   // was too coarse — proposeTrade and bankrupt are almost always available,
   // which blinded the old check to real stalls.)
   if (s.phase !== 'GAME_OVER' && !room.watchdogBusy && alivePlayers(s).length > 1) {
-    const decision = currentDecision(s)
+    const decision = blockingDecision(s)
     const stuck = decision != null && decision.playerId != null && allowedActions(s, decision.playerId).length === 0
     if (stuck) {
       console.error(`[watchdog] room ${room.code}: stuck at phase ${s.phase}, turn ${s.turn} — attempting remedy`)
@@ -517,43 +518,11 @@ function broadcast(room: Room, io: IOServer): void {
 
 // ── Decision deadlines ──
 
-interface Decision {
-  key: string
-  playerId: string | null // null = everyone (auction)
-}
-
-// What single decision is currently blocking play, if any.
-function currentDecision(s: GameState): Decision | null {
-  if (s.phase === 'ROLL') {
-    // dice+doubles in the key so a doubles bonus roll gets a fresh clock
-    const d = s.dice ? `${s.dice[0] + s.dice[1]}` : '0'
-    return { key: `roll:${s.turn}:${s.currentPlayerId}:${d}:${s.doubles}`, playerId: s.currentPlayerId }
-  }
-  if (s.phase === 'ACTION') {
-    if (s.pendingJail) return { key: `jail:${s.turn}:${s.pendingJail.player}`, playerId: s.pendingJail.player }
-    if (s.pendingCardDraw) return { key: `draw:${s.turn}:${s.pendingCardDraw.deck}:${s.pendingCardDraw.space}`, playerId: s.currentPlayerId }
-    if (s.pendingPurchase != null) return { key: `buy:${s.turn}:${s.pendingPurchase}`, playerId: s.currentPlayerId }
-    if (s.pendingTax) return { key: `tax:${s.turn}`, playerId: s.currentPlayerId }
-    return { key: `end:${s.turn}:${s.currentPlayerId}`, playerId: s.currentPlayerId }
-  }
-  if (s.phase === 'DEBT' && s.debt) {
-    const d = s.debt
-    // debtor AND creditor AND amount AND queue-depth in the key: a same-debtor
-    // relay (chairman paying each player) reuses one debtor+turn — with only
-    // those fields every relay row looked like the SAME decision, the timer
-    // never re-armed and later debts inherited an expired clock.
-    return {
-      key: `debt:${s.turn}:${d.debtor}:${d.creditor ?? 'bank'}:${d.amount}:${s.debtQueue.length}`,
-      playerId: d.debtor,
-    }
-  }
-  if (s.phase === 'AUCTION' && s.auction) {
-    // The bid and bidder are in the key so every new bid restarts the clock
-    // — the hammer falls only after real silence, never mid-bidding-war.
-    return { key: `auc:${s.turn}:${s.auction.space}:${s.auction.bid}:${s.auction.bidder ?? '-'}`, playerId: null }
-  }
-  return null
-}
+// What single decision is currently blocking play, if any: the room layer
+// calls the shared blockingDecision() projection (shared/rules.ts) — the
+// exact same helper that fills HostView.waitingOn for every screen, so the
+// clock and the phones can never disagree on who/what blocks. Only the
+// key and playerId matter to the clock; the kind rides along for the views.
 
 // The debt-clock expiry play. An affordable debt is one tap away — pay it.
 // An unaffordable one liquidates minimally (liquidationPlan) and pays on the
@@ -589,7 +558,14 @@ export function debtAutoActions(s: GameState, playerId: string): { autos: Array<
 }
 
 // The sensible default each deadline plays on expiry.
-function autoActionsFor(room: Room, d: Decision): Array<[string, Action]> {
+// The deadline machinery's working type: the key and the owner are all
+// the auto-play table needs (decisionFor's slim answer satisfies it).
+interface ClockedDecision {
+  key: string
+  playerId: string | null // null = everyone (auction)
+}
+
+function autoActionsFor(room: Room, d: ClockedDecision): Array<[string, Action]> {
   const s = room.state
   if (!s || !d.playerId) return []
   if (d.key.startsWith('roll:')) return [[d.playerId, { type: 'roll' }]]
@@ -625,37 +601,39 @@ function autoActionsFor(room: Room, d: Decision): Array<[string, Action]> {
 // Trades and portfolio taps are never clocked at any setting, and during a
 // DEBT freeze the clock belongs to exactly one blocking owner: the debtor.
 export function decisionFor(s: GameState, turnTimeoutMs: number): { key: string; playerId: string | null; ms: number } | null {
-  const decision = currentDecision(s)
+  const decision = blockingDecision(s)
   if (!decision) return null
   const key = decision.key
   // Arrests and end-of-turn waits run on a fixed 30-second clock at any
   // host setting — they must never strand.
-  if (key.startsWith('jail:') || key.startsWith('end:')) return { ...decision, ms: 30_000 }
+  if (key.startsWith('jail:') || key.startsWith('end:')) return { key, playerId: decision.playerId, ms: 30_000 }
   if (key.startsWith('debt:')) {
     const d = s.debt
     if (!d) return null
     const debtor = s.players.find((q) => q.id === d.debtor)
-    if (debtor && debtor.cash >= d.amount) return { ...decision, ms: 30_000 }
+    if (debtor && debtor.cash >= d.amount) return { key, playerId: decision.playerId, ms: 30_000 }
     // Unaffordable: the host clock when it's on; a fixed 90-second
     // raise-funds window when it's off — on expiry the bank auto-settles
     // the estate (liquidationPlan) instead of bankrupting a recoverable seat.
-    return { ...decision, ms: turnTimeoutMs > 0 ? turnTimeoutMs : 90_000 }
+    return { key, playerId: decision.playerId, ms: turnTimeoutMs > 0 ? turnTimeoutMs : 90_000 }
   }
   if (key.startsWith('auc:')) {
     // Auctions: a generous opening window, then a short fuse that every bid
     // resets. The host fuse shortens it when set below the fixed windows.
     const auctionIdle = s.auction != null && (s.auction.bidder != null || s.auction.bid > 0)
     const ms = auctionIdle ? AUCTION_IDLE_MS : AUCTION_OPEN_MS
-    return { ...decision, ms: turnTimeoutMs > 0 ? Math.min(turnTimeoutMs, ms) : ms }
+    return { key, playerId: decision.playerId, ms: turnTimeoutMs > 0 ? Math.min(turnTimeoutMs, ms) : ms }
   }
-  if (turnTimeoutMs > 0) return { ...decision, ms: turnTimeoutMs }
+  if (turnTimeoutMs > 0) return { key, playerId: decision.playerId, ms: turnTimeoutMs }
   // Timer-off defaults: the phase names the wait, the wait names the clock.
   const fixed = key.startsWith('roll:') ? 60_000
     : key.startsWith('draw:') ? 30_000
     : key.startsWith('buy:') ? 60_000
     : key.startsWith('tax:') ? 60_000
     : 0
-  return fixed > 0 ? { ...decision, ms: fixed } : null
+  // Only {key, playerId, ms} ships on purpose: the clock answer stays
+  // stable even if the projection grows new fields (the kind never clocked).
+  return fixed > 0 ? { key, playerId: decision.playerId, ms: fixed } : null
 }
 
 function scheduleDeadline(room: Room): void {
@@ -712,7 +690,7 @@ function scheduleDeadline(room: Room): void {
 // player sees the debt either still pending or fully settled, and the
 // per-step reducer log lines (every sellHouse/mortgage carries a ledger
 // entry) provide the paper trail right behind the headline.
-function autoCommit(room: Room, decision: Decision): boolean {
+function autoCommit(room: Room, decision: ClockedDecision): boolean {
   const s = room.state
   if (!s || decision.playerId == null) return false
   if (decision.key.startsWith('debt:')) {

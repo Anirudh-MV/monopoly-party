@@ -1,4 +1,4 @@
-import { allowedActions } from './rules.js'
+import { allowedActions, blockingDecision } from './rules.js'
 import type { GameState, HostView, PlayerView } from './types.js'
 
 // Monopoly is full-information, so the projection is mostly a trim:
@@ -35,6 +35,8 @@ export function hostView(s: GameState, code: string, hostId: string | null, turn
     deadline: s.deadline,
     deadlineFor: s.deadlineFor,
     turnTimeoutMs,
+    // Derived, never stored: who/what blocks right now, with or without a clock.
+    waitingOn: blockingDecision(s),
   }
 }
 

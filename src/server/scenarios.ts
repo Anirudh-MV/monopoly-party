@@ -14,7 +14,8 @@ import {
   type Result,
 } from '../shared/engine.js'
 import { auctionGraceActions, commit, debtAutoActions, decisionFor, forfeitSeat, type Room } from './rooms.js'
-import { allowedActions, debtBlurb, rentFor, rentPreview } from '../shared/rules.js'
+import { allowedActions, blockingDecision, debtBlurb, rentFor, rentPreview } from '../shared/rules.js'
+import { hostView } from '../shared/views.js'
 import type { Action, DebtState, GameState, PlayerState, PropertyState } from '../shared/types.js'
 
 const NAMES = ['Asha', 'Ben', 'Cho', 'Dara']
@@ -1404,6 +1405,76 @@ scenario('auctionGraceActions passes exactly the seats the old inline check did'
   h.eq(auctionGraceActions(room), [[h.id(0), { type: 'passBid' }]], 'exactly one seat due, same as the piggybacked check')
   room.players[0].disconnectedAt = Date.now() - 5_000
   h.eq(auctionGraceActions(room), [], 'a seat still inside the grace window is left to the fuse')
+})
+
+// ── waitingOn: the blocking-decision projection ──
+// Who the game is waiting on and what kind of decision blocks, projected
+// into every view by the shared blockingDecision() helper. Timer-off is
+// the headline: the projection reads no clock, so it must be identical
+// with the decision timer disabled and enabled.
+scenario('waitingOn names who and what blocks, with or without a clock', 4, (h) => {
+  // ROLL pending → the current player's roll attempt
+  h.s.phase = 'ROLL'
+  h.eq(blockingDecision(h.s), { key: `roll:1:${h.id(0)}:0:0`, playerId: h.id(0), kind: 'roll' }, 'a fresh turn waits on the current player rolling')
+  // a jailed player in ROLL still owes the roll attempt (pay fine / card
+  // are alternatives on the SAME decision — the two-step arrest is the
+  // separate 'jail' kind below)
+  h.p(0).jail = true
+  h.eq(blockingDecision(h.s)?.kind, 'roll', 'a jailed player in ROLL still waits on the roll attempt')
+  h.p(0).jail = false
+
+  // the announced arrest → 'jail', owned by the arrested player
+  h.s.phase = 'ACTION'
+  h.s.pendingJail = { player: h.id(2), reason: 'doubles' }
+  h.eq(blockingDecision(h.s), { key: `jail:1:${h.id(2)}`, playerId: h.id(2), kind: 'jail' }, 'the announced arrest waits on the arrested player')
+
+  // pending card draw → 'draw'
+  h.s.pendingJail = null
+  h.s.pendingCardDraw = { player: h.id(0), deck: 'chance', space: 8 }
+  h.eq(blockingDecision(h.s), { key: `draw:1:chance:8`, playerId: h.id(0), kind: 'draw' }, 'a landed card space waits on the drawer')
+
+  // pending purchase → 'buy'
+  h.s.pendingCardDraw = null
+  h.s.pendingPurchase = 6
+  h.eq(blockingDecision(h.s), { key: `buy:1:6`, playerId: h.id(0), kind: 'buy' }, 'an unowned landing waits on buy or decline')
+
+  // pending tax → 'tax'
+  h.s.pendingPurchase = null
+  h.s.pendingTax = { player: h.id(0), space: 4 }
+  h.eq(blockingDecision(h.s), { key: `tax:1`, playerId: h.id(0), kind: 'tax' }, 'income tax waits on the choice')
+
+  // plain ACTION → 'end'
+  h.s.pendingTax = null
+  h.eq(blockingDecision(h.s), { key: `end:1:${h.id(0)}`, playerId: h.id(0), kind: 'end' }, 'an idled turn waits on End turn')
+
+  // DEBT → 'debt', owned by the debtor (bank creditor spelled out)
+  h.s.phase = 'DEBT'
+  h.s.debt = { debtor: h.id(1), amount: 50, creditor: null }
+  h.eq(blockingDecision(h.s), { key: `debt:1:${h.id(1)}:bank:50:0`, playerId: h.id(1), kind: 'debt' }, 'a debt freeze waits on the debtor')
+
+  // AUCTION → 'auc' with playerId null — the whole table is the owner,
+  // which is exactly why deadlineFor's null overload can't serve this
+  h.s.phase = 'AUCTION'
+  h.s.debt = null
+  h.s.auction = { space: 6, bid: 0, bidder: null, passed: [] }
+  h.eq(blockingDecision(h.s), { key: `auc:1:6:0:-`, playerId: null, kind: 'auc' }, 'an auction waits on everyone (playerId null)')
+
+  // finished games block on nothing
+  h.s.phase = 'GAME_OVER'
+  h.s.auction = null
+  h.eq(blockingDecision(h.s), null, 'GAME_OVER blocks on nothing')
+
+  // the view projection is DERIVED (never stored) and reads no clock: the
+  // field is byte-identical at timer-off and timer-on, and equals the
+  // shared helper the server's own decision clock delegates to
+  h.s.phase = 'ROLL'
+  h.eq(
+    hostView(h.s, 'TEST', null, 0).waitingOn,
+    hostView(h.s, 'TEST', null, 300_000).waitingOn,
+    'waitingOn ignores the clock setting',
+  )
+  h.eq(hostView(h.s, 'TEST', null, 0).waitingOn, blockingDecision(h.s), 'the view field is the shared projection')
+  h.assert(!('waitingOn' in h.s), 'waitingOn is never stored in GameState')
 })
 
 // ── summary ──
