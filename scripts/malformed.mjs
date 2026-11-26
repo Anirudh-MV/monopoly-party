@@ -402,6 +402,29 @@ try {
     tvr.disconnect()
   }
 
+  // ── round-cap settings: hostile payloads must die at the boundary ──
+  // The presets ride the same room:settings channel as the timer; the
+  // shared asInt(0..999) pin is what makes them safe. Bogus shapes are
+  // rejected with the standard copy, the legal presets still land.
+  {
+    const tvr = connect()
+    const cr = await emitAck(tvr, 'room:create')
+    assert(cr.ok, 'rounds-cap battery room created')
+    const badCaps = ['twenty', -1, 1000, 1.5, 1e15, [], { evil: BIG }, null, true]
+    for (const cap of badCaps) {
+      const res = await emitAck(tvr, 'room:settings', { roundsCap: cap })
+      assert(!res.ok, `room:settings rejects roundsCap ${JSON.stringify(cap)}`)
+      assert(alive(), `server alive after roundsCap ${JSON.stringify(cap)}`)
+    }
+    // NaN serializes to null over the wire — the null entry above covers it
+    for (const cap of [0, 20, 35, 999]) {
+      const res = await emitAck(tvr, 'room:settings', { roundsCap: cap })
+      assert(res.ok, `room:settings accepts roundsCap ${cap}`)
+      assert(alive(), `server alive after accepting roundsCap ${cap}`)
+    }
+    tvr.close()
+  }
+
   // ── prototype pollution attempt through a snapshot import ──
   const poison = await emitAck(tv, 'god:command', {
     cmd: 'import',
@@ -569,6 +592,96 @@ try {
     })
     assert(lres.ok, 'an exactly-at-cap log imports cleanly (export/import aligned)')
     assert(alive(), 'server alive after the at-cap import')
+
+    // ── winners + roundsCap: the shared-win record gets the same
+    // normalize-or-default treatment — unknown ids, non-strings, hostile
+    // objects and oversized arrays are dropped or defaulted, never
+    // rendered; the legal record survives byte-identical.
+    const winPlayers = [
+      { id: 'p0', cash: 100, pos: 0, jail: false, jailRolls: 0, jailCards: 0, jailReason: null, bankrupt: false, connected: true },
+      { id: 'p1', cash: 100, pos: 0, jail: false, jailRolls: 0, jailCards: 0, jailReason: null, bankrupt: false, connected: true },
+    ]
+    const wres = await emitAck(tvg, 'god:command', {
+      cmd: 'import',
+      json: {
+        players: [
+          { meta: { id: 'p0', name: 'Ann', color: '#000000', token: '🎩' }, token: 'tk0' },
+          { meta: { id: 'p1', name: 'Bob', color: '#111111', token: '🚗' }, token: 'tk1' },
+        ],
+        roundsCap: 20,
+        state: bare({
+          phase: 'GAME_OVER',
+          players: winPlayers,
+          pendingCard: null,
+          pendingCardDraw: null,
+          pendingJail: null,
+          pendingPurchase: null,
+          pendingTax: null,
+          pendingMove: null,
+          auction: null,
+          auctionQueue: [],
+          lastLanded: null,
+          lastMove: null,
+          deadline: null,
+          deadlineFor: null,
+          winner: 'p0',
+          debt: null,
+          debtQueue: [],
+          roundsCap: 20,
+          winners: ['p0', 'ghost', 42, null, { evil: '<img src=x onerror=alert(1)>' }, 'p1'],
+        }),
+      },
+    })
+    assert(wres.ok, 'the shared-win snapshot imports (hostile entries dropped)')
+    assert(alive(), 'server alive after the hostile winners array')
+    const wsnap = await emitAck(tvg, 'god:command', { cmd: 'export' })
+    const wstate = wsnap.snapshot && wsnap.snapshot.state
+    assert(wsnap.ok && wstate, 'export after the winners import')
+    assert(
+      wstate && JSON.stringify(wstate.winners) === JSON.stringify(['p0', 'p1']),
+      'only known seat ids survived the winners array',
+    )
+    assert(wstate && wstate.roundsCap === 20, 'the state-level cap round-tripped')
+    assert(wsnap.snapshot && wsnap.snapshot.roundsCap === 20, 'the room-level cap round-tripped')
+
+    // a non-array winners field and an out-of-range cap both default away
+    const wres2 = await emitAck(tvg, 'god:command', {
+      cmd: 'import',
+      json: {
+        players: [
+          { meta: { id: 'p0', name: 'Ann', color: '#000000', token: '🎩' }, token: 'tk0' },
+          { meta: { id: 'p1', name: 'Bob', color: '#111111', token: '🚗' }, token: 'tk1' },
+        ],
+        state: bare({
+          phase: 'GAME_OVER',
+          players: winPlayers,
+          pendingCard: null,
+          pendingCardDraw: null,
+          pendingJail: null,
+          pendingPurchase: null,
+          pendingTax: null,
+          pendingMove: null,
+          auction: null,
+          auctionQueue: [],
+          lastLanded: null,
+          lastMove: null,
+          deadline: null,
+          deadlineFor: null,
+          winner: 'p0',
+          debt: null,
+          debtQueue: [],
+          roundsCap: 9999,
+          winners: 'p0',
+        }),
+      },
+    })
+    const w2snap = await emitAck(tvg, 'god:command', { cmd: 'export' })
+    const w2state = w2snap.snapshot && w2snap.snapshot.state
+    assert(wres2.ok && w2snap.ok, 'the bogus-shape snapshot imports with defaults')
+    assert(w2state && w2state.winners === undefined, 'a non-array winners field reads as none recorded')
+    assert(w2state && w2state.roundsCap === 0, 'an out-of-range state cap defaults to uncapped')
+    assert(w2snap.snapshot && w2snap.snapshot.roundsCap === 0, 'an absent room cap defaults to uncapped')
+    assert(alive(), 'server alive after the defaulted winners/cap import')
     tvg.close()
   }
 

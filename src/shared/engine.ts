@@ -81,7 +81,7 @@ function logMoney(s: GameState, pid: string, delta: number, memo: string): void 
   if (s.ledger.length > 600) s.ledger.splice(0, s.ledger.length - 600)
 }
 
-export function createGame(players: PlayerMeta[], rng: () => number = Math.random): GameState {
+export function createGame(players: PlayerMeta[], rng: () => number = Math.random, roundsCap = 0): GameState {
   const s: GameState = {
     phase: 'ROLL',
     players: players.map((m) => ({
@@ -127,6 +127,7 @@ export function createGame(players: PlayerMeta[], rng: () => number = Math.rando
     log: [],
     turn: 1,
     winner: null,
+    roundsCap,
   }
   for (const [i, sp] of BOARD.entries()) {
     if ('price' in sp) s.props[i] = { owner: null, houses: 0, mortgaged: false }
@@ -204,7 +205,68 @@ function advancePhase(s: GameState): void {
   s.phase = bonus ? 'ROLL' : 'ACTION'
 }
 
-function nextPlayer(s: GameState): void {
+// ── Round-cap victory ──
+// The boundary lives HERE, at the only place a turn can hand over to the
+// next: before advancing, if the next turn would open round roundsCap + 1,
+// the game ends by worth instead. The round in progress always completes —
+// nextPlayer is only reachable with every pending cleared (the endTurn gate
+// refuses while a purchase/tax/card/arrest/debt is open, and the
+// resumeAfterDebt chain drains debts and liquidation auctions before it
+// ever calls advancePhase → nextPlayer), so a cap can never interrupt an
+// auction, a debt, a trade or a mid-round stroll. Real wins still trump
+// the cap: checkGameOver runs during play, long before any boundary.
+function endByCap(s: GameState): void {
+  const alive = R.alivePlayers(s)
+  if (alive.length === 0) {
+    // Should be impossible — checkGameOver ends the game the moment one
+    // player (or nobody) is left, long before a boundary. Assert the
+    // invariant defensively and fall back to the no-winner record.
+    log(s, '🏆 Everyone went bankrupt.', 'good')
+    s.phase = 'GAME_OVER'
+    s.winner = null
+    s.winners = []
+    return
+  }
+  // Rank by finalWorth, tie-break on cash, then SHARE the win. ("Fewest
+  // properties" was explicitly rejected by the ruling.)
+  const ranked = [...alive].sort((a, b) => {
+    const wa = R.finalWorth(s, a.id).total
+    const wb = R.finalWorth(s, b.id).total
+    if (wa !== wb) return wb - wa
+    return b.cash - a.cash
+  })
+  const top = R.finalWorth(s, ranked[0].id).total
+  const winners = ranked
+    .filter((p) => {
+      const w = R.finalWorth(s, p.id)
+      return w.total === top && p.cash === ranked[0].cash
+    })
+    .map((p) => p.id)
+  s.phase = 'GAME_OVER'
+  s.winners = winners
+  s.winner = winners[0] ?? null
+  // Clear pendings exactly like checkGameOver does.
+  s.auction = null
+  s.auctionQueue = []
+  s.debtQueue = []
+  s.pendingPurchase = null
+  s.pendingTax = null
+  s.pendingMove = null
+  if (winners.length === 1) {
+    const w = R.byId(s, winners[0])
+    log(s, `🏆 ${w?.name ?? 'Someone'} WINS ON WORTH — $${top}`, 'good')
+  } else {
+    const names = winners.map((id) => R.byId(s, id)?.name ?? 'Someone').join(' & ')
+    log(s, `🏆 ${names} SHARE THE WIN — tied at $${top}`, 'good')
+  }
+}
+
+// Advance the turn pointer to the next living seat. The one turn-boundary
+// of the whole engine: when the next turn would open round roundsCap + 1,
+// the cap ends the game by worth instead of advancing. Exported so the god
+// console's skipTurn routes through the SAME boundary (a god skip must
+// never smuggle the game past its own cap).
+export function nextPlayer(s: GameState): void {
   s.dice = null
   s.doubles = 0
   s.pendingCard = null
@@ -212,6 +274,10 @@ function nextPlayer(s: GameState): void {
   s.pendingJail = null
   s.pendingMove = null
   const order = s.players
+  if (s.roundsCap > 0 && R.roundOf(s.turn + 1, order.length) > s.roundsCap) {
+    endByCap(s)
+    return
+  }
   const k = order.findIndex((q) => q.id === s.currentPlayerId)
   for (let step = 1; step <= order.length; step++) {
     const cand = order[(k + step) % order.length]
@@ -222,6 +288,17 @@ function nextPlayer(s: GameState): void {
   }
   s.turn++
   s.phase = 'ROLL'
+  // The final round gets its warning line the moment it OPENS (turn 1 of a
+  // cap-1 game is the final round by birth — no boundary opened it, so no
+  // line: the lobby preset already said so). Only the round-OPENING turn
+  // logs, not every turn inside it.
+  if (
+    s.roundsCap > 0 &&
+    R.roundOf(s.turn, order.length) === s.roundsCap &&
+    (s.turn - 1) % order.length === 0
+  ) {
+    log(s, '⏳ Final round — highest worth wins!', 'info')
+  }
 }
 
 function resumeAfterDebt(s: GameState, rng: () => number): void {
@@ -554,6 +631,8 @@ function checkGameOver(s: GameState, lastStanding = false): boolean {
   if (alive.length > 1) return false
   s.phase = 'GAME_OVER'
   s.winner = alive[0]?.id ?? null
+  // The single-winner record: winner === winners[0] ?? null, by construction.
+  s.winners = alive[0] ? [alive[0].id] : []
   s.auction = null
   s.auctionQueue = []
   s.debtQueue = []

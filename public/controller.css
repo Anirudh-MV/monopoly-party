@@ -565,9 +565,11 @@ main { display: block; }
 
 /* ── update prompt (fixed pill, undismissable until refresh) ── */
 .mp-updater {
-  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  position: fixed; bottom: calc(76px + env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%);
   z-index: 45; /* the your-move bar (82) and confirmations (84) sit above
-     the pill — it never blocks a decision's escape hatch; toasts rule at 96 */
+     the pill — it never blocks a decision's escape hatch; toasts rule at 96;
+     and the bottom offset clears the dock bar (56px + safe area) so the
+     two never overlap */
   background: var(--panel); border: 2px solid var(--money-bright);
   border-radius: 14px; padding: 12px 16px;
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;

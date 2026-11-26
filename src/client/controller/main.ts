@@ -23,6 +23,7 @@ import {
   netWorth,
   rentFor,
   rentPreview,
+  roundOf,
   unmortgageCost,
 } from '../../shared/rules.js'
 import type { Action, Card, ColorGroup, LobbyInfo, PlayerView, Space, TradeOffer, TradeSide, WaitingKind } from '../../shared/types.js'
@@ -217,13 +218,21 @@ function closeSheet(): void {
 }
 
 // Android back / browser back: the popstate is either our own pop (the
-// sheet is already closed — stand down) or the user's (close, exactly once).
+// cover is already closed — stand down) or the user's (close, exactly
+// once). Two cover kinds, one handler: whichever entry the history just
+// popped names the cover that dies — a board entry never eats a sheet's
+// back and vice versa.
 window.addEventListener('popstate', (ev) => {
   if (popGuard) {
     popGuard = false
     return
   }
-  if (sheet && !(ev.state as { mpSheet?: string } | null)?.mpSheet) closeSheet()
+  const st = ev.state as { mpSheet?: string; mpBoard?: number } | null
+  if (phoneBoard && !st?.mpBoard) {
+    closeBoard()
+    return
+  }
+  if (sheet && !st?.mpSheet) closeSheet()
 })
 
 // Dialog keyboard semantics: Escape closes (one path — closeSheet), and
@@ -358,9 +367,10 @@ function performExit(): void {
 // Seat gone (leave, kick, room closed): every screen-local state must go
 // back to cold. A rejoin's first view is then a fresh baseline — the old
 // roll machine must not replay the previous seat's last roll, and a dead
-// sheet must not greet the join screen. closeSheet funnels the teardown
-// (DOM, scroll lock, focus, the pushed history entry).
+// sheet or board must not greet the join screen. closeSheet/closeBoard
+// funnel the teardown (DOM, scroll lock, focus, the pushed history entry).
 function resetScreenStates(): void {
+  if (phoneBoard) closeBoard()
   closeSheet()
   deedFilters = { owner: 'ALL', kind: 'ALL' }
   rollSeen = false
@@ -637,6 +647,11 @@ function animateMoney(from: number, to: number): void {
 // The dock's Board button is the permanent entry point — discovery is
 // structural now, no one-time promo needed.
 let phoneBoard: Board3D | null = null
+// true while the open board owns its pushed history entry — the sheet
+// mechanism mirrored, so Android back over an open board closes the BOARD,
+// not the page (and never double-fires with an underlying sheet entry: the
+// board's entry sits on top, one back pops exactly one cover).
+let boardEntry = false
 
 // Persisted single-finger gesture verb for the pocket board: 'pan' (map-style
 // lateral drag, the default) or 'orbit'. Stored per browser.
@@ -665,6 +680,10 @@ function showBoard(): void {
   phoneBoard.sync(view)
   // tap any tile for its details: price, rent, owner
   phoneBoard.onTileTap = (space) => showPropInfo(space)
+  // one pushed entry per open, exactly like a sheet: same URL, so the
+  // update pill and the ?code= prefill are untouched
+  history.pushState({ mpBoard: 1 }, '', location.href)
+  boardEntry = true
   const tools = overlay.querySelector('.board-tools') as HTMLElement
   tools.addEventListener('click', (ev) => {
     const btn = (ev.target as HTMLElement).closest('[data-act]') as HTMLElement | null
@@ -695,9 +714,22 @@ function showBoard(): void {
 }
 
 function closeBoard(): void {
+  // The pushed entry is consumed exactly once, sheet-style: a UI close pops
+  // it via history.back() (the popstate handler recognises its own pop), a
+  // real Android back has already popped it — history.state no longer
+  // carries mpBoard, so no second back fires.
+  const hadEntry = boardEntry
+  boardEntry = false
   phoneBoard?.dispose()
   phoneBoard = null
   document.querySelector('.board-overlay')?.remove()
+  if (hadEntry) {
+    const st = history.state as { mpBoard?: number } | null
+    if (st?.mpBoard && !popGuard) {
+      popGuard = true
+      history.back()
+    }
+  }
   if (view || lobby) render()
 }
 
@@ -1646,8 +1678,16 @@ function renderGame(v: PlayerView): void {
 
   // ── Contextual status (mutually exclusive) ──
   if (v.phase === 'GAME_OVER' || v.winner) {
-    const winner = v.players.find((p) => p.id === v.winner)
-    banner = `<div class="banner ${winner?.id === I.id ? 'good' : ''}">${winner ? `${esc(winner.name)} wins!` : 'Game over'}</div>`
+    // Shared wins (worth ties) read as a tie on the phone; the single-winner
+    // copy every existing screen knows stays byte-identical.
+    const winners = v.winners ?? (v.winner ? [v.winner] : [])
+    if (winners.length > 1) {
+      const mine = winners.includes(I.id)
+      banner = `<div class="banner ${mine ? 'good' : ''}">It's a tie! — ${v.players.filter((p) => winners.includes(p.id)).map((p) => esc(p.name)).join(' & ')} share the win</div>`
+    } else {
+      const winner = v.players.find((p) => p.id === v.winner)
+      banner = `<div class="banner ${winner?.id === I.id ? 'good' : ''}">${winner ? `${esc(winner.name)} wins!` : 'Game over'}</div>`
+    }
   } else if (v.phase === 'DEBT' && v.debt && v.debt.debtor === I.id) {
     const creditor = v.debt.creditor ? v.players.find((p) => p.id === v.debt?.creditor) : null
     const canPay = acts.has('payDebt')
@@ -1817,7 +1857,7 @@ function renderGame(v: PlayerView): void {
     <header class="topbar" style="--c:${I.color}">
       <span class="me">${avathumb(I)}${esc(I.name)}</span>
       <span class="money" id="moneyChip">$${I.cash}</span>
-      <span class="meta">worth $${worth}${I.jailCards > 0 ? ` · jail card ×${I.jailCards}` : ''}${I.jail ? ' · in jail' : ''}</span>
+      <span class="meta">worth $${worth}${v.roundsCap > 0 ? ` · Round ${roundOf(v.turn, v.players.length)}/${v.roundsCap}` : ''}${I.jailCards > 0 ? ` · jail card ×${I.jailCards}` : ''}${I.jail ? ' · in jail' : ''}</span>
     </header>
     ${banner}
     ${diceStrip && Date.now() < diceStrip.until ? diceStrip.html : ''}

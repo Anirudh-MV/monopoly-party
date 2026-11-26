@@ -145,6 +145,15 @@ export interface GameState {
   log: LogEntry[]
   turn: number
   winner: string | null
+  // Round-cap victory: 0 = uncapped (Classic). When the cap-th round completes
+  // with two or more players still alive, the game ends and the highest-worth
+  // estate wins instead of the last one standing. Absent in pre-cap
+  // snapshots (treated as 0 — the jailCardDecks optional-field precedent).
+  roundsCap: number
+  // Every winner of the record (shared ties), winner-first. `winner` above
+  // stays the single-id field every existing screen keys on: winner ===
+  // winners[0] ?? null. Optional so old snapshots import without it.
+  winners?: string[]
 }
 
 // The subset of state the rules helpers need. GameState satisfies this structurally,
@@ -236,12 +245,16 @@ export interface HostView {
    *  Ships to every screen so phones and the TV can show relay progress. */
   debtQueue: DebtState[]
   winner: string | null
+  /** Every winner of the record (shared ties); winner === winners[0] ?? null. */
+  winners: string[] | undefined
   trades: TradeOffer[]
   lastLanded: { playerId: string; space: number } | null
   lastMove: { playerId: string; path: number[] } | null
   deadline: number | null
   deadlineFor: string | null
   turnTimeoutMs: number
+  /** Round cap for the worth victory; 0 = uncapped (Classic). */
+  roundsCap: number
   /** Who/what the game is waiting on right now — the shared
    *  blockingDecision() projection, identical with the clock on or off. */
   waitingOn: WaitingOn | null
@@ -288,6 +301,9 @@ export interface LobbyInfo {
   hostId: string | null
   /** Decision deadline in ms; 0 = off. Set by the host in the lobby. */
   turnTimeoutMs: number
+  /** Round cap (worth victory); 0 = uncapped Classic. Set by the host in
+   *  the lobby beside the timer — phones render it read-only at most. */
+  roundsCap: number
 }
 
 // ── God commands (TV host console only) ──

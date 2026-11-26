@@ -10,7 +10,7 @@ import QRCode from 'qrcode'
 import { BOARD, GROUP_COLORS, groupIndices, isStreet } from '../../shared/board.js'
 import { TOKENS } from '../../shared/tokens.js'
 import { avatarThumbnail } from '../tokens3d.js'
-import { debtBlurb, rentFor } from '../../shared/rules.js'
+import { debtBlurb, finalWorth, rentFor, roundOf } from '../../shared/rules.js'
 import { cardEffectLine } from '../../shared/card-effect.js'
 import { cardFace, deedChip, deedFull } from '../deed-card.js'
 import type { ColorGroup, HostView, LobbyInfo, PlayerState } from '../../shared/types.js'
@@ -384,6 +384,12 @@ $app.addEventListener('click', (ev) => {
     socket.emit('room:settings', { turnTimeoutMs: ms }, (res: { ok: boolean; error?: string }) => {
       if (!res.ok) console.warn('timer change failed:', res.error)
     })
+  } else if (el.dataset.act === 'setRounds') {
+    // Game-length presets (the worth victory): Quick / Standard / Classic.
+    const roundsCap = Number(JSON.parse(el.dataset.args ?? '{}').roundsCap ?? 0)
+    socket.emit('room:settings', { roundsCap }, (res: { ok: boolean; error?: string }) => {
+      if (!res.ok) console.warn('rounds change failed:', res.error)
+    })
   } else if (el.dataset.act === 'resetRoom') {
     // two-tap arm, TV style: first tap swaps the label, second tap fires
     if (!resetArmed) {
@@ -463,6 +469,11 @@ function renderLobby(l: LobbyInfo): void {
         <div class="chips">${TIMERS.map(
           ([label, ms]) => `<button class="chip ${l.turnTimeoutMs === ms ? 'sel' : ''}" data-act="setTimer" data-args='{"ms":${ms}}'>${label}</button>`,
         ).join('')}</div>
+        <label style="margin-top:1.2vh">Game length</label>
+        <div class="chips">${ROUND_CAPS.map(
+          ([label, cap]) => `<button class="chip ${l.roundsCap === cap ? 'sel' : ''}" data-act="setRounds" data-args='{"roundsCap":${cap}}'>${label}</button>`,
+        ).join('')}</div>
+        <p class="hint">The cap ends the game at the highest worth — the host picks, Standard by default.</p>
         <div style="margin-top:1.6vh"><button class="chip" data-act="resetRoom">New room</button></div>`
         }
       </div>
@@ -646,8 +657,12 @@ function updateQueue(v: HostView): void {
   }
   const crown = (p: PlayerState): string => (p.id === v.hostId ? ' <span class="crown">Host</span>' : '')
   const jailBadge = (p: PlayerState): string => (p.jail ? ' <span class="jailbadge">in jail</span>' : '')
+  // The round promise the cap made: derived client-side from turn and the
+  // seat count (the modulus never shrinks — bankruptcy only flags). None
+  // for Classic (cap 0).
+  const roundBadge = v.roundsCap > 0 ? ` · ROUND ${roundOf(v.turn, v.players.length)}/${v.roundsCap}` : ''
   el.innerHTML = `
-    <div class="qhead">ROOM ${esc(v.code)} · TURN ${v.turn}</div>
+    <div class="qhead">ROOM ${esc(v.code)} · TURN ${v.turn}${roundBadge}</div>
     <div class="qnow" style="--c:${now.color}">
       <span class="qt">${avathumb(now).trim()}</span>
       <span class="qn">${esc(now.name)}${crown(now)}${jailBadge(now)}</span>
@@ -688,6 +703,13 @@ function standingsOrder(v: HostView): PlayerState[] {
 function updateStandings(v: HostView): void {
   const el = document.getElementById('standings')
   if (!el) return
+  // On the game-over record the standings become the FINAL standings: every
+  // row gains its worth breakdown (cash / deeds / buildings) so the cap's
+  // numbers are transparent — finalWorth and the Income-Tax netWorth are two
+  // deliberate formulas, and the visible math keeps them from ever
+  // mystically disagreeing.
+  const over = v.phase === 'GAME_OVER' || v.winner != null
+  const winSet = new Set(v.winners ?? (v.winner ? [v.winner] : []))
   const rows = standingsOrder(v)
     .map((p) => {
       const mine = Object.entries(v.props)
@@ -708,16 +730,24 @@ function updateStandings(v: HostView): void {
           const houses = mine.reduce((n, { st }) => n + st.houses, 0)
           return houses > 0 ? `<span class="smark">🏠×${houses}</span>` : ''
         })()
-      return `<div class="srow${p.bankrupt ? ' dead' : ''}" style="--c:${p.color}">
+      const breakdown = over
+        ? (() => {
+            const w = finalWorth(v, p.id)
+            const trophy = winSet.has(p.id) ? ' 🏆' : ''
+            return `<span class="sworth${winSet.has(p.id) ? ' win' : ''}">${trophy}worth $${w.total}${p.bankrupt ? ' — bankrupt' : ` — cash $${w.cash} · deeds $${w.deeds} · buildings $${w.buildings}`}</span>`
+          })()
+        : ''
+      return `<div class="srow${p.bankrupt ? ' dead' : ''}${over && winSet.has(p.id) ? ' crowned-row' : ''}" style="--c:${p.color}">
         <span class="sdots">${dots}</span>
         <span class="st">${avathumb(p).trim()}</span>
         <span class="sn">${esc(p.name)}</span>
         ${marks ? `<span class="smarks">${marks}</span>` : ''}
         <span class="sc">$${p.cash}</span>
+        ${breakdown}
       </div>`
     })
     .join('')
-  el.innerHTML = `<div class="shead">HOLDINGS</div>${rows}`
+  el.innerHTML = `<div class="shead">${over ? 'FINAL STANDINGS' : 'HOLDINGS'}</div>${rows}`
 }
 
 // The decision-clock line — who the game waits on, honestly: with the
@@ -843,10 +873,18 @@ function updateCenter(v: HostView): void {
   if (!el) return
 
   if (v.phase === 'GAME_OVER' || v.winner) {
-    const winner = v.players.find((p) => p.id === v.winner)
-    el.innerHTML = winner
-      ? `<div class="winner"><div class="wname">${esc(winner.name)} wins!</div><div class="wsub">MONOPOLY PARTY</div></div>`
-      : `<div class="winner"><div class="wname">everyone is bankrupt</div></div>`
+    // Shared wins (worth ties) name every winner; the single-winner
+    // display every existing screen knows stays byte-identical below.
+    const winners = v.winners ?? (v.winner ? [v.winner] : [])
+    const names = winners.map((id) => v.players.find((p) => p.id === id)?.name ?? '').filter(Boolean)
+    if (names.length > 1) {
+      el.innerHTML = `<div class="winner"><div class="wname">${names.map(esc).join(' & ')} share the win!</div><div class="wsub">TIED ON WORTH — MONOPOLY PARTY</div></div>`
+    } else {
+      const winner = v.players.find((p) => p.id === v.winner)
+      el.innerHTML = winner
+        ? `<div class="winner"><div class="wname">${esc(winner.name)} wins!</div><div class="wsub">MONOPOLY PARTY</div></div>`
+        : `<div class="winner"><div class="wname">everyone is bankrupt</div></div>`
+    }
     el.classList.add('gameover')
     return
   }
@@ -954,6 +992,14 @@ const TIMERS: Array<[string, number]> = [
   ['2 min', 120_000],
   ['5 min', 300_000],
   ['10 min', 600_000],
+]
+
+// Game-length presets (the worth victory). Standard 35 is the server's
+// default for new rooms; Classic is uncapped, labelled as such.
+const ROUND_CAPS: Array<[string, number]> = [
+  ['Quick · 20 rounds', 20],
+  ['Standard · 35 rounds', 35],
+  ['Classic · no cap', 0],
 ]
 
 function updateGodPanel(v: HostView): void {

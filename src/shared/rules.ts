@@ -47,6 +47,38 @@ export function netWorth(s: RulesState, pid: string): number {
   return w
 }
 
+// ── Round-cap victory math ──
+// A round is initialPlayers turns wide: round = floor((turn-1)/n) + 1. The
+// count NEVER shrinks on mid-round bankruptcy — the players array only gains
+// bankrupt flags, never loses seats, so the modulus is the seat count at
+// creation. A round just gets shorter in wall-time as seats die; the round
+// count is a promise the TV badge keeps.
+export function roundOf(turn: number, playerCount: number): number {
+  return Math.floor((turn - 1) / playerCount) + 1
+}
+
+// The end-of-cap estate value: cash + owned UNMORTGAGED deeds at printed
+// price + owned MORTGAGED deeds at half price + houses × printed houseCost
+// (a hotel is houses=5, so it counts as five houses' cost). Deliberately
+// NOT netWorth: netWorth is the Income-Tax 10% basis, which by the official
+// rules counts mortgaged deeds at full price — a WIN measures the estate
+// net of its liens. Two formulas exist on purpose; the final standings
+// surface shows the breakdown so the numbers never mystically disagree.
+export function finalWorth(s: RulesState, pid: string): { cash: number; deeds: number; buildings: number; total: number } {
+  const p = byId(s, pid)
+  let deeds = 0
+  let buildings = 0
+  for (const [iStr, st] of Object.entries(s.props)) {
+    if (st.owner !== pid) continue
+    const sp = BOARD[Number(iStr)]
+    if (!('price' in sp)) continue
+    deeds += st.mortgaged ? sp.price / 2 : sp.price
+    if (isStreet(sp)) buildings += st.houses * sp.houseCost
+  }
+  const cash = p ? p.cash : 0
+  return { cash, deeds, buildings, total: cash + deeds + buildings }
+}
+
 export function rentFor(
   s: RulesState,
   i: number,

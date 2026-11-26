@@ -13,8 +13,8 @@ import {
   type PlayerMeta,
   type Result,
 } from '../shared/engine.js'
-import { auctionGraceActions, commit, debtAutoActions, decisionFor, forfeitSeat, type Room } from './rooms.js'
-import { allowedActions, blockingDecision, debtBlurb, rentFor, rentPreview } from '../shared/rules.js'
+import { auctionGraceActions, commit, debtAutoActions, decisionFor, forfeitSeat, validateSnapshot, type Room } from './rooms.js'
+import { allowedActions, blockingDecision, debtBlurb, finalWorth, netWorth, rentFor, rentPreview, roundOf } from '../shared/rules.js'
 import { hostView } from '../shared/views.js'
 import { ALL_CARDS, cardById } from '../shared/cards.js'
 import { cardEffectLine, debtWhy } from '../shared/card-effect.js'
@@ -44,6 +44,7 @@ function stubRoom(s: GameState): Room {
     hostToken: 't',
     hostPlayerId: null,
     turnTimeoutMs: 0,
+    roundsCap: 0,
     state: structuredClone(s),
     hostSockets: new Set(),
     players: [],
@@ -1589,6 +1590,213 @@ scenario('debtWhy: card debts keep the debtBlurb text', 4, (h) => {
   h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 50, creditor: null, memo: 'Jail release fine' }), 'jail fine', 'the jail fine keeps its blurb')
   h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 200, creditor: null, memo: 'Luxury tax' }), 'Luxury Tax', 'taxes keep their blurb')
   h.eq(debtWhy(h.s, { debtor: h.id(0), amount: 10, creditor: null }), 'a debt', 'a memo-less debt stays generic')
+})
+
+// ── round-cap presets: the worth victory ──
+// A round is initialPlayers turns wide (the modulus NEVER shrinks — the
+// players array only gains bankrupt flags); when the cap-th round completes
+// with the table still alive, the game ends and the highest-worth estate
+// wins. Real wins still trump the cap, and a cap never interrupts anything:
+// nextPlayer is only reachable with every pending cleared.
+
+scenario('round cap: the boundary ends the game with the worth leader', 2, (h) => {
+  h.s.roundsCap = 1
+  // rig the estates: p0 holds a hotel on Boardwalk and a mortgaged rail;
+  // p1 is bare. finalWorth(p0) = 700 + 400 + 5×200 + 200/2 = 2200.
+  h.cash(0, 700)
+  h.give(0, [39])
+  h.prop(39, { houses: 5 })
+  h.give(0, [5])
+  h.prop(5, { mortgaged: true })
+  h.cash(1, 300)
+  h.eq(finalWorth(h.s, h.id(0)).total, 2200, 'exact finalWorth: cash + unmortgaged deed + hotel (5 houses) + mortgaged rail at half')
+  h.eq(finalWorth(h.s, h.id(1)).total, 300, 'the bare estate')
+  // round 1 spans turns 1..2 with two players — both turns must complete
+  h.now(0, 'ACTION')
+  h.ok(h.act(0, { type: 'endTurn' }), 'turn 1 hands over')
+  h.eq(h.s.phase, 'ROLL', 'the round in progress continues')
+  h.eq(h.s.turn, 2, 'turn 2 opens inside the capped round')
+  h.now(1, 'ACTION')
+  h.ok(h.act(1, { type: 'endTurn' }), 'the final turn of the capped round ends')
+  h.eq(h.s.phase, 'GAME_OVER', 'the boundary ended the game instead of advancing')
+  h.eq(h.s.turn, 2, 'no extra turn was played')
+  h.eq(h.s.winners, [h.id(0)], 'the worth leader wins')
+  h.eq(h.s.winner, h.id(0), 'winner === winners[0]')
+  h.eq(
+    h.s.log.some((l) => l.text === `🏆 ${NAMES[0]} WINS ON WORTH — $2200`),
+    true,
+    'the game-over log names the worth and the winner',
+  )
+})
+
+scenario('round cap: a pending debt in the final round resolves before the boundary', 2, (h) => {
+  h.s.roundsCap = 2
+  // drive into the final round for real: round 2 opens at turn 3
+  h.now(0, 'ACTION')
+  h.ok(h.act(0, { type: 'endTurn' }), 'turn 1 hands over')
+  h.now(1, 'ACTION')
+  h.ok(h.act(1, { type: 'endTurn' }), 'turn 2 ends — the handover opens the final round')
+  h.eq(h.s.turn, 3, 'turn 3 is the first turn of the final round')
+  h.eq(h.s.log.some((l) => l.text === '⏳ Final round — highest worth wins!'), true, 'the final round announces itself')
+  // rig a debt mid-final-round: the cap must wait for it
+  h.s.debt = { debtor: h.id(0), amount: 60, creditor: null, memo: 'Luxury tax' }
+  h.s.phase = 'DEBT'
+  h.eq(h.s.phase, 'DEBT', 'the final round freezes on the debt — the cap cannot interrupt it')
+  h.ok(h.act(0, { type: 'payDebt' }), 'the debt resolves by hand')
+  h.eq(h.s.phase, 'ACTION', 'the turn resumes live')
+  h.ok(h.act(0, { type: 'endTurn' }), 'turn 3 ends inside the final round')
+  h.eq(h.s.phase, 'ROLL', 'still playing — the boundary is the NEXT handover')
+  h.eq(h.s.turn, 4, 'turn 4 is the last turn of the final round')
+  h.now(1, 'ACTION')
+  h.ok(h.act(1, { type: 'endTurn' }), 'the last turn ends')
+  h.eq(h.s.phase, 'GAME_OVER', 'the next nextPlayer ends by cap')
+  h.eq(h.s.winners != null && h.s.winners.length, 1, 'a winner was recorded')
+})
+
+scenario('round cap: a worth tie breaks by cash — never by fewest properties', 2, (h) => {
+  h.s.roundsCap = 1
+  // dead tie on worth, split estates: p0 = $800 cash + Mediterranean ($60);
+  // p1 = $860 cash, deedless. The tie breaks on cash.
+  h.cash(0, 800)
+  h.give(0, [1])
+  h.cash(1, 860)
+  h.eq(finalWorth(h.s, h.id(0)).total, 860, 'p0 worth 860')
+  h.eq(finalWorth(h.s, h.id(1)).total, 860, 'p1 worth 860 — a dead tie')
+  h.now(0, 'ACTION')
+  h.ok(h.act(0, { type: 'endTurn' }), 'turn 1 hands over')
+  h.now(1, 'ACTION')
+  h.ok(h.act(1, { type: 'endTurn' }), 'the capped round completes')
+  h.eq(h.s.phase, 'GAME_OVER', 'the cap ended the game')
+  h.eq(h.s.winners, [h.id(1)], 'the tie breaks on most cash — property count is not the tie-break')
+  h.eq(h.s.winner, h.id(1), 'winner === winners[0]')
+})
+
+scenario('round cap: a full tie shares the win', 2, (h) => {
+  h.s.roundsCap = 1
+  h.cash(0, 500)
+  h.cash(1, 500) // identical bare estates
+  h.now(0, 'ACTION')
+  h.ok(h.act(0, { type: 'endTurn' }), 'turn 1 hands over')
+  h.now(1, 'ACTION')
+  h.ok(h.act(1, { type: 'endTurn' }), 'the capped round completes')
+  h.eq(h.s.phase, 'GAME_OVER', 'the cap ended the game')
+  h.eq(h.s.winners, [h.id(0), h.id(1)], 'both players share the win')
+  h.eq(h.s.winner, h.id(0), 'winner === winners[0]')
+  h.eq(
+    h.s.log.some((l) => l.text === `🏆 ${NAMES[0]} & ${NAMES[1]} SHARE THE WIN — tied at $500`),
+    true,
+    'the shared-win log line names both and the tie',
+  )
+})
+
+scenario('finalWorth: mortgaged at half price, hotels as five houses, unmortgaged at printed', 2, (h) => {
+  h.cash(0, 100)
+  h.give(0, [1]) // Mediterranean $60, house $50 — unmortgaged, 2 houses
+  h.prop(1, { houses: 2 })
+  h.give(0, [3]) // Baltic $60 — mortgaged
+  h.prop(3, { mortgaged: true })
+  h.give(0, [39]) // Boardwalk $400, house $200 — a hotel (houses = 5)
+  h.prop(39, { houses: 5 })
+  h.give(0, [5]) // the railroad $200 — mortgaged
+  h.prop(5, { mortgaged: true })
+  const w = finalWorth(h.s, h.id(0))
+  h.eq(w.cash, 100, 'cash term')
+  h.eq(w.deeds, 60 + 30 + 400 + 100, 'deeds term: printed, half, printed, half')
+  h.eq(w.buildings, 2 * 50 + 5 * 200, 'buildings term: two houses + the hotel as five houses')
+  h.eq(w.total, 1790, 'total = cash + deeds + buildings')
+  // netWorth deliberately disagrees — it is the Income-Tax 10% basis, which
+  // by the official rules counts mortgaged deeds at full price.
+  h.eq(netWorth(h.s, h.id(0)), 1920, 'netWorth still counts mortgaged deeds at printed price')
+  h.eq(finalWorth(h.s, h.id(1)).total, 1500, 'a bare estate is its cash alone')
+})
+
+scenario('round cap: bankruptcy during the final round still wins the classic way', 2, (h) => {
+  h.s.roundsCap = 1
+  h.s.turn = 2 // the last turn of the capped round
+  h.now(1)
+  h.cash(1, 10)
+  h.s.debt = { debtor: h.id(1), amount: 500, creditor: h.id(0) }
+  h.s.phase = 'DEBT'
+  h.ok(h.act(1, { type: 'bankrupt' }), 'the final-round debtor goes bankrupt')
+  h.eq(h.s.phase, 'GAME_OVER', 'checkGameOver beat the cap')
+  h.eq(h.s.winner, h.id(0), 'the creditor wins the classic way')
+  h.eq(h.s.winners, [h.id(0)], 'the classic single-winner record')
+  h.eq(h.s.log.some((l) => l.text.includes('WINS THE GAME!')), true, 'the classic game-over line')
+  h.eq(h.s.log.some((l) => l.text.includes('WINS ON WORTH')), false, 'no worth line on a classic win')
+})
+
+scenario('round cap 0 (Classic) never ends by rounds', 2, (h) => {
+  h.s.roundsCap = 0
+  h.s.turn = 400 // far past what any cap boundary would be
+  for (let n = 0; n < 8; n++) {
+    const who = n % 2 === 0 ? 0 : 1
+    h.now(who, 'ACTION')
+    h.ok(h.act(who, { type: 'endTurn' }), `turn ${h.s.turn} hands over`)
+  }
+  h.eq(h.s.phase, 'ROLL', 'still playing after driving far past any boundary')
+  h.eq(h.s.phase === 'GAME_OVER', false, 'Classic never ends by rounds')
+  h.eq(h.s.winners, undefined, 'no winners were recorded')
+})
+
+scenario('god export/import round-trip preserves roundsCap and winners', 2, (h) => {
+  h.s.roundsCap = 35
+  h.s.phase = 'GAME_OVER'
+  h.s.winner = h.id(0)
+  h.s.winners = [h.id(0), h.id(1)] // a shared record
+  const payload = {
+    v: 1,
+    code: 'TEST',
+    hostToken: 't',
+    hostPlayerId: null,
+    turnTimeoutMs: 0,
+    roundsCap: 35,
+    players: h.s.players.map((p) => ({ meta: { id: p.id, name: p.name, color: p.color, token: p.token }, token: 'x' })),
+    state: h.s as unknown as Record<string, unknown>,
+  }
+  const snap = validateSnapshot(payload)
+  h.assert(snap != null, 'a capped, shared-win snapshot validates')
+  h.eq(snap?.roundsCap, 35, 'the room-level cap round-trips')
+  h.eq(snap?.state?.roundsCap, 35, 'the state-level cap round-trips')
+  h.eq(snap?.state?.winners, [h.id(0), h.id(1)], 'the shared-win record round-trips')
+  h.eq(snap?.state?.winner, h.id(0), 'the single-winner field round-trips')
+  // pre-cap snapshots (no roundsCap, no winners) still import: 0 / undefined
+  const legacy = JSON.parse(JSON.stringify(payload)) as {
+    roundsCap?: number
+    state?: { roundsCap?: number; winners?: string[] }
+  }
+  delete legacy.roundsCap
+  delete legacy.state?.roundsCap
+  delete legacy.state?.winners
+  const oldSnap = validateSnapshot(legacy)
+  h.assert(oldSnap != null, 'a pre-cap snapshot still imports')
+  h.eq(oldSnap?.roundsCap, 0, 'the room defaults to uncapped')
+  h.eq(oldSnap?.state?.roundsCap, 0, 'the state defaults to uncapped')
+  h.eq(oldSnap?.state?.winners, undefined, 'winners defaults to undefined')
+})
+
+scenario('round cap: the modulus never shrinks on mid-round bankruptcy', 4, (h) => {
+  h.s.roundsCap = 2
+  h.s.turn = 6 // round 2 = turns 5..8 with the creation-time 4 seats
+  h.now(3)
+  h.cash(3, 10)
+  h.s.debt = { debtor: h.id(3), amount: 5000, creditor: h.id(0) }
+  h.s.phase = 'DEBT'
+  h.ok(h.act(3, { type: 'bankrupt' }), 'p3 dies mid-round')
+  h.eq(h.s.players.length, 4, 'the players array never shrinks — bankruptcy only flags')
+  h.eq((h.s.phase as GameState['phase']) !== 'GAME_OVER', true, 'three players remain — the game plays on')
+  h.eq(h.s.turn, 7, 'the handover after the bankruptcy lands on turn 7')
+  h.eq(roundOf(h.s.turn, h.s.players.length), 2, 'turn 7 is still round 2 — the 4-wide modulus held')
+  // a shrinking (alive-count) modulus would end the game at turn 7's
+  // handover; the creation-time modulus keeps the promise to turn 8
+  h.now(0, 'ACTION')
+  h.ok(h.act(0, { type: 'endTurn' }), 'turn 7 ends')
+  h.eq((h.s.phase as GameState['phase']) === 'GAME_OVER', false, 'a shrinking modulus would have ended the game here — it did not')
+  h.eq(h.s.turn, 8, 'turn 8 is still inside the final round')
+  h.now(1, 'ACTION')
+  h.ok(h.act(1, { type: 'endTurn' }), 'turn 8 ends')
+  h.eq(h.s.phase, 'GAME_OVER', 'the boundary arrives exactly at the end of round 2')
+  h.eq(h.s.turn, 8, 'no extra turn was played')
+  h.eq(h.s.winners, [h.id(0)], 'the creditor, who absorbed the estate, wins on worth')
 })
 
 // ── summary ──

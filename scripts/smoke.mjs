@@ -843,6 +843,142 @@ try {
     tvr.disconnect()
   }
 
+  // ── round-cap presets: the worth victory, end to end ──
+  // A Quick-cap room created through the TV settings, started, god-driven to
+  // the boundary (export → patch turn via import — the import is validated,
+  // so the crafted state must be legal), and asserted to auto-end with the
+  // worth winner. Plus the lobby-settings validation probe.
+  {
+    const tvc = connect()
+    const cc = await emitAck(tvc, 'room:create')
+    assert(cc.ok, 'cap room created')
+    let clobby = null
+    tvc.on('lobby', (l) => {
+      clobby = l
+    })
+
+    // lobby-settings validation probe: the host sets every preset…
+    for (const cap of [0, 20, 35, 999]) {
+      const res = await emitAck(tvc, 'room:settings', { roundsCap: cap })
+      assert(res.ok, `host sets roundsCap ${cap}`)
+    }
+    await sleep(150)
+    assert(clobby && clobby.roundsCap === 999, 'the lobby broadcast carries the cap')
+    // …and out-of-range / non-number values are rejected with the standard copy
+    for (const bad of [1000, -1, 1.5, 'quick', null, [20]]) {
+      const res = await emitAck(tvc, 'room:settings', { roundsCap: bad })
+      assert(!res.ok, `room:settings rejects roundsCap ${JSON.stringify(bad)}`)
+    }
+    // the timer dial still works on the same channel
+    const tok = await emitAck(tvc, 'room:settings', { turnTimeoutMs: 120000 })
+    assert(tok.ok, 'the timer dial still works beside the cap')
+
+    // three phones join; a plain phone cannot set the cap
+    const cphones = []
+    for (const n of ['Capa', 'Capb', 'Capp']) {
+      const s = connect()
+      const res = await emitAck(s, 'room:join', { code: cc.code, name: n })
+      assert(res.ok, `phone joined as ${n}`)
+      cphones.push({ sock: s, id: res.playerId, view: null })
+    }
+    const phoneSet = await emitAck(cphones[1].sock, 'room:settings', { roundsCap: 5 })
+    assert(phoneSet && !phoneSet.ok, 'a plain phone cannot set the cap')
+
+    // Quick 20 for the boundary drive: cap × 3 players = turn 60 is the
+    // boundary turn (ending it would open round 21)
+    const quick = await emitAck(tvc, 'room:settings', { roundsCap: 20 })
+    assert(quick.ok, 'the room takes Quick 20 for the game')
+    await sleep(150)
+    assert(clobby && clobby.roundsCap === 20, 'the lobby shows Quick 20')
+
+    let cv = null
+    tvc.on('view', (v) => {
+      cv = v
+    })
+    for (const p of cphones) p.sock.on('view', (v) => { p.view = v })
+    const sv = await emitAck(tvc, 'game:start', {})
+    assert(sv.ok, 'the Quick-cap game started')
+    await waitFor(() => cv != null && cphones.every((p) => p.view != null), 8000, 'cap-room views')
+    assert(cv && cv.roundsCap === 20, 'the game view carries roundsCap (the TV badge derives Round N of 20 from turn + seats)')
+
+    // god-driven to the boundary: export, patch the turn, re-import
+    const eres = await emitAck(tvc, 'god:command', { cmd: 'export' })
+    assert(eres.ok && eres.snapshot && eres.snapshot.state, 'god exported the running game')
+    const snap = eres.snapshot
+    snap.state.turn = 60 // the boundary turn: ending it opens round 21
+    snap.state.players[0].cash = 5000 // the worth leader, beyond any dispute
+    const ires = await emitAck(tvc, 'god:command', { cmd: 'import', json: snap })
+    assert(ires.ok, 'the crafted boundary snapshot imported (validateSnapshot accepted it)')
+    await sleep(200)
+    assert(cv && cv.turn === 60, 'the game sits on the boundary turn')
+
+    // drive the boundary: the current player finishes turn 60, the cap ends it
+    let okActs = 0
+    for (let i = 0; i < 40 && cv && cv.phase !== 'GAME_OVER'; i++) {
+      if (cv.debt) {
+        const debtor = cphones.find((p) => p.id === cv.debt.debtor)
+        if (debtor && debtor.view) {
+          const acts = debtor.view.allowed || []
+          if (acts.includes('payDebt')) await emitAck(debtor.sock, 'game:action', { type: 'payDebt' })
+          else if (acts.includes('bankrupt')) await emitAck(debtor.sock, 'game:action', { type: 'bankrupt' })
+        }
+        await sleep(100)
+        continue
+      }
+      if (cv.auction) {
+        for (const p of cphones) await emitAck(p.sock, 'game:action', { type: 'passBid' })
+        await sleep(100)
+        continue
+      }
+      if (cv.pendingJail) {
+        const arrested = cphones.find((p) => p.id === cv.pendingJail.player)
+        if (arrested) await emitAck(arrested.sock, 'game:action', { type: 'goToJail' })
+        await sleep(100)
+        continue
+      }
+      const me = cphones.find((p) => p.id === cv.currentPlayerId)
+      const acts = (me && me.view && me.view.allowed) || []
+      const action =
+        acts.includes('roll') ? { type: 'roll' }
+        : acts.includes('drawCard') ? { type: 'drawCard' }
+        : acts.includes('buy') ? { type: 'buy' }
+        : acts.includes('declineBuy') ? { type: 'declineBuy' }
+        : acts.includes('payTax') ? { type: 'payTax', choice: 'flat' }
+        : acts.includes('endTurn') ? { type: 'endTurn' }
+        : null
+      if (!me || !action) break
+      const res = await emitAck(me.sock, 'game:action', action)
+      if (res.ok) okActs++
+      await sleep(60)
+    }
+    assert(okActs >= 1, `boundary drive: ${okActs} actions accepted`)
+    let ended = false
+    try {
+      await waitFor(() => cv != null && cv.phase === 'GAME_OVER', 8000, 'the capped game to auto-end')
+      ended = true
+    } catch {
+      /* asserted below */
+    }
+    assert(ended && cv && cv.phase === 'GAME_OVER', 'the capped game auto-ended at the boundary')
+    assert(cv && cv.turn === 60, 'the boundary turn was the last — no extra turn played')
+    assert(
+      cv && Array.isArray(cv.winners) && cv.winners.length === 1 && cv.winners[0] === cphones[0].id,
+      'the worth leader (the fat wallet) wins',
+    )
+    assert(cv && cv.winner === cv.winners[0], 'winner === winners[0]')
+    assert(cv && cv.roundsCap === 20, 'the served view still carries the cap for the Round N of M badge')
+    assert(cv && (cv.log || []).some((l) => l.text.includes('WINS ON WORTH')), 'the game-over log names the worth win')
+    assert(cphones[0].view && cphones[0].view.phase === 'GAME_OVER', "the winner's phone shows the game-over screen")
+    assert(cphones[0].view && cphones[0].view.winners && cphones[0].view.winners[0] === cphones[0].id, "the winner's phone view carries the winners record")
+
+    // mid-game the cap is a promise, not a preference: changing it is refused
+    const midCap = await emitAck(tvc, 'room:settings', { roundsCap: 35 })
+    assert(midCap && !midCap.ok, 'a started game refuses cap changes')
+
+    for (const p of cphones) p.sock.disconnect()
+    tvc.disconnect()
+  }
+
   // boot-restore fixture cleanup (quarantine keeps party records; the
   // fixtures are ours, so they go)
   for (const f of ['ZZZQ.json', 'ZZZX.json.bad', 'ZZZY.json.bad']) {

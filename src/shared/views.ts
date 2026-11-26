@@ -29,6 +29,8 @@ export function hostView(s: GameState, code: string, hostId: string | null, turn
     debt: s.debt,
     debtQueue: s.debtQueue,
     winner: s.winner,
+    winners: s.winners,
+    roundsCap: s.roundsCap,
     trades: s.trades,
     lastLanded: s.lastLanded,
     lastMove: s.lastMove,

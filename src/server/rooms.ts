@@ -18,6 +18,7 @@ import {
   forfeitEstate,
   liquidationPlan,
   MAX_GAME_LOG,
+  nextPlayer,
   type PlayerMeta,
   type Result,
 } from '../shared/engine.js'
@@ -37,7 +38,7 @@ import type {
   TradeSide,
   WaitingOn,
 } from '../shared/types.js'
-import { validAction, validCode, validGodCommand, validToken } from '../shared/validate.js'
+import { validAction, validCode, validGodCommand, validRoundsCap, validToken } from '../shared/validate.js'
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ' // no I/O — they confuse party guests
 const MAX_PLAYERS = 8
@@ -55,6 +56,12 @@ const MAX_ROOMS = 200
 // the final 30 seconds; on expiry the server plays a sensible default so a
 // stalled phone can never stall the table.
 const DEFAULT_TURN_TIMEOUT_MS = 300_000
+
+// The out-of-box game must terminate (panel evidence: 88% of 6-player
+// no-trade games never ended). Standard 35 rounds is the default cap; the
+// host can pick Quick 20 or Classic 0 (uncapped) in the lobby, beside the
+// decision timer — same ownership domain, same room:settings channel.
+export const DEFAULT_ROUNDS_CAP = 35
 
 // Auction pacing: the opening window is more generous than the restarts —
 // every bid resets a short fuse, so the hammer only falls after real silence,
@@ -89,6 +96,7 @@ export interface Room {
   hostToken: string // TV rejoin secret
   hostPlayerId: string | null // the player who is "party host" (crown)
   turnTimeoutMs: number // decision deadline; 0 = off
+  roundsCap: number // worth-victory round cap; 0 = uncapped (Classic)
   state: GameState | null
   hostSockets: Set<string>
   players: PlayerEntry[]
@@ -133,12 +141,13 @@ function playerRoom(code: string, playerId: string): string {
 
 // One room-minting path for create and reset, so the guards and defaults
 // can never drift apart.
-function mintRoom(turnTimeoutMs: number = DEFAULT_TURN_TIMEOUT_MS): Room {
+function mintRoom(turnTimeoutMs: number = DEFAULT_TURN_TIMEOUT_MS, roundsCap: number = DEFAULT_ROUNDS_CAP): Room {
   return {
     code: newCode(),
     hostToken: randomUUID(),
     hostPlayerId: null,
     turnTimeoutMs,
+    roundsCap,
     state: null,
     hostSockets: new Set(),
     players: [],
@@ -175,6 +184,7 @@ function lobbyInfo(room: Room): LobbyInfo {
     canStart: room.players.length >= MIN_PLAYERS,
     hostId: room.hostPlayerId,
     turnTimeoutMs: room.turnTimeoutMs,
+    roundsCap: room.roundsCap,
   }
 }
 
@@ -722,12 +732,13 @@ function applyServerAction(room: Room, autos: Array<[string, Action]>): boolean 
 // party: on boot the rooms come back and phones rejoin via their tokens.
 // The same serialization powers the god console's export/import.
 
-interface RoomSnapshot {
+export interface RoomSnapshot {
   v: number
   code: string
   hostToken: string
   hostPlayerId: string | null
   turnTimeoutMs: number
+  roundsCap: number
   players: Array<{ meta: PlayerMeta; token: string }>
   state: GameState | null
 }
@@ -739,6 +750,7 @@ function serializeRoom(room: Room): RoomSnapshot {
     hostToken: room.hostToken,
     hostPlayerId: room.hostPlayerId,
     turnTimeoutMs: room.turnTimeoutMs,
+    roundsCap: room.roundsCap,
     players: room.players.map((e) => ({ meta: e.meta, token: e.token })),
     state: room.state,
   }
@@ -827,6 +839,7 @@ function loadSnapshots(): void {
           // boot applies the snapshot's own identity here.
           hostPlayerId: null,
           turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS,
+          roundsCap: DEFAULT_ROUNDS_CAP,
           state: null,
           hostSockets: new Set(),
           players: [],
@@ -911,8 +924,9 @@ function snapDeck(raw: unknown, what: string): string[] | null {
 // or null if anything about the input is off. `minSeats` relaxes the seat
 // floor for the boot restore (a live party's lobby may legitimately hold a
 // single waiting phone — a restart must bring it back); the god import
-// keeps the full 2-seat quorum.
-function validateSnapshot(raw: unknown, opts: { minSeats?: number } = {}): RoomSnapshot | null {
+// keeps the full 2-seat quorum. Exported for the scenario + remedy suites,
+// which pin the optional-field defaults (roundsCap / winners) directly.
+export function validateSnapshot(raw: unknown, opts: { minSeats?: number } = {}): RoomSnapshot | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   let bytes: number
   try {
@@ -956,6 +970,9 @@ function validateSnapshot(raw: unknown, opts: { minSeats?: number } = {}): RoomS
   const hostPlayerId = d.hostPlayerId == null ? null : snapStr(d.hostPlayerId, 64)
   if (hostPlayerId != null && !metas.has(hostPlayerId)) return null
   const turnTimeoutMs = snapInt(d.turnTimeoutMs, 0, 3_600_000) ?? DEFAULT_TURN_TIMEOUT_MS
+  // Pre-cap snapshots lack the field entirely: uncapped, the jailCardDecks
+  // optional-field precedent.
+  const roundsCap = snapInt(d.roundsCap, 0, 999) ?? 0
 
   // ── state: null (lobby) or a fully checked GameState ──
   let state: GameState | null = null
@@ -1104,6 +1121,17 @@ function validateSnapshot(raw: unknown, opts: { minSeats?: number } = {}): RoomS
     if (snapInt(st.cardDrawSeq, 0, 1_000_000) === null) return null
     if (snapInt(st.turn, 0, 100_000) === null) return null
     if (st.winner != null && !metas.has(snapStr(st.winner, 64) ?? '')) return null
+    // The round-cap pair: state-level roundsCap defaults like the room-level
+    // one (0 = uncapped), and winners is a shared-win record of seat ids —
+    // unknown or non-string entries are dropped (the jailCardDecks filter
+    // precedent), an over-long array is capped at the seat count, and an
+    // empty result means "none recorded" (undefined).
+    const stateRoundsCap = snapInt(st.roundsCap, 0, 999) ?? 0
+    let winners: string[] | undefined
+    if (Array.isArray(st.winners)) {
+      const ids = st.winners.filter((x): x is string => typeof x === 'string' && metas.has(x))
+      winners = ids.length > 0 ? ids.slice(0, players.length) : undefined
+    }
 
     // Rebuild the state as the normalized object: known-safe values only.
     // Transient reveal pendings (card draw, jail sentence, pending card)
@@ -1111,6 +1139,8 @@ function validateSnapshot(raw: unknown, opts: { minSeats?: number } = {}): RoomS
     // broadcast, so the game simply continues from a stable point.
     state = {
       ...(st as unknown as GameState),
+      roundsCap: stateRoundsCap,
+      winners,
       chanceDeck,
       chestDeck,
       debt,
@@ -1135,6 +1165,7 @@ function validateSnapshot(raw: unknown, opts: { minSeats?: number } = {}): RoomS
     hostToken: snapStr(d.hostToken, 64) ?? '',
     hostPlayerId,
     turnTimeoutMs,
+    roundsCap,
     players,
     state,
   }
@@ -1167,6 +1198,7 @@ function restoreRoomFromSnapshot(room: Room, snap: RoomSnapshot): boolean {
   for (const [tok, ref] of playerTokens) if (ref.code === room.code) playerTokens.delete(tok)
   room.hostPlayerId = snap.hostPlayerId
   room.turnTimeoutMs = snap.turnTimeoutMs
+  room.roundsCap = snap.roundsCap
   room.players = snap.players.map((e) => ({
     meta: e.meta,
     token: e.token,
@@ -1615,9 +1647,9 @@ export function attach(io: IOServer, getJoinUrls: (code: string) => string[], sn
         return ack?.({ ok: false, error: 'Server is full — try again in a few minutes' })
       }
 
-      // the fresh room keeps the screen's timer preference — that's a
-      // preference, not part of the mess being reset
-      const next = mintRoom(old.turnTimeoutMs)
+      // the fresh room keeps the screen's timer and cap preferences — those
+      // are preferences, not part of the mess being reset
+      const next = mintRoom(old.turnTimeoutMs, old.roundsCap)
       rooms.set(next.code, next)
       data.roomsCreated = (data.roomsCreated ?? 0) + 1
       const urls = getJoinUrls(next.code)
@@ -1692,7 +1724,7 @@ export function attach(io: IOServer, getJoinUrls: (code: string) => string[], sn
       if (!isTvHost && !isPartyHost) return ack?.({ ok: false, error: 'Hosts only' })
       if (room.state) return ack?.({ ok: false, error: 'Already started' })
       if (room.players.length < MIN_PLAYERS) return ack?.({ ok: false, error: 'Need at least 2 players' })
-      room.state = createGame(room.players.map((e) => e.meta))
+      room.state = createGame(room.players.map((e) => e.meta), Math.random, room.roundsCap)
       broadcastGame(io, room)
       ack?.({ ok: true })
     })
@@ -1721,6 +1753,10 @@ export function attach(io: IOServer, getJoinUrls: (code: string) => string[], sn
     })
 
     // ── Host lobby settings ──
+    // One channel, two host-owned dials: the decision timer (turnTimeoutMs)
+    // and the round cap (roundsCap — the worth-victory presets). Each field
+    // is optional in the payload (a dial that wasn't touched isn't sent),
+    // but at least one must arrive, well-formed.
     on(
       'room:settings',
       (raw: unknown, ack?: (res: unknown) => void) => {
@@ -1729,18 +1765,33 @@ export function attach(io: IOServer, getJoinUrls: (code: string) => string[], sn
         const isTvHost = room.hostSockets.has(socket.id)
         const isPartyHost = isCurrentConnection(room, data, socket.id) && data.playerId === room.hostPlayerId
         if (!isTvHost && !isPartyHost) return ack?.({ ok: false, error: 'Hosts only' })
-        const rawMs = (raw as { turnTimeoutMs?: unknown } | null | undefined)?.turnTimeoutMs
+        const payload = (raw ?? {}) as { turnTimeoutMs?: unknown; roundsCap?: unknown }
+        const hasTimer = payload.turnTimeoutMs !== undefined
+        const hasCap = payload.roundsCap !== undefined
+        if (!hasTimer && !hasCap) return ack?.({ ok: false, error: 'Bad timer value' })
         // Whole minutes-of-seconds only: no NaN, no strings, no floats.
         const ms =
-          typeof rawMs === 'number' && Number.isInteger(rawMs)
-            ? Math.max(0, Math.min(3_600_000, rawMs))
+          typeof payload.turnTimeoutMs === 'number' && Number.isInteger(payload.turnTimeoutMs)
+            ? Math.max(0, Math.min(3_600_000, payload.turnTimeoutMs))
             : null
-        if (ms === null) return ack?.({ ok: false, error: 'Bad timer value' })
-        room.turnTimeoutMs = ms
+        if (hasTimer && ms === null) return ack?.({ ok: false, error: 'Bad timer value' })
+        // The cap shares the boundary pin with the presets: asInt(0..999),
+        // same error copy family as the timer.
+        const cap = hasCap ? validRoundsCap(payload.roundsCap) : null
+        if (hasCap && cap === null) return ack?.({ ok: false, error: 'Bad rounds value' })
+        // The cap is baked into the game at createGame — mid-game it is not
+        // a preference anymore, it is a promise the badge keeps.
+        if (hasCap && room.state) return ack?.({ ok: false, error: 'The game already started' })
+        if (ms !== null) room.turnTimeoutMs = ms
+        if (cap !== null) room.roundsCap = cap
         // The in-progress decision re-arms with the new duration.
         room.timerKey = null
         if (room.state) {
-          godMutate(io, room, `decision timer ${ms === 0 ? 'disabled' : `set to ${Math.round(ms / 1000)}s`}`, () => {})
+          if (ms !== null) {
+            godMutate(io, room, `decision timer ${ms === 0 ? 'disabled' : `set to ${Math.round(ms / 1000)}s`}`, () => {})
+          } else {
+            broadcastGame(io, room)
+          }
         } else {
           broadcastLobby(io, room)
           void saveRoom(room)
@@ -1777,17 +1828,10 @@ export function attach(io: IOServer, getJoinUrls: (code: string) => string[], sn
             n.auctionQueue = []
             n.dice = null
             n.doubles = 0
-            // advance the turn pointer manually (nextPlayer lives in the engine)
-            const k = n.players.findIndex((q) => q.id === n.currentPlayerId)
-            for (let step = 1; step <= n.players.length; step++) {
-              const cand = n.players[(k + step) % n.players.length]
-              if (cand && !cand.bankrupt) {
-                n.currentPlayerId = cand.id
-                break
-              }
-            }
-            n.turn++
-            n.phase = 'ROLL'
+            // advance through the engine's own boundary — nextPlayer checks
+            // the round cap before moving, so a god skip can never smuggle
+            // the game past its own cap
+            nextPlayer(n)
           })
           return ack?.({ ok: true })
         }
@@ -1944,8 +1988,11 @@ export function attach(io: IOServer, getJoinUrls: (code: string) => string[], sn
             ? (s.players.find((p) => p.id === payload.winner)?.name ?? 'nobody')
             : (s.players.find((p) => p.id === s.winner)?.name ?? 'nobody')
           godMutate(io, room, `ended the game — ${winner} wins`, (n) => {
+            const w = payload.winner ?? n.winner
             n.phase = 'GAME_OVER'
-            n.winner = payload.winner ?? n.winner
+            n.winner = w
+            // keep the pair consistent: winner === winners[0] ?? null
+            n.winners = w != null ? [w] : []
             n.pendingPurchase = null
             n.pendingTax = null
             n.pendingCardDraw = null

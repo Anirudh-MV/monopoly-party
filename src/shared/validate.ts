@@ -186,3 +186,12 @@ export function validCode(raw: unknown): string | null {
 export function validToken(raw: unknown): string | null {
   return asStr(raw, MAX_ID)
 }
+
+// Round-cap presets (Quick 20 / Standard 35 / Classic 0) arrive through the
+// same room:settings channel as the timer; the boundary check is this one,
+// shared pin: whole numbers 0..999 only — no NaN, no strings, no floats.
+export const MAX_ROUNDS_CAP = 999
+
+export function validRoundsCap(raw: unknown): number | null {
+  return asInt(raw, 0, MAX_ROUNDS_CAP)
+}
