@@ -73,19 +73,30 @@ npm run dev
 - **`src/shared/validate.ts`** — the boundary: every client message is checked
   against a schema (whole numbers, fixed ranges, capped strings) before it
   reaches the engine. The engine stays I/O-free *because* this gate exists.
-- **`src/server/rooms.ts`** — socket glue: room codes, host/player tokens,
-  per-device view projection, auto-pass for phones that drop mid-auction.
-  Every handler runs inside a guard, so a malformed message can never crash
-  the process — and one connection belongs to exactly one room.
+- **`src/server/rooms.ts`** — the import surface (a barrel) for the room
+  layer; the split lives behind it: `core.ts` (registry + host migration),
+  `clock.ts` (the one commit path + decision clock), `persist.ts`
+  (snapshots), `lobby.ts` (join/leave/reset), `god.ts` (the TV console),
+  `sockets.ts` (the wiring). Socket glue end to end: room codes,
+  host/player tokens, per-device view projection, auto-pass for phones
+  that drop mid-auction. Every handler runs inside a guard, so a
+  malformed message can never crash the process — and one connection
+  belongs to exactly one room.
 - **`src/server/index.ts`** — express + socket.io; binds `0.0.0.0` so LAN phones
   can reach it, prints its LAN URL at startup.
 - **`src/client/host/`** — the TV app: lobby (code + QR), 11×11 board, tokens,
   ownership tinting, houses/hotels, auction + card + debt overlays, activity feed.
-- **`src/client/controller/`** — the phone app: sticky wallet (with animated
-  balance changes), contextual action buttons, per-property management, trade
-  composer, auction bidding, debt resolution — rent is paid by hand, a
-  Collect prompt marks passing GO, the dice roll plays on every screen, and
-  a **pocket board** button opens the full 3D board to roam and inspect.
+- **`src/client/controller/`** — the phone app, split by concern:
+  `net.ts` (the socket + reconnection), `state.ts` (the shared phone state
+  + the roll state machine), `screens.ts` (the join/lobby/game render
+  flow), `sheets.ts` (the chrome patcher: sheets, dock, your-move bar),
+  `overlays.ts` (board, dice, confirms), `actions.ts` (the delegated
+  command switch), with `main.ts` as the slim boot. Sticky wallet (with
+  animated balance changes), contextual action buttons, per-property
+  management, trade composer, auction bidding, debt resolution — rent is
+  paid by hand, a Collect prompt marks passing GO, the dice roll plays on
+  every screen, and a **pocket board** button opens the full 3D board to
+  roam and inspect.
 - **`src/client/tokens3d.ts`** — one distinct 3D avatar per emoji, shared by
   the TV board and the phone's piece picker (with a live preview).
 
